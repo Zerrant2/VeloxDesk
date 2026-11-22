@@ -232,3 +232,102 @@ pub fn decode_gamepad_datagram(dgram: &[u8]) -> Option<GamepadState>;
 ### `veloxdesk-ui` & `apps/client` M3 additions (render-ui-worker)
 * Settings & toolbar: FPS (`60/120/144/240`), 10-bit HDR, YUV 4:4:4, Audio / Mic toggles, Pointer Lock (`Ctrl+Alt+G`).
 * Viewer requests `prefer_gpu_output = true` when `VideoSurface` supports zero-copy import, displays `zero_copy` and `audio_buf_ms` in HUD, plays received `MediaKind::Audio` through `AudioJitterBuffer` + `OpusDecoder` + `veloxdesk_audio::create_playback()`, polls local physical gamepads (multi-player) and applies incoming `Msg::Rumble`!
+
+---
+
+## M4 cross-crate APIs (Full RustDesk Parity)
+
+> Temporary M4 crate assignments (disjoint, zero overlap): `net-worker` implements `crates/tunnel` + `crates/file-transfer`; `media-worker` implements `crates/clipboard` + `crates/virtual-display`; `sys-worker` implements `crates/terminal` + `crates/service`; `render-ui-worker` implements `crates/ui` + `apps/client`; `qa-worker` implements `tests/tests/m4_rustdesk_parity.rs` + final checks.
+
+### `veloxdesk-tunnel` (net-worker)
+```rust
+#[derive(Debug, Clone)]
+pub struct TunnelPolicy { pub allow_loopback_only: bool, pub allowed_ports: Option<Vec<u16>> }
+impl Default for TunnelPolicy { /* allow_loopback_only: false, allowed_ports: None */ }
+/// Host side: handles one `StreamKind::Tunnel` bidi stream (reads `TunnelOpen`, replies `TunnelResult`, bridges TCP).
+pub async fn serve_tunnel_stream(send: SendStream, recv: RecvStream, policy: &TunnelPolicy) -> Result<()>;
+/// Viewer side: listens on `local_bind`, opens a `StreamKind::Tunnel` stream per TCP client.
+pub struct LocalForwarder { .. }
+impl LocalForwarder {
+    pub async fn bind(local_bind: SocketAddr, remote_host: String, remote_port: u16, ch: Arc<dyn TransportChannel>) -> Result<Self>;
+    pub fn local_addr(&self) -> SocketAddr;
+    pub fn shutdown(&self);
+}
+```
+
+### `veloxdesk-file-transfer` (net-worker)
+```rust
+#[derive(Debug, Clone)]
+pub struct FileTransferConfig { pub root_dir: Option<PathBuf>, pub chunk_size: usize, pub max_parallel: usize, pub compress: bool }
+/// Host side: serves `FileRequest` (`ListDir/Stat/Download/Upload/Delete/Mkdir/Rename`) on one `StreamKind::FileTransfer` bidi stream with zstd + resume + SHA-256 digest.
+pub async fn serve_file_stream(send: SendStream, recv: RecvStream, cfg: &FileTransferConfig) -> Result<()>;
+/// Viewer side: high-level client opening `StreamKind::FileTransfer` streams (supports resume, zstd, SHA-256 verification, parallel transfers).
+pub struct FileTransferClient { .. }
+impl FileTransferClient {
+    pub fn new(ch: Arc<dyn TransportChannel>) -> Self;
+    pub async fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>>;
+    pub async fn mkdir(&self, path: &str) -> Result<()>;
+    pub async fn delete(&self, path: &str) -> Result<()>;
+    pub async fn rename(&self, from: &str, to: &str) -> Result<()>;
+    pub async fn download(&self, remote_path: &str, local_path: &Path, resume: bool, compress: bool, on_progress: Option<ProgressCb>) -> Result<TransferReport>;
+    pub async fn upload(&self, local_path: &Path, remote_path: &str, resume: bool, compress: bool, on_progress: Option<ProgressCb>) -> Result<TransferReport>;
+}
+```
+
+### `veloxdesk-clipboard` (media-worker)
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardItem { Text(String), Html(String), ImagePng(Bytes), FileList(Vec<String>) }
+impl ClipboardItem {
+    pub fn content_hash(&self) -> [u8; 32]; // SHA-256 for echo suppression
+    pub fn to_wire(&self, compress: bool) -> Result<ClipboardData>;
+    pub fn from_wire(data: &ClipboardData) -> Result<Self>;
+}
+pub trait ClipboardBackend: Send { fn read(&mut self) -> Result<Option<ClipboardItem>>; fn write(&mut self, item: &ClipboardItem) -> Result<()>; }
+pub struct SystemClipboard; // impl ClipboardBackend (arboard text+PNG + Windows CF_HDROP)
+pub struct MemoryClipboard; // impl ClipboardBackend (Arc-backed, for deterministic tests)
+pub fn create_system_clipboard() -> Result<Box<dyn ClipboardBackend>>;
+pub async fn run_clipboard_stream(send: SendStream, recv: RecvStream, backend: Box<dyn ClipboardBackend>, poll_interval: Duration, shutdown: watch::Receiver<bool>) -> Result<()>;
+```
+
+### `veloxdesk-virtual-display` (media-worker)
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualDisplaySpec { pub width: u32, pub height: u32, pub refresh_hz: u32, pub name: String }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualDisplayInfo { pub id: u32, pub spec: VirtualDisplaySpec }
+pub trait VirtualDisplayManager: Send + Sync {
+    fn backend(&self) -> &'static str;
+    fn is_supported(&self) -> bool;
+    fn create(&self, spec: VirtualDisplaySpec) -> Result<VirtualDisplayInfo>;
+    fn remove(&self, id: u32) -> Result<()>;
+    fn list(&self) -> Vec<VirtualDisplayInfo>;
+}
+pub fn create_virtual_display_manager() -> Box<dyn VirtualDisplayManager>;
+pub trait PrivacyController: Send + Sync {
+    fn enable(&self) -> Result<()>;
+    fn disable(&self) -> Result<()>;
+    fn is_enabled(&self) -> bool;
+}
+pub struct PrivacyGuard { .. } // RAII: always calls disable() on Drop
+pub fn create_privacy_controller() -> Arc<dyn PrivacyController>;
+pub struct SimulatedPrivacyController; // impl PrivacyController (for tests)
+```
+
+### `veloxdesk-terminal` (sys-worker)
+```rust
+/// Host side: reads `TerminalOpen`, spawns real ConPTY (Windows) or POSIX PTY (Unix), bridges `TerminalData` + `TerminalResize`, emits `TerminalExit`.
+pub async fn serve_terminal_stream(send: SendStream, recv: RecvStream) -> Result<()>;
+/// Viewer side: interactive remote terminal session over `StreamKind::Terminal`.
+pub struct TerminalClient { .. }
+impl TerminalClient {
+    pub async fn open(ch: &dyn TransportChannel, cols: u32, rows: u32, shell: String) -> Result<Self>;
+    pub async fn write(&mut self, data: &[u8]) -> Result<()>;
+    pub async fn resize(&mut self, cols: u32, rows: u32) -> Result<()>;
+    pub async fn recv(&mut self) -> Result<TerminalEvent>; // Data(Bytes) | Exit(i32)
+}
+```
+
+### `veloxdesk-service` M4 additions (sys-worker)
+* Wires all 5 M4 crates into `run_session` gated by `Permissions::{clipboard, file_transfer, tunnel, terminal, privacy_mode}`, RAII `PrivacyGuard` cleanup on disconnect, live `DisplayList` + hot `SwitchDisplay`.
+* Local IPC (`ipc::{IpcServer, IpcClient, IpcRequest, IpcResponse}`), daemon/service helpers (`daemon::{ServiceStatus, DesktopKind, detect_desktop, install_service, uninstall_service, service_status}`), portable mode (`--portable`) & `--config <path>`.

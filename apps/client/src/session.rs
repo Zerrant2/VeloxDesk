@@ -9,8 +9,10 @@ use veloxdesk_core_traits::Timestamp;
 use veloxdesk_core_traits::time::ClockSync;
 use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
-use veloxdesk_protocol::control::{InputEvent, SessionConfig, SessionMode};
-use veloxdesk_ui::ConnectTarget;
+use veloxdesk_protocol::control::{DisplayInfo, FileEntry, InputEvent, SessionConfig, SessionMode};
+use veloxdesk_ui::{
+    ActiveTunnel, ConnectTarget, FileAction, TerminalAction, TransferProgress, TunnelAction, TunnelSpec,
+};
 
 use crate::latest::Latest;
 use crate::stats::HudAggregator;
@@ -36,6 +38,19 @@ pub enum SessionEvent {
         error: Option<String>,
     },
     Config(Box<SessionConfig>),
+    DisplayList(Vec<DisplayInfo>),
+    PrivacyMode { enabled: bool, error: Option<String> },
+    FileListing { path: String, entries: Vec<FileEntry> },
+    FileProgress(Option<TransferProgress>),
+    FileStatus(String),
+    FileError(String),
+    TerminalOpened,
+    TerminalOutput(Vec<u8>),
+    TerminalExit(i32),
+    TerminalError(String),
+    TunnelAdded(ActiveTunnel),
+    TunnelRemoved(u64),
+    TunnelError(String),
     CursorShape(CursorImage),
     CursorPos { x: i32, y: i32, visible: bool },
     /// Decoder name / HW flag, for the HUD.
@@ -54,6 +69,11 @@ pub enum SessionCommand {
     SetMaxBitrate(u32),
     SetAudio(bool),
     SetMic(bool),
+    SetClipboardSync(bool),
+    SetPrivacyMode(bool),
+    File(FileAction),
+    Terminal(TerminalAction),
+    Tunnel(TunnelAction),
     Disconnect,
 }
 
@@ -87,6 +107,8 @@ pub struct ConnectOptions {
     pub prefer_gpu_decode: bool,
     pub audio_enabled: bool,
     pub mic_enabled: bool,
+    pub clipboard_sync: bool,
+    pub initial_tunnels: Vec<TunnelSpec>,
     pub hdr_10bit: bool,
     pub yuv444: bool,
     pub viewer_size: (u32, u32),

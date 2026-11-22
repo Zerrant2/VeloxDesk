@@ -250,6 +250,10 @@ async fn full_session_over_memory_transport() {
             audio_capture: None,
             audio_encoder: None,
             audio_playback: None,
+            clipboard: None,
+            privacy: None,
+            file_transfer: None,
+            tunnel_policy: None,
         }
     };
     let cfg = Arc::new(HostConfig { max_fps: 60, bitrate_kbps: 10_000, ..Default::default() });

@@ -3,10 +3,14 @@
 
 use std::sync::Arc;
 
+use veloxdesk_clipboard::ClipboardBackend;
 use veloxdesk_core_traits::audio::{AudioCapture, AudioEncoder, AudioEncoderConfig, AudioPlayback};
 use veloxdesk_core_traits::video::{EncodedPacket, EncoderConfig};
 use veloxdesk_core_traits::{FrameCapture, InputInjector, Result, Timestamp, TransportChannel, VideoEncoder};
+use veloxdesk_file_transfer::FileTransferConfig;
 use veloxdesk_protocol::control::{Nack, ReceiverReport};
+use veloxdesk_tunnel::TunnelPolicy;
+use veloxdesk_virtual_display::PrivacyController;
 
 /// Media-plane sender for one video stream (FEC packetization → datagrams).
 /// Called synchronously from the encode thread.
@@ -38,6 +42,7 @@ pub type RateFactory = dyn Fn(u32, u32, u32) -> Box<dyn RateController> + Send +
 pub type AudioCaptureFactory = dyn Fn() -> Result<Box<dyn AudioCapture>> + Send + Sync;
 pub type AudioEncoderFactory = dyn Fn(&AudioEncoderConfig) -> Result<Box<dyn AudioEncoder>> + Send + Sync;
 pub type AudioPlaybackFactory = dyn Fn() -> Result<Box<dyn AudioPlayback>> + Send + Sync;
+pub type ClipboardFactory = dyn Fn() -> Result<Box<dyn ClipboardBackend>> + Send + Sync;
 
 /// Factories for every platform-dependent stage. Cheap to clone (Arc'd closures).
 #[derive(Clone)]
@@ -50,6 +55,10 @@ pub struct HostBackends {
     pub audio_capture: Option<Arc<AudioCaptureFactory>>,
     pub audio_encoder: Option<Arc<AudioEncoderFactory>>,
     pub audio_playback: Option<Arc<AudioPlaybackFactory>>,
+    pub clipboard: Option<Arc<ClipboardFactory>>,
+    pub privacy: Option<Arc<dyn PrivacyController>>,
+    pub file_transfer: Option<FileTransferConfig>,
+    pub tunnel_policy: Option<TunnelPolicy>,
 }
 
 impl HostBackends {
@@ -58,6 +67,26 @@ impl HostBackends {
         self.audio_capture = None;
         self.audio_encoder = None;
         self.audio_playback = None;
+        self
+    }
+
+    pub fn with_clipboard(mut self, factory: Arc<ClipboardFactory>) -> Self {
+        self.clipboard = Some(factory);
+        self
+    }
+
+    pub fn with_privacy(mut self, ctrl: Arc<dyn PrivacyController>) -> Self {
+        self.privacy = Some(ctrl);
+        self
+    }
+
+    pub fn with_file_transfer(mut self, cfg: FileTransferConfig) -> Self {
+        self.file_transfer = Some(cfg);
+        self
+    }
+
+    pub fn with_tunnel_policy(mut self, policy: TunnelPolicy) -> Self {
+        self.tunnel_policy = Some(policy);
         self
     }
 }

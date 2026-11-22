@@ -4146,13 +4146,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "veloxdesk-audio",
+ "veloxdesk-clipboard",
  "veloxdesk-codec",
  "veloxdesk-core-traits",
  "veloxdesk-crypto",
+ "veloxdesk-file-transfer",
  "veloxdesk-protocol",
  "veloxdesk-render",
  "veloxdesk-service",
+ "veloxdesk-terminal",
  "veloxdesk-transport",
+ "veloxdesk-tunnel",
  "veloxdesk-ui",
  "windows",
  "winit",
@@ -4210,8 +4214,16 @@ dependencies = [
 name = "veloxdesk-clipboard"
 version = "0.1.0"
 dependencies = [
+ "arboard",
+ "bytes",
+ "png",
+ "sha2",
+ "tokio",
+ "tracing",
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
+ "windows",
+ "zstd",
 ]
 
 [[package]]
@@ -4263,8 +4275,15 @@ dependencies = [
 name = "veloxdesk-file-transfer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "prost",
+ "sha2",
+ "tokio",
  "veloxdesk-core-traits",
+ "veloxdesk-crypto",
  "veloxdesk-protocol",
+ "veloxdesk-transport",
+ "zstd",
 ]
 
 [[package]]
@@ -4362,20 +4381,33 @@ dependencies = [
  "tracing",
  "veloxdesk-audio",
  "veloxdesk-capture",
+ "veloxdesk-clipboard",
  "veloxdesk-codec",
  "veloxdesk-core-traits",
  "veloxdesk-crypto",
+ "veloxdesk-file-transfer",
  "veloxdesk-input",
  "veloxdesk-protocol",
+ "veloxdesk-terminal",
  "veloxdesk-transport",
+ "veloxdesk-tunnel",
+ "veloxdesk-virtual-display",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "veloxdesk-terminal"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "libc",
+ "tokio",
+ "tracing",
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
+ "veloxdesk-transport",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4388,15 +4420,20 @@ dependencies = [
  "tokio",
  "veloxdesk-audio",
  "veloxdesk-benches",
+ "veloxdesk-clipboard",
  "veloxdesk-codec",
  "veloxdesk-core-traits",
  "veloxdesk-crypto",
+ "veloxdesk-file-transfer",
  "veloxdesk-protocol",
  "veloxdesk-render",
  "veloxdesk-server-relay",
  "veloxdesk-server-rendezvous",
  "veloxdesk-service",
+ "veloxdesk-terminal",
  "veloxdesk-transport",
+ "veloxdesk-tunnel",
+ "veloxdesk-virtual-display",
  "windows",
 ]
 
@@ -4427,8 +4464,14 @@ dependencies = [
 name = "veloxdesk-tunnel"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "prost",
+ "tokio",
+ "tracing",
  "veloxdesk-core-traits",
+ "veloxdesk-crypto",
  "veloxdesk-protocol",
+ "veloxdesk-transport",
 ]
 
 [[package]]
@@ -4447,8 +4490,10 @@ dependencies = [
 name = "veloxdesk-virtual-display"
 version = "0.1.0"
 dependencies = [
+ "tracing",
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
+ "windows",
 ]
 
 [[package]]
@@ -5503,6 +5548,34 @@ checksum = "ac67096b97c00742108c4674db6bb6178adb78c4b66a506b0e4a7a9593aa5d9e"
 dependencies = [
  "futures-core",
  "futures-io",
+]
+
+[[package]]
+name = "zstd"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50adf04cf3ec914b0b9905c9dde90c80fe74bfd701e331fc80a39c512c525278"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498d94ad68720c89b4fbe41b9090850651e68cb2dd9210ce7ffbff3a94653819"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.3+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
+dependencies = [
+ "cc",
+ "pkg-config",
 ]
 
 [[package]]

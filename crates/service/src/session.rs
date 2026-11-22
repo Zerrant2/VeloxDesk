@@ -9,19 +9,22 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use veloxdesk_core_traits::audio::AudioCodecId;
 use veloxdesk_core_traits::input::{DisplayGeometry, InputEvent, InputEventKind, InputFeedback};
+use veloxdesk_core_traits::transport::{RecvStream, SendStream};
 use veloxdesk_core_traits::video::{ChromaFormat, Display, VideoCodec};
 use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
 use veloxdesk_protocol::StreamKind;
 use veloxdesk_protocol::control::{
-    AudioConfig, BitrateUpdate, Close, DisplayInfo, Envelope, Hello, Pong, SessionConfig, SessionMode, VideoConfig,
-    envelope::Msg,
+    AudioConfig, BitrateUpdate, Close, DisplayInfo, DisplayList, Envelope, FileAck, Hello, Permissions, Pong,
+    PrivacyModeResult, SessionConfig, SessionMode, TerminalExit, TunnelResult, VideoConfig, envelope::Msg,
 };
 use veloxdesk_protocol::media::MediaKind;
 use veloxdesk_transport::{
     AudioReceiver, ControlReceiver, ControlSender, datagram_kind, decode_gamepad_datagram, framed,
 };
+use veloxdesk_virtual_display::PrivacyGuard;
 
 use crate::audio::{AudioParams, AudioPipeline, MicHandle, MicPlayback, frame_ms_to_us};
+use crate::auth::CLOSE_AUTH_FAILED;
 use crate::backends::{HostBackends, RateController, RateDecision};
 use crate::config::HostConfig;
 use crate::inject::{InputHandle, InputThread};
@@ -282,11 +285,16 @@ pub async fn run_session_until(
         }
         let _ = writer.finish().await;
     });
-    // 5. extra streams (input) and incoming media datagrams (gamepads + optional mic).
-    if let Some(i) = &input {
-        tasks.spawn(accept_streams(ch.clone(), i.handle()));
-    }
+    // 5. extra streams (input, clipboard, file-transfer, tunnel, terminal) and incoming media datagrams.
+    let (session_stop_tx, session_stop_rx) = watch::channel(false);
     let input_handle = input.as_ref().map(|i| i.handle());
+    tasks.spawn(accept_streams(
+        ch.clone(),
+        input_handle.clone(),
+        auth.permissions.clone(),
+        backends.clone(),
+        session_stop_rx,
+    ));
     let mic_handle = mic.as_ref().and_then(|m| m.handle());
     if input_handle.is_some() || mic_handle.is_some() {
         tasks.spawn(recv_media_datagrams(ch.clone(), input_handle.clone(), mic_handle));
@@ -296,6 +304,8 @@ pub async fn run_session_until(
     let mut rate: Box<dyn RateController> =
         (backends.rate)(params.bitrate_kbps, cfg.min_bitrate_kbps, params.bitrate_kbps);
     let mut viewer_cap = params.bitrate_kbps;
+    // RAII guard: guaranteed to restore display & local input on normal exit, error, disconnect, or abort.
+    let mut privacy_guard: Option<PrivacyGuard> = None;
     let reason = loop {
         if *stop.borrow() {
             let _ = out.send(Msg::Close(Close { code: CLOSE_NORMAL, reason: "host shutting down".into() }).into());
@@ -351,6 +361,10 @@ pub async fn run_session_until(
                             parity_percent: cfg.fec_parity_percent });
                     }
                     Some(Msg::SwitchDisplay(s)) => pipeline.switch_display(s.index),
+                    Some(Msg::PrivacyMode(pm)) => {
+                        let res = handle_privacy_mode(pm.enable, &auth.permissions, &backends, &mut privacy_guard);
+                        let _ = out.send(Msg::PrivacyModeResult(res).into());
+                    }
                     Some(Msg::Input(ev)) => {
                         if let Some(h) = &input_handle { h.inject(ev); }
                     }
@@ -373,6 +387,8 @@ pub async fn run_session_until(
                         if let Some(h) = &input_handle { h.set_displays(geometry(&displays)); }
                         st.displays = displays;
                         st.active = active;
+                        let dl = DisplayList { displays: st.displays.iter().map(display_info).collect() };
+                        let _ = out.send(Msg::DisplayList(dl).into());
                         let _ = out.send(Msg::SessionConfig(st.session_config()).into());
                     }
                     Some(VideoEvent::Cursor(c)) => { let _ = out.send(Msg::CursorPosition(c).into()); }
@@ -390,7 +406,9 @@ pub async fn run_session_until(
     summary.frames_dropped = pipeline.dropped_frames();
     summary.close_reason = reason;
 
-    // 7. teardown: stop input readers first (they hold input handles), flush control.
+    // 7. teardown: restore privacy mode, signal M4 streams, stop input readers, flush control.
+    drop(privacy_guard);
+    let _ = session_stop_tx.send(true);
     drop(input_handle);
     drop(out);
     // the writer task ends once `out` is dropped and drained
@@ -479,38 +497,230 @@ async fn recv_media_datagrams(
     }
 }
 
-/// Accept viewer-opened streams; `Input` streams feed the injector.
-async fn accept_streams(ch: Arc<dyn TransportChannel>, input: InputHandle) {
+fn handle_privacy_mode(
+    enable: bool,
+    perms: &Permissions,
+    backends: &HostBackends,
+    guard: &mut Option<PrivacyGuard>,
+) -> PrivacyModeResult {
+    if !perms.privacy_mode {
+        return PrivacyModeResult {
+            enabled: guard.is_some(),
+            error: "privacy mode permission denied".into(),
+        };
+    }
+    if enable {
+        if guard.is_some() {
+            return PrivacyModeResult { enabled: true, error: String::new() };
+        }
+        let ctrl = backends
+            .privacy
+            .clone()
+            .unwrap_or_else(veloxdesk_virtual_display::create_privacy_controller);
+        match PrivacyGuard::activate(ctrl) {
+            Ok(g) => {
+                *guard = Some(g);
+                PrivacyModeResult { enabled: true, error: String::new() }
+            }
+            Err(e) => PrivacyModeResult { enabled: false, error: e.to_string() },
+        }
+    } else if let Some(g) = guard.take() {
+        match g.disable() {
+            Ok(()) => PrivacyModeResult { enabled: false, error: String::new() },
+            Err(e) => PrivacyModeResult { enabled: false, error: e.to_string() },
+        }
+    } else {
+        PrivacyModeResult { enabled: false, error: String::new() }
+    }
+}
+
+/// Accept viewer-opened streams (`Input`, `Clipboard`, `FileTransfer`, `Tunnel`, `Terminal`),
+/// strictly gated by the granted session [`Permissions`].
+async fn accept_streams(
+    ch: Arc<dyn TransportChannel>,
+    input: Option<InputHandle>,
+    perms: Permissions,
+    backends: HostBackends,
+    stop: watch::Receiver<bool>,
+) {
     let mut readers = JoinSet::new();
+    let file_cfg = backends.file_transfer.clone().unwrap_or_default();
+    let tunnel_policy = backends.tunnel_policy.clone().unwrap_or_default();
+
     loop {
-        let rx = tokio::select! {
+        let incoming: (StreamKind, Option<SendStream>, RecvStream) = tokio::select! {
             r = ch.accept_bi() => match r {
-                Ok((kind, _send, recv)) => (kind, recv),
+                Ok((kind, send, recv)) => (kind, Some(send), recv),
                 Err(_) => break,
             },
             r = ch.accept_uni() => match r {
-                Ok((kind, recv)) => (kind, recv),
+                Ok((kind, recv)) => (kind, None, recv),
                 Err(_) => break,
             },
         };
-        match rx.0 {
+        let (kind, send_opt, recv) = incoming;
+        match kind {
             StreamKind::Input => {
-                let input = input.clone();
-                let mut reader = ControlReceiver::new(rx.1);
+                if let Some(input) = input.clone() {
+                    let mut reader = ControlReceiver::new(recv);
+                    readers.spawn(async move {
+                        while let Ok(env) = reader.recv().await {
+                            if let Some(Msg::Input(ev)) = env.msg {
+                                input.inject(ev);
+                            }
+                        }
+                        // stream ended: don't leave keys stuck
+                        input.release_all();
+                    });
+                } else {
+                    tracing::debug!("input stream denied (input permission disabled)");
+                }
+            }
+            StreamKind::Clipboard => {
+                let Some(send) = send_opt else { continue };
+                if !perms.clipboard {
+                    tracing::info!("clipboard stream denied by permissions");
+                    readers.spawn(deny_with_close(send, "clipboard permission denied"));
+                    continue;
+                }
+                let clip_factory = backends.clipboard.clone();
+                let stop_rx = stop.clone();
                 readers.spawn(async move {
-                    while let Ok(env) = reader.recv().await {
-                        if let Some(Msg::Input(ev)) = env.msg {
-                            input.inject(ev);
+                    let backend = match clip_factory {
+                        Some(f) => f(),
+                        None => veloxdesk_clipboard::create_system_clipboard(),
+                    };
+                    match backend {
+                        Ok(b) => {
+                            if let Err(e) = veloxdesk_clipboard::run_clipboard_stream(
+                                send,
+                                recv,
+                                b,
+                                Duration::from_millis(150),
+                                stop_rx,
+                            )
+                            .await
+                            {
+                                tracing::debug!("clipboard stream ended: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("clipboard backend unavailable: {e}");
+                            deny_with_close(send, &format!("clipboard unavailable: {e}")).await;
                         }
                     }
-                    // stream ended: don't leave keys stuck
-                    input.release_all();
                 });
             }
-            other => tracing::debug!(?other, "stream kind not handled in M1"),
+            StreamKind::FileTransfer => {
+                let Some(send) = send_opt else { continue };
+                if !perms.file_transfer {
+                    tracing::info!("file transfer stream denied by permissions");
+                    readers.spawn(deny_file_transfer(send, recv));
+                    continue;
+                }
+                let cfg = file_cfg.clone();
+                readers.spawn(async move {
+                    if let Err(e) = veloxdesk_file_transfer::serve_file_stream(send, recv, &cfg).await {
+                        tracing::debug!("file transfer stream ended: {e}");
+                    }
+                });
+            }
+            StreamKind::Tunnel => {
+                let Some(send) = send_opt else { continue };
+                if !perms.tunnel {
+                    tracing::info!("tunnel stream denied by permissions");
+                    readers.spawn(deny_tunnel(send, recv));
+                    continue;
+                }
+                let policy = tunnel_policy.clone();
+                readers.spawn(async move {
+                    if let Err(e) = veloxdesk_tunnel::serve_tunnel_stream(send, recv, &policy).await {
+                        tracing::debug!("tunnel stream ended: {e}");
+                    }
+                });
+            }
+            StreamKind::Terminal => {
+                let Some(send) = send_opt else { continue };
+                if !perms.terminal {
+                    tracing::info!("terminal stream denied by permissions");
+                    readers.spawn(deny_terminal(send, recv));
+                    continue;
+                }
+                readers.spawn(async move {
+                    if let Err(e) = veloxdesk_terminal::serve_terminal_stream(send, recv).await {
+                        tracing::debug!("terminal stream ended: {e}");
+                    }
+                });
+            }
+            other => tracing::debug!(?other, "unhandled stream kind"),
         }
     }
     readers.abort_all();
+}
+
+async fn deny_with_close(send: SendStream, reason: &str) {
+    let mut w = ControlSender::new(send);
+    let _ = w.send(&Msg::Close(Close { code: CLOSE_AUTH_FAILED, reason: reason.into() }).into()).await;
+    let _ = w.finish().await;
+}
+
+async fn deny_file_transfer(send: SendStream, recv: RecvStream) {
+    let (mut w, mut r) = framed(send, recv);
+    let id = match timeout(Duration::from_secs(2), r.recv()).await {
+        Ok(Ok(env)) => match env.msg {
+            Some(Msg::FileRequest(req)) => req.id,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    let _ = w
+        .send(
+            &Msg::FileAck(FileAck {
+                id,
+                offset: 0,
+                error: "file transfer permission denied".into(),
+                digest: Vec::new(),
+            })
+            .into(),
+        )
+        .await;
+    let _ = w.finish().await;
+}
+
+async fn deny_tunnel(send: SendStream, recv: RecvStream) {
+    let (mut w, mut r) = framed(send, recv);
+    let tunnel_id = match timeout(Duration::from_secs(2), r.recv()).await {
+        Ok(Ok(env)) => match env.msg {
+            Some(Msg::TunnelOpen(open)) => open.tunnel_id,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    let _ = w
+        .send(
+            &Msg::TunnelResult(TunnelResult {
+                tunnel_id,
+                ok: false,
+                error: "tunnel permission denied".into(),
+            })
+            .into(),
+        )
+        .await;
+    let _ = w.finish().await;
+}
+
+async fn deny_terminal(send: SendStream, recv: RecvStream) {
+    let (mut w, mut r) = framed(send, recv);
+    let term_id = match timeout(Duration::from_secs(2), r.recv()).await {
+        Ok(Ok(env)) => match env.msg {
+            Some(Msg::TerminalOpen(open)) => open.term_id,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    let _ = w.send(&Msg::TerminalExit(TerminalExit { term_id, code: -1 }).into()).await;
+    let _ = w.send(&Msg::Close(Close { code: CLOSE_AUTH_FAILED, reason: "terminal permission denied".into() }).into()).await;
+    let _ = w.finish().await;
 }
 
 #[cfg(test)]

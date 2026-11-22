@@ -165,6 +165,8 @@ pub struct Settings {
     pub audio_enabled: bool,
     /// Stream local microphone to the host (track 1).
     pub mic_enabled: bool,
+    /// Synchronize clipboard (text, images, file lists) with the remote host.
+    pub clipboard_sync: bool,
 }
 
 impl Default for Settings {
@@ -184,6 +186,7 @@ impl Default for Settings {
             yuv444: false,
             audio_enabled: true,
             mic_enabled: false,
+            clipboard_sync: true,
         }
     }
 }

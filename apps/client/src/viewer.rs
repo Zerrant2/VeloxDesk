@@ -2,7 +2,10 @@
 //! thread for video decoding, "latest frame wins" handoff to the winit/wgpu render thread).
 
 #[cfg(feature = "net")]
-pub use net::{connect, device_id_label, load_identity};
+pub use net::{connect, device_id_label, load_identity, set_identity_override};
+
+#[cfg(not(feature = "net"))]
+pub fn set_identity_override(_path: std::path::PathBuf) {}
 
 #[cfg(not(feature = "net"))]
 pub fn device_id_label() -> String {
@@ -19,6 +22,8 @@ pub fn connect(
 
 #[cfg(feature = "net")]
 mod net {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -26,7 +31,7 @@ mod net {
 
     use anyhow::{Context, bail};
     use crossbeam_channel::{Receiver, Sender, TrySendError};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
     use tokio::time::{interval, timeout};
     use veloxdesk_audio::{AudioJitterBuffer, JitterConfig, OpusDecoder, OpusEncoder};
     use veloxdesk_core_traits::audio::{
@@ -36,18 +41,24 @@ mod net {
     use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
     use veloxdesk_crypto::DeviceIdentity;
     use veloxdesk_crypto::auth::{Argon2Params, derive_password_key, password_proof, sign_pubkey_challenge};
+    use veloxdesk_file_transfer::FileTransferClient;
     use veloxdesk_protocol::control::{
         AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, Close, Envelope, GamepadState,
-        Hello, InputEvent, Ping, SessionConfig, SwitchDisplay, VideoCodecCap, VideoConfig, envelope::Msg,
+        Hello, InputEvent, Ping, PrivacyMode, SessionConfig, SwitchDisplay, VideoCodecCap, VideoConfig, envelope::Msg,
     };
     use veloxdesk_protocol::media::MediaKind;
     use veloxdesk_protocol::{PROTOCOL_VERSION, StreamKind};
     use veloxdesk_render::winit::event_loop::EventLoopProxy;
+    use veloxdesk_terminal::{TerminalClient, TerminalEvent};
     use veloxdesk_transport::{
         AudioReceiver, AudioSender, ControlSender, ReceivedFrame, VideoReceiver, datagram_kind,
         encode_gamepad_datagram, framed,
     };
-    use veloxdesk_ui::{ConnectTarget, format_device_id};
+    use veloxdesk_tunnel::LocalForwarder;
+    use veloxdesk_ui::{
+        ActiveTunnel, ConnectTarget, FileAction, TerminalAction, TransferProgress, TunnelAction, TunnelSpec,
+        format_device_id,
+    };
 
     use crate::app::UserEvent;
     use crate::gamepad::GamepadPoller;
@@ -61,9 +72,19 @@ mod net {
     const PING_TICK: Duration = Duration::from_millis(500);
     const DECODER_QUEUE_DEPTH: usize = 4;
 
+    static IDENTITY_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+    /// Override the default persisted identity key path (used by `--portable` mode).
+    pub fn set_identity_override(path: PathBuf) {
+        let _ = IDENTITY_OVERRIDE.set(path);
+    }
+
     /// Default path for the persisted Ed25519 identity key.
     fn default_identity_path() -> Option<PathBuf> {
-        veloxdesk_ui::settings::config_dir().map(|d| d.join("veloxdesk").join("identity.key"))
+        IDENTITY_OVERRIDE
+            .get()
+            .cloned()
+            .or_else(|| veloxdesk_ui::settings::config_dir().map(|d| d.join("veloxdesk").join("identity.key")))
     }
 
     /// Load the device identity from `override_path` or the per-user config directory
@@ -806,6 +827,20 @@ mod net {
             }
         });
 
+        // 5c. M4 RustDesk-parity subsystems: Clipboard, File Transfer, TCP Tunnels, Remote Terminal.
+        let mut clip_stop: Option<watch::Sender<bool>> = if opts.clipboard_sync {
+            Some(start_clipboard_task(ch.clone()))
+        } else {
+            None
+        };
+        let ft_client = Arc::new(FileTransferClient::new(ch.clone()));
+        let mut tunnels: HashMap<u64, LocalForwarder> = HashMap::new();
+        let mut next_tunnel_id: u64 = 1;
+        for spec in opts.initial_tunnels.clone() {
+            add_tunnel(spec, ch.clone(), &mut tunnels, &mut next_tunnel_id, &proxy).await;
+        }
+        let mut term_tx: Option<mpsc::UnboundedSender<TermCtrl>> = None;
+
         // 6. Initialize VideoReceiver + notify UI of initial SessionConfig.
         let mut receiver = VideoReceiver::new();
         if let Some(v) = &initial_cfg.video {
@@ -913,6 +948,16 @@ mod net {
                                     visible: cp.visible,
                                 }));
                             }
+                            Some(Msg::DisplayList(dl)) => {
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::DisplayList(dl.displays)));
+                            }
+                            Some(Msg::PrivacyModeResult(r)) => {
+                                let err = (!r.error.is_empty()).then_some(r.error);
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::PrivacyMode {
+                                    enabled: r.enabled,
+                                    error: err,
+                                }));
+                            }
                             Some(Msg::Rumble(r)) => {
                                 GamepadPoller::apply_rumble(&r);
                             }
@@ -966,6 +1011,55 @@ mod net {
                         Some(SessionCommand::SetMic(on)) => {
                             mic.set_enabled(on);
                         }
+                        Some(SessionCommand::SetClipboardSync(on)) => {
+                            if on {
+                                if clip_stop.is_none() {
+                                    clip_stop = Some(start_clipboard_task(ch.clone()));
+                                }
+                            } else if let Some(stop) = clip_stop.take() {
+                                let _ = stop.send(true);
+                            }
+                        }
+                        Some(SessionCommand::SetPrivacyMode(enable)) => {
+                            let _ = ctrl_out_tx.send(Msg::PrivacyMode(PrivacyMode { enable }).into());
+                        }
+                        Some(SessionCommand::File(action)) => {
+                            spawn_file_action(ft_client.clone(), action, proxy.clone());
+                        }
+                        Some(SessionCommand::Terminal(action)) => match action {
+                            TerminalAction::Open { cols, rows, shell } => {
+                                if let Some(tx) = term_tx.take() {
+                                    let _ = tx.send(TermCtrl::Close);
+                                }
+                                term_tx = Some(spawn_terminal_task(ch.clone(), cols, rows, shell, proxy.clone()));
+                            }
+                            TerminalAction::SendInput(data) => {
+                                if let Some(tx) = &term_tx {
+                                    let _ = tx.send(TermCtrl::Input(data));
+                                }
+                            }
+                            TerminalAction::Resize { cols, rows } => {
+                                if let Some(tx) = &term_tx {
+                                    let _ = tx.send(TermCtrl::Resize { cols, rows });
+                                }
+                            }
+                            TerminalAction::Close => {
+                                if let Some(tx) = term_tx.take() {
+                                    let _ = tx.send(TermCtrl::Close);
+                                }
+                            }
+                        },
+                        Some(SessionCommand::Tunnel(action)) => match action {
+                            TunnelAction::Add(spec) => {
+                                add_tunnel(spec, ch.clone(), &mut tunnels, &mut next_tunnel_id, &proxy).await;
+                            }
+                            TunnelAction::Remove(id) => {
+                                if let Some(fwd) = tunnels.remove(&id) {
+                                    fwd.shutdown();
+                                    let _ = proxy.send_event(UserEvent::Session(SessionEvent::TunnelRemoved(id)));
+                                }
+                            }
+                        },
                         Some(SessionCommand::SubmitPassword(_)) | Some(SessionCommand::CancelAuth) => {}
                         Some(SessionCommand::Disconnect) | None => {
                             let _ = ctrl_out_tx.send(
@@ -1007,6 +1101,15 @@ mod net {
         };
 
         // 8. Clean teardown.
+        if let Some(stop) = clip_stop.take() {
+            let _ = stop.send(true);
+        }
+        if let Some(tx) = term_tx.take() {
+            let _ = tx.send(TermCtrl::Close);
+        }
+        for (_, fwd) in tunnels.drain() {
+            fwd.shutdown();
+        }
         gamepads.stop();
         mic.stop();
         if let Some(ao) = audio_out {
@@ -1231,5 +1334,253 @@ mod net {
             }
             let _ = ctrl_out.send(env);
         }
+    }
+
+    // ───────────────────────── M4 feature helpers ─────────────────────────
+
+    fn start_clipboard_task(ch: Arc<dyn TransportChannel>) -> watch::Sender<bool> {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            let backend = match veloxdesk_clipboard::create_system_clipboard() {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("system clipboard unavailable: {e}");
+                    return;
+                }
+            };
+            match ch.open_bi(StreamKind::Clipboard).await {
+                Ok((send, recv)) => {
+                    if let Err(e) = veloxdesk_clipboard::run_clipboard_stream(
+                        send,
+                        recv,
+                        backend,
+                        Duration::from_millis(250),
+                        stop_rx,
+                    )
+                    .await
+                    {
+                        tracing::debug!("clipboard sync ended: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("open Clipboard stream failed: {e}"),
+            }
+        });
+        stop_tx
+    }
+
+    async fn add_tunnel(
+        spec: TunnelSpec,
+        ch: Arc<dyn TransportChannel>,
+        tunnels: &mut HashMap<u64, LocalForwarder>,
+        next_id: &mut u64,
+        proxy: &EventLoopProxy<UserEvent>,
+    ) {
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], spec.local_port));
+        match LocalForwarder::bind(bind_addr, spec.remote_host.clone(), spec.remote_port, ch).await {
+            Ok(fwd) => {
+                let id = *next_id;
+                *next_id += 1;
+                let local_addr = fwd.local_addr().to_string();
+                tracing::info!(id, %local_addr, remote = %format!("{}:{}", spec.remote_host, spec.remote_port), "TCP tunnel listening");
+                tunnels.insert(id, fwd);
+                let _ = proxy.send_event(UserEvent::Session(SessionEvent::TunnelAdded(ActiveTunnel {
+                    id,
+                    local_addr,
+                    remote_host: spec.remote_host,
+                    remote_port: spec.remote_port,
+                })));
+            }
+            Err(e) => {
+                let _ = proxy.send_event(UserEvent::Session(SessionEvent::TunnelError(format!(
+                    "tunnel {} -> {}:{}: {e}",
+                    spec.local_port, spec.remote_host, spec.remote_port
+                ))));
+            }
+        }
+    }
+
+    fn spawn_file_action(
+        client: Arc<FileTransferClient>,
+        action: FileAction,
+        proxy: EventLoopProxy<UserEvent>,
+    ) {
+        tokio::spawn(async move {
+            match action {
+                FileAction::ListDir(path) => match client.list_dir(&path).await {
+                    Ok(entries) => {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing { path, entries }));
+                    }
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileError(e.to_string())));
+                    }
+                },
+                FileAction::Mkdir(path) => match client.mkdir(&path).await {
+                    Ok(()) => {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
+                            "Created directory {path}"
+                        ))));
+                        let parent = veloxdesk_ui::parent_remote_path(&path);
+                        if let Ok(entries) = client.list_dir(&parent).await {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing {
+                                path: parent,
+                                entries,
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileError(e.to_string())));
+                    }
+                },
+                FileAction::Delete(path) => match client.delete(&path).await {
+                    Ok(()) => {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
+                            "Deleted {path}"
+                        ))));
+                        let parent = veloxdesk_ui::parent_remote_path(&path);
+                        if let Ok(entries) = client.list_dir(&parent).await {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing {
+                                path: parent,
+                                entries,
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileError(e.to_string())));
+                    }
+                },
+                FileAction::Rename { from, to } => match client.rename(&from, &to).await {
+                    Ok(()) => {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
+                            "Renamed to {to}"
+                        ))));
+                        let parent = veloxdesk_ui::parent_remote_path(&to);
+                        if let Ok(entries) = client.list_dir(&parent).await {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing {
+                                path: parent,
+                                entries,
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileError(e.to_string())));
+                    }
+                },
+                FileAction::Download { remote_path, local_path, resume, compress } => {
+                    let label = format!("Downloading {remote_path}");
+                    let p_proxy = proxy.clone();
+                    let p_label = label.clone();
+                    let cb = Arc::new(move |done: u64, total: u64| {
+                        let _ = p_proxy.send_event(UserEvent::Session(SessionEvent::FileProgress(Some(
+                            TransferProgress { label: p_label.clone(), bytes_done: done, bytes_total: total },
+                        ))));
+                    });
+                    match client
+                        .download(&remote_path, Path::new(&local_path), resume, compress, Some(cb))
+                        .await
+                    {
+                        Ok(rep) => {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
+                                "Downloaded {} ({} bytes, resumed from {})",
+                                remote_path, rep.total_bytes, rep.resumed_from
+                            ))));
+                        }
+                        Err(e) => {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileError(e.to_string())));
+                        }
+                    }
+                }
+                FileAction::Upload { local_path, remote_path, resume, compress } => {
+                    let label = format!("Uploading {remote_path}");
+                    let p_proxy = proxy.clone();
+                    let p_label = label.clone();
+                    let cb = Arc::new(move |done: u64, total: u64| {
+                        let _ = p_proxy.send_event(UserEvent::Session(SessionEvent::FileProgress(Some(
+                            TransferProgress { label: p_label.clone(), bytes_done: done, bytes_total: total },
+                        ))));
+                    });
+                    match client
+                        .upload(Path::new(&local_path), &remote_path, resume, compress, Some(cb))
+                        .await
+                    {
+                        Ok(rep) => {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
+                                "Uploaded {} ({} bytes, resumed from {})",
+                                remote_path, rep.total_bytes, rep.resumed_from
+                            ))));
+                            let parent = veloxdesk_ui::parent_remote_path(&remote_path);
+                            if let Ok(entries) = client.list_dir(&parent).await {
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing {
+                                    path: parent,
+                                    entries,
+                                }));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileError(e.to_string())));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    enum TermCtrl {
+        Input(Vec<u8>),
+        Resize { cols: u32, rows: u32 },
+        Close,
+    }
+
+    fn spawn_terminal_task(
+        ch: Arc<dyn TransportChannel>,
+        cols: u32,
+        rows: u32,
+        shell: String,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> mpsc::UnboundedSender<TermCtrl> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut client = match TerminalClient::open(ch.as_ref(), cols, rows, shell).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = proxy.send_event(UserEvent::Session(SessionEvent::TerminalError(e.to_string())));
+                    return;
+                }
+            };
+            let _ = proxy.send_event(UserEvent::Session(SessionEvent::TerminalOpened));
+            loop {
+                tokio::select! {
+                    ev = client.recv() => match ev {
+                        Ok(TerminalEvent::Data(bytes)) => {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::TerminalOutput(bytes.to_vec())));
+                        }
+                        Ok(TerminalEvent::Exit(code)) => {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::TerminalExit(code)));
+                            break;
+                        }
+                        Err(CoreError::Closed) => {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::TerminalExit(0)));
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::TerminalError(e.to_string())));
+                            break;
+                        }
+                    },
+                    cmd = rx.recv() => match cmd {
+                        Some(TermCtrl::Input(data)) => {
+                            if let Err(e) = client.write(&data).await {
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::TerminalError(e.to_string())));
+                                break;
+                            }
+                        }
+                        Some(TermCtrl::Resize { cols, rows }) => {
+                            let _ = client.resize(cols, rows).await;
+                        }
+                        Some(TermCtrl::Close) | None => break,
+                    },
+                }
+            }
+        });
+        tx
     }
 }

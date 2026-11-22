@@ -21,12 +21,20 @@ toml = "0.9"
 tracing.workspace = true
 veloxdesk-audio = { workspace = true }
 veloxdesk-capture = { workspace = true }
+veloxdesk-clipboard = { workspace = true }
 veloxdesk-codec = { workspace = true }
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-crypto = { workspace = true }
+veloxdesk-file-transfer = { workspace = true }
 veloxdesk-input = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+veloxdesk-terminal = { workspace = true }
 veloxdesk-transport = { workspace = true }
+veloxdesk-tunnel = { workspace = true }
+veloxdesk-virtual-display = { workspace = true }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_StationsAndDesktops"] }
 
 [lints]
 workspace = true

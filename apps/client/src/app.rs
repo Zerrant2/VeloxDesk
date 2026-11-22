@@ -20,8 +20,9 @@ use veloxdesk_render::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use veloxdesk_render::{RenderBreakdown, SurfaceOptions, VideoSurface, egui};
 use veloxdesk_ui::{
-    ConnectAction, ConnectScreen, ConnectTarget, Mode, PasswordAction, PasswordPrompt, Present, SessionInfo,
-    SessionToolbar, Settings, ToolbarAction, format_device_id, parse_rendezvous_addr, parse_target, settings_window,
+    ConnectAction, ConnectScreen, ConnectTarget, FileAction, FileManagerWindow, Mode, PasswordAction, PasswordPrompt,
+    Present, SessionInfo, SessionToolbar, Settings, TerminalAction, TerminalWindow, ToolbarAction, TunnelAction,
+    TunnelSpec, TunnelsWindow, format_device_id, parse_rendezvous_addr, parse_target, settings_window,
 };
 
 use crate::input::{self, RelativeAccum, WheelAccum};
@@ -83,12 +84,14 @@ enum State {
     TestPattern(Box<TestPatternState>),
 }
 
-/// Viewer-side CLI overrides for M2 P2P / E2EE connections.
+/// Viewer-side CLI overrides for M2/M4 P2P, E2EE, tunnels, and portable mode.
 #[derive(Debug, Clone, Default)]
 pub struct ViewerCliOpts {
     pub rendezvous: Option<String>,
     pub password: Option<String>,
     pub relay_only: bool,
+    pub tunnels: Vec<TunnelSpec>,
+    pub settings_path: Option<std::path::PathBuf>,
 }
 
 /// UI actions collected during the egui pass and applied afterwards.
@@ -96,6 +99,9 @@ enum UiAction {
     Connect(ConnectAction),
     Toolbar(ToolbarAction),
     Password(PasswordAction),
+    File(FileAction),
+    Terminal(TerminalAction),
+    Tunnel(TunnelAction),
 }
 
 pub struct App {
@@ -109,6 +115,9 @@ pub struct App {
     connect: ConnectScreen,
     toolbar: SessionToolbar,
     password_prompt: Option<PasswordPrompt>,
+    files: FileManagerWindow,
+    terminal: TerminalWindow,
+    tunnels: TunnelsWindow,
     settings_open: bool,
     modifiers: ModifiersState,
     pressed: HashSet<KeyCode>,
@@ -142,6 +151,9 @@ impl App {
             connect,
             toolbar: SessionToolbar::default(),
             password_prompt: None,
+            files: FileManagerWindow::default(),
+            terminal: TerminalWindow::default(),
+            tunnels: TunnelsWindow::default(),
             settings_open: false,
             modifiers: ModifiersState::empty(),
             pressed: HashSet::new(),
@@ -154,6 +166,16 @@ impl App {
             cursor_image: None,
             settings,
             exit_code: 0,
+        }
+    }
+
+    fn save_settings(&self) {
+        if let Some(p) = &self.viewer_opts.settings_path {
+            if let Err(e) = self.settings.save(p) {
+                tracing::warn!("saving settings to {}: {e}", p.display());
+            }
+        } else {
+            self.settings.save_default();
         }
     }
 
@@ -198,7 +220,7 @@ impl App {
             return;
         }
         self.settings.push_recent(&address);
-        self.settings.save_default();
+        self.save_settings();
         let (vw, vh, monitor_hz) = self
             .surface
             .as_ref()
@@ -223,6 +245,8 @@ impl App {
             prefer_gpu_decode,
             audio_enabled: self.settings.audio_enabled,
             mic_enabled: self.settings.mic_enabled,
+            clipboard_sync: self.settings.clipboard_sync,
+            initial_tunnels: self.viewer_opts.tunnels.clone(),
             hdr_10bit: self.settings.hdr_10bit,
             yuv444: self.settings.yuv444,
             viewer_size: (vw, vh),
@@ -251,6 +275,16 @@ impl App {
         self.connect.status = None;
         self.connect.error = reason;
         self.password_prompt = None;
+        self.files.open = false;
+        self.files.progress = None;
+        self.terminal.open = false;
+        self.terminal.connected = false;
+        self.tunnels.open = false;
+        self.tunnels.active.clear();
+        self.session_info.privacy_mode = false;
+        self.session_info.files_open = false;
+        self.session_info.terminal_open = false;
+        self.session_info.tunnels_open = false;
         self.cursor_image = None;
         if let Some(s) = &mut self.surface {
             s.set_cursor(None, 0, 0, false);
@@ -399,7 +433,36 @@ impl App {
                 if let State::Session { handle, .. } = &self.state {
                     handle.send(SessionCommand::SetMic(on));
                 }
-                self.settings.save_default();
+                self.save_settings();
+            }
+            ToolbarAction::SetClipboardSync(on) => {
+                if let State::Session { handle, .. } = &self.state {
+                    handle.send(SessionCommand::SetClipboardSync(on));
+                }
+                self.save_settings();
+            }
+            ToolbarAction::SetPrivacyMode(enable) => {
+                if let State::Session { handle, .. } = &self.state {
+                    handle.send(SessionCommand::SetPrivacyMode(enable));
+                }
+            }
+            ToolbarAction::ToggleFiles => {
+                self.files.open = !self.files.open;
+                self.session_info.files_open = self.files.open;
+                if self.files.open
+                    && self.files.entries.is_empty()
+                    && let State::Session { handle, .. } = &self.state
+                {
+                    handle.send(SessionCommand::File(FileAction::ListDir(self.files.current_path.clone())));
+                }
+            }
+            ToolbarAction::ToggleTerminal => {
+                self.terminal.open = !self.terminal.open;
+                self.session_info.terminal_open = self.terminal.open;
+            }
+            ToolbarAction::ToggleTunnels => {
+                self.tunnels.open = !self.tunnels.open;
+                self.session_info.tunnels_open = self.tunnels.open;
             }
             ToolbarAction::TogglePointerLock => self.toggle_pointer_lock(),
             ToolbarAction::SetPresent(p) => {
@@ -454,8 +517,14 @@ impl App {
         let connect = &mut self.connect;
         let toolbar = &mut self.toolbar;
         let password_prompt = &mut self.password_prompt;
+        let files = &mut self.files;
+        let terminal = &mut self.terminal;
+        let tunnels = &mut self.tunnels;
         let settings_open = &mut self.settings_open;
-        let info = &self.session_info;
+        let info = &mut self.session_info;
+        info.files_open = files.open;
+        info.terminal_open = terminal.open;
+        info.tunnels_open = tunnels.open;
         let state = &self.state;
         let mut ui_fn = |ui: &mut egui::Ui| {
             match state {
@@ -477,6 +546,21 @@ impl App {
                                     ui.label("Waiting for video…");
                                 });
                             });
+                    }
+                    if files.open {
+                        for a in files.show(ui.ctx()) {
+                            actions.push(UiAction::File(a));
+                        }
+                    }
+                    if terminal.open {
+                        for a in terminal.show(ui.ctx()) {
+                            actions.push(UiAction::Terminal(a));
+                        }
+                    }
+                    if tunnels.open {
+                        for a in tunnels.show(ui.ctx()) {
+                            actions.push(UiAction::Tunnel(a));
+                        }
                     }
                 }
                 State::TestPattern(tp) => {
@@ -530,6 +614,24 @@ impl App {
                         handle.send(SessionCommand::CancelAuth);
                     }
                     self.end_session(None);
+                }
+                UiAction::File(fa) => {
+                    if let State::Session { handle, .. } = &self.state {
+                        self.files.error = None;
+                        handle.send(SessionCommand::File(fa));
+                    }
+                }
+                UiAction::Terminal(ta) => {
+                    if let State::Session { handle, .. } = &self.state {
+                        self.terminal.error = None;
+                        handle.send(SessionCommand::Terminal(ta));
+                    }
+                }
+                UiAction::Tunnel(ta) => {
+                    if let State::Session { handle, .. } = &self.state {
+                        self.tunnels.error = None;
+                        handle.send(SessionCommand::Tunnel(ta));
+                    }
                 }
             }
         }
@@ -697,6 +799,61 @@ impl App {
                     }
                     other => other,
                 };
+            }
+            SessionEvent::DisplayList(displays) => {
+                self.session_info.displays = displays.clone();
+                if let State::Session { config, .. } = &mut self.state {
+                    config.displays = displays;
+                }
+            }
+            SessionEvent::PrivacyMode { enabled, error } => {
+                self.session_info.privacy_mode = enabled;
+                if let Some(e) = error {
+                    tracing::warn!("privacy mode: {e}");
+                }
+            }
+            SessionEvent::FileListing { path, entries } => {
+                self.files.current_path = path;
+                self.files.entries = entries;
+                self.files.selected = None;
+                self.files.error = None;
+            }
+            SessionEvent::FileProgress(p) => {
+                self.files.progress = p;
+            }
+            SessionEvent::FileStatus(s) => {
+                self.files.status = Some(s);
+                self.files.progress = None;
+            }
+            SessionEvent::FileError(e) => {
+                self.files.error = Some(e);
+                self.files.progress = None;
+            }
+            SessionEvent::TerminalOpened => {
+                self.terminal.connected = true;
+                self.terminal.exit_code = None;
+                self.terminal.error = None;
+            }
+            SessionEvent::TerminalOutput(bytes) => {
+                self.terminal.append_output(&bytes);
+            }
+            SessionEvent::TerminalExit(code) => {
+                self.terminal.connected = false;
+                self.terminal.exit_code = Some(code);
+            }
+            SessionEvent::TerminalError(e) => {
+                self.terminal.connected = false;
+                self.terminal.error = Some(e);
+            }
+            SessionEvent::TunnelAdded(t) => {
+                self.tunnels.active.push(t);
+                self.tunnels.error = None;
+            }
+            SessionEvent::TunnelRemoved(id) => {
+                self.tunnels.active.retain(|t| t.id != id);
+            }
+            SessionEvent::TunnelError(e) => {
+                self.tunnels.error = Some(e);
             }
             SessionEvent::CursorShape(img) => {
                 if let Some(s) = &mut self.surface {

@@ -15,6 +15,11 @@ pub enum ToolbarAction {
     SetScale(Scale),
     SetAudio(bool),
     SetMic(bool),
+    SetClipboardSync(bool),
+    SetPrivacyMode(bool),
+    ToggleFiles,
+    ToggleTerminal,
+    ToggleTunnels,
     TogglePointerLock,
     ToggleHud,
     ToggleFullscreen,
@@ -31,6 +36,10 @@ pub struct SessionInfo {
     pub hud_visible: bool,
     pub pointer_locked: bool,
     pub active_gamepads: u8,
+    pub privacy_mode: bool,
+    pub files_open: bool,
+    pub terminal_open: bool,
+    pub tunnels_open: bool,
 }
 
 #[derive(Debug, Default)]
@@ -159,6 +168,42 @@ impl SessionToolbar {
                             if info.active_gamepads > 0 {
                                 ui.label(format!("Pad×{}", info.active_gamepads));
                             }
+                            if ui
+                                .selectable_label(info.files_open, "Files")
+                                .on_hover_text("File Manager")
+                                .clicked()
+                            {
+                                out.push(ToolbarAction::ToggleFiles);
+                            }
+                            if ui
+                                .selectable_label(info.terminal_open, "Term")
+                                .on_hover_text("Remote Terminal")
+                                .clicked()
+                            {
+                                out.push(ToolbarAction::ToggleTerminal);
+                            }
+                            if ui
+                                .selectable_label(info.tunnels_open, "Tunnels")
+                                .on_hover_text("TCP Port Forwarding")
+                                .clicked()
+                            {
+                                out.push(ToolbarAction::ToggleTunnels);
+                            }
+                            if ui
+                                .selectable_label(info.privacy_mode, "Privacy")
+                                .on_hover_text("Blank host monitor (Privacy Mode)")
+                                .clicked()
+                            {
+                                out.push(ToolbarAction::SetPrivacyMode(!info.privacy_mode));
+                            }
+                            if ui
+                                .selectable_label(settings.clipboard_sync, "Clip")
+                                .on_hover_text("Toggle clipboard synchronization")
+                                .clicked()
+                            {
+                                settings.clipboard_sync = !settings.clipboard_sync;
+                                out.push(ToolbarAction::SetClipboardSync(settings.clipboard_sync));
+                            }
                             if ui.selectable_label(info.hud_visible, "HUD").on_hover_text("Ctrl+Shift+H").clicked() {
                                 out.push(ToolbarAction::ToggleHud);
                             }
@@ -257,6 +302,10 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, settings: &mut Sett
             ui.checkbox(&mut settings.relative_mouse_in_gaming, "Pointer Lock (Ctrl+Alt+G), relative motion");
             ui.end_row();
 
+            ui.label("Clipboard");
+            ui.checkbox(&mut settings.clipboard_sync, "Sync clipboard (text, images, files)");
+            ui.end_row();
+
             ui.label("Rendezvous server");
             ui.add(
                 egui::TextEdit::singleline(&mut settings.rendezvous_server)
@@ -265,8 +314,6 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, settings: &mut Sett
             );
             ui.end_row();
         });
-        ui.add_space(6.0);
-        ui.weak("Audio, clipboard and file transfer settings arrive in later milestones.");
     });
     if *settings != before {
         if settings.present != before.present {
@@ -286,6 +333,9 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, settings: &mut Sett
         }
         if settings.mic_enabled != before.mic_enabled {
             out.push(ToolbarAction::SetMic(settings.mic_enabled));
+        }
+        if settings.clipboard_sync != before.clipboard_sync {
+            out.push(ToolbarAction::SetClipboardSync(settings.clipboard_sync));
         }
         if settings.mode != before.mode {
             out.push(ToolbarAction::SetMode(settings.mode));
@@ -323,6 +373,10 @@ mod tests {
             hud_visible: false,
             pointer_locked: true,
             active_gamepads: 2,
+            privacy_mode: false,
+            files_open: false,
+            terminal_open: false,
+            tunnels_open: false,
         };
         let mut screen = crate::connect::ConnectScreen::new(&settings);
         let mut open = true;

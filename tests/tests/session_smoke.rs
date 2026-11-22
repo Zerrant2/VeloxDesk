@@ -165,6 +165,10 @@ async fn host_viewer_session_end_to_end() {
         audio_capture: None,
         audio_encoder: None,
         audio_playback: None,
+        clipboard: None,
+        privacy: None,
+        file_transfer: None,
+        tunnel_policy: None,
     };
 
     let cfg = Arc::new(HostConfig {

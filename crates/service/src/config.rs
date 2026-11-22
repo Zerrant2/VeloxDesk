@@ -64,6 +64,31 @@ pub struct HostConfig {
     pub audio_frame_ms: f32,
     /// Allow viewer microphone audio playback (`stream_id = 1`) on the host.
     pub allow_mic: bool,
+    /// Portable mode: store config and device identity next to the executable instead of AppData.
+    pub portable: bool,
+}
+
+/// File paths resolved next to the VeloxDesk executable in `--portable` mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortablePaths {
+    pub dir: PathBuf,
+    pub config_path: PathBuf,
+    pub identity_path: PathBuf,
+}
+
+/// Resolve portable config & identity paths next to `exe_path` (or `std::env::current_exe()`).
+pub fn resolve_portable_paths(exe_path: Option<&Path>) -> PortablePaths {
+    let dir = exe_path
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    PortablePaths {
+        config_path: dir.join("veloxdesk.toml"),
+        identity_path: dir.join("identity.key"),
+        dir,
+    }
 }
 
 impl Default for HostConfig {
@@ -90,6 +115,7 @@ impl Default for HostConfig {
             audio_bitrate_kbps: 128,
             audio_frame_ms: 5.0,
             allow_mic: false,
+            portable: false,
         }
     }
 }
@@ -400,15 +426,33 @@ pub struct HostArgs {
     /// Allow viewer microphone audio playback on the host.
     #[arg(long)]
     pub allow_mic: bool,
+    /// Portable mode: read/write config and identity next to the executable instead of AppData.
+    #[arg(long)]
+    pub portable: bool,
 }
 
 impl HostArgs {
-    /// Defaults < `--config` file < flags.
+    /// Defaults < `--config` file (or portable `veloxdesk.toml`) < flags.
     pub fn resolve(&self) -> anyhow::Result<HostConfig> {
+        self.resolve_with_exe(None)
+    }
+
+    /// Like [`Self::resolve`], using `exe_path` as the base for `--portable` paths (useful in tests).
+    pub fn resolve_with_exe(&self, exe_path: Option<&Path>) -> anyhow::Result<HostConfig> {
+        let portable_paths = self.portable.then(|| resolve_portable_paths(exe_path));
         let mut cfg = match &self.config {
             Some(p) => HostConfig::from_toml_file(p)?,
-            None => HostConfig::default(),
+            None => match &portable_paths {
+                Some(pp) if pp.config_path.exists() => HostConfig::from_toml_file(&pp.config_path)?,
+                _ => HostConfig::default(),
+            },
         };
+        if let Some(pp) = portable_paths {
+            cfg.portable = true;
+            if cfg.identity_path.is_none() {
+                cfg.identity_path = Some(pp.identity_path);
+            }
+        }
         if let Some(v) = self.bind {
             cfg.bind = v;
         }
@@ -607,5 +651,21 @@ mod tests {
         let resolved = args.resolve().unwrap();
         assert_eq!(resolved.auth.one_time_password.as_deref(), Some("ABCDEFGH"));
         assert!(!resolved.auth.allow_no_auth);
+    }
+
+    #[test]
+    fn portable_mode_resolves_adjacent_config_and_identity() {
+        let dir = std::env::temp_dir().join(format!("vdk-portable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_exe = dir.join("veloxdesk.exe");
+        std::fs::write(dir.join("veloxdesk.toml"), "max_fps = 144\n").unwrap();
+
+        let args = HostArgs { portable: true, ..Default::default() };
+        let cfg = args.resolve_with_exe(Some(&fake_exe)).unwrap();
+        assert!(cfg.portable);
+        assert_eq!(cfg.max_fps, 144);
+        assert_eq!(cfg.identity_path, Some(dir.join("identity.key")));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -21,6 +21,10 @@ net = [
     "dep:veloxdesk-audio",
     "dep:veloxdesk-crypto",
     "dep:veloxdesk-service",
+    "dep:veloxdesk-clipboard",
+    "dep:veloxdesk-file-transfer",
+    "dep:veloxdesk-tunnel",
+    "dep:veloxdesk-terminal",
     "dep:crossbeam-channel",
 ]
 
@@ -34,6 +38,10 @@ veloxdesk-codec = { workspace = true, optional = true }
 veloxdesk-audio = { workspace = true, optional = true }
 veloxdesk-crypto = { workspace = true, optional = true }
 veloxdesk-service = { workspace = true, optional = true }
+veloxdesk-clipboard = { workspace = true, optional = true }
+veloxdesk-file-transfer = { workspace = true, optional = true }
+veloxdesk-tunnel = { workspace = true, optional = true }
+veloxdesk-terminal = { workspace = true, optional = true }
 winit = "0.30.13"
 egui = { workspace = true }
 clap = { workspace = true }

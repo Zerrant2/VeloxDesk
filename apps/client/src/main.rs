@@ -8,12 +8,13 @@ mod session;
 mod stats;
 mod viewer;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use tracing_subscriber::EnvFilter;
 use veloxdesk_render::winit::event_loop::EventLoop;
-use veloxdesk_ui::{Mode, Present, Settings};
+use veloxdesk_ui::{Mode, Present, Settings, TunnelSpec, parse_tunnel_spec};
 
 use crate::app::{App, Launch, TestPatternOpts, UserEvent, ViewerCliOpts};
 
@@ -101,15 +102,155 @@ struct Cli {
     #[arg(long)]
     mic: bool,
 
-    /// Host options (used with `--host`).
+    /// Forward a local TCP port through the remote host (`local_port:remote_host:remote_port`, repeatable).
+    #[arg(long = "tunnel", value_name = "SPEC")]
+    tunnels: Vec<String>,
+
+    /// Query the OS host service status, active desktop kind, and local daemon IPC status.
+    #[arg(
+        long,
+        conflicts_with_all = ["host", "connect", "test_pattern", "service_install", "service_uninstall", "service_run"]
+    )]
+    service_status: bool,
+
+    /// Install VeloxDesk as an OS system service (Windows SCM / Linux systemd).
+    #[arg(
+        long,
+        conflicts_with_all = ["host", "connect", "test_pattern", "service_status", "service_uninstall", "service_run"]
+    )]
+    service_install: bool,
+
+    /// Uninstall the VeloxDesk OS system service.
+    #[arg(
+        long,
+        conflicts_with_all = ["host", "connect", "test_pattern", "service_status", "service_install", "service_run"]
+    )]
+    service_uninstall: bool,
+
+    /// Service entry point invoked by the OS service manager (implies `--host`).
+    #[arg(
+        long,
+        conflicts_with_all = ["connect", "test_pattern", "service_status", "service_install", "service_uninstall"]
+    )]
+    service_run: bool,
+
+    /// Portable mode: store config, settings, and identity next to the executable (also provided by `HostArgs` when `net` is enabled).
+    #[cfg(not(feature = "net"))]
+    #[arg(long)]
+    portable: bool,
+
+    /// Optional configuration file path (provided by `HostArgs` when `net` is enabled).
+    #[cfg(not(feature = "net"))]
+    #[arg(long = "config", value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Host options (used with `--host`, includes `--config` and `--portable`).
     #[cfg(feature = "net")]
     #[command(flatten)]
     host_args: veloxdesk_service::HostArgs,
 }
 
+impl Cli {
+    fn is_portable(&self) -> bool {
+        #[cfg(feature = "net")]
+        {
+            self.host_args.portable
+        }
+        #[cfg(not(feature = "net"))]
+        {
+            self.portable
+        }
+    }
+}
+
+fn portable_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn parse_cli_tunnels(raw: &[String]) -> anyhow::Result<Vec<TunnelSpec>> {
+    raw.iter()
+        .map(|s| parse_tunnel_spec(s).map_err(|e| anyhow::anyhow!("invalid --tunnel `{s}`: {e}")))
+        .collect()
+}
+
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,wgpu=warn,naga=warn"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).try_init();
+}
+
+#[cfg(feature = "net")]
+fn run_service_status() -> anyhow::Result<()> {
+    let status = veloxdesk_service::service_status().map_err(anyhow::Error::from)?;
+    let desktop = veloxdesk_service::detect_desktop();
+    println!("service: {status}");
+    println!("desktop: {desktop}");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, veloxdesk_service::DEFAULT_IPC_PORT));
+    match rt.block_on(veloxdesk_service::IpcClient::request(addr, &veloxdesk_service::IpcRequest::Status)) {
+        Ok(veloxdesk_service::IpcResponse::Status { device_id, active_otp, active_sessions, desktop }) => {
+            println!("ipc: connected ({addr})");
+            println!("  device_id: {}", veloxdesk_ui::format_device_id(&device_id));
+            if let Some(otp) = active_otp {
+                println!("  active_otp: {otp}");
+            }
+            println!("  active_sessions: {active_sessions}");
+            println!("  host_desktop: {desktop}");
+        }
+        Ok(veloxdesk_service::IpcResponse::Error { message }) => {
+            println!("ipc: error ({message})");
+        }
+        Ok(other) => {
+            println!("ipc: {other:?}");
+        }
+        Err(_) => {
+            println!("ipc: not running");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "net")]
+fn run_service_install(args: &veloxdesk_service::HostArgs, rendezvous: Option<&str>) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
+    let mut extra = Vec::new();
+    if args.portable {
+        extra.push("--portable".into());
+    }
+    if let Some(cfg) = &args.config {
+        extra.push("--config".into());
+        extra.push(cfg.display().to_string());
+    }
+    if let Some(bind) = args.bind {
+        extra.push("--bind".into());
+        extra.push(bind.to_string());
+    }
+    if let Some(rdv) = rendezvous {
+        extra.push("--rendezvous".into());
+        extra.push(rdv.to_string());
+    }
+    let msg = veloxdesk_service::install_service(&exe, &extra).map_err(anyhow::Error::from)?;
+    if !msg.is_empty() {
+        println!("{msg}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "net")]
+fn run_service_uninstall() -> anyhow::Result<()> {
+    let msg = veloxdesk_service::uninstall_service().map_err(anyhow::Error::from)?;
+    if !msg.is_empty() {
+        println!("{msg}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "net"))]
+fn run_service_unavailable(flag: &str) -> anyhow::Result<()> {
+    anyhow::bail!("{flag} requires the `net` feature (rebuild with `--features net`)")
 }
 
 #[cfg(feature = "net")]
@@ -132,6 +273,9 @@ fn run_host_cli(
         cfg.bind,
         veloxdesk_ui::format_device_id(&id.device_id()),
     );
+    if cfg.portable {
+        println!("  mode: portable");
+    }
     if let Some(rdv) = cfg.rendezvous {
         println!("  rendezvous: {rdv}");
     }
@@ -145,25 +289,67 @@ fn run_host_cli() -> anyhow::Result<()> {
     anyhow::bail!("--host requires the `net` feature (rebuild with `--features net`)")
 }
 
+fn exit_from_result(label: &str, res: anyhow::Result<()>) -> ExitCode {
+    match res {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{label}: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     init_logging();
     let cli = Cli::parse();
 
-    if cli.host {
+    if cli.service_status {
+        #[cfg(feature = "net")]
+        return exit_from_result("service-status error", run_service_status());
+        #[cfg(not(feature = "net"))]
+        return exit_from_result("service-status error", run_service_unavailable("--service-status"));
+    }
+    if cli.service_install {
+        #[cfg(feature = "net")]
+        return exit_from_result(
+            "service-install error",
+            run_service_install(&cli.host_args, cli.rendezvous.as_deref()),
+        );
+        #[cfg(not(feature = "net"))]
+        return exit_from_result("service-install error", run_service_unavailable("--service-install"));
+    }
+    if cli.service_uninstall {
+        #[cfg(feature = "net")]
+        return exit_from_result("service-uninstall error", run_service_uninstall());
+        #[cfg(not(feature = "net"))]
+        return exit_from_result("service-uninstall error", run_service_unavailable("--service-uninstall"));
+    }
+
+    if cli.host || cli.service_run {
         #[cfg(feature = "net")]
         let res = run_host_cli(cli.host_args, cli.rendezvous, cli.password);
         #[cfg(not(feature = "net"))]
         let res = run_host_cli();
-        return match res {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("host error: {e:#}");
-                ExitCode::FAILURE
-            }
-        };
+        return exit_from_result("host error", res);
     }
 
-    let mut settings = Settings::load_or_default();
+    let parsed_tunnels = match parse_cli_tunnels(&cli.tunnels) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (mut settings, settings_path) = if cli.is_portable() {
+        let dir = portable_dir();
+        viewer::set_identity_override(dir.join("identity.key"));
+        let path = dir.join("veloxdesk-settings.json");
+        let loaded = Settings::load(&path).unwrap_or_default();
+        (loaded, Some(path))
+    } else {
+        (Settings::load_or_default(), None)
+    };
     if cli.hud {
         settings.show_hud = true;
     }
@@ -213,6 +399,8 @@ fn main() -> ExitCode {
         rendezvous: cli.rendezvous,
         password: cli.password,
         relay_only: cli.relay_only,
+        tunnels: parsed_tunnels,
+        settings_path,
     };
     let proxy = event_loop.create_proxy();
     let mut app = App::new(launch, proxy, settings, cli.present.map(PresentArg::to_ui), viewer_opts);
@@ -314,5 +502,45 @@ mod tests {
         assert_eq!(cfg.max_fps, 120);
         assert_eq!(cfg.bitrate_kbps, 30000);
         assert!(!cfg.prefer_hw);
+    }
+
+    #[test]
+    fn cli_m4_flags_and_no_clap_collisions() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+
+        let conn = Cli::try_parse_from([
+            "veloxdesk",
+            "--connect",
+            "127.0.0.1:21118",
+            "--portable",
+            "--tunnel",
+            "8080:127.0.0.1:80",
+            "--tunnel",
+            "5432:db.internal:5432",
+        ])
+        .unwrap();
+        assert!(conn.is_portable());
+        let specs = parse_cli_tunnels(&conn.tunnels).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].local_port, 8080);
+        assert_eq!(specs[0].remote_host, "127.0.0.1");
+        assert_eq!(specs[0].remote_port, 80);
+        assert_eq!(specs[1].local_port, 5432);
+        assert_eq!(specs[1].remote_host, "db.internal");
+        assert_eq!(specs[1].remote_port, 5432);
+        assert!(parse_cli_tunnels(&["not-a-tunnel".into()]).is_err());
+
+        let svc_st = Cli::try_parse_from(["veloxdesk", "--service-status"]).unwrap();
+        assert!(svc_st.service_status);
+        let svc_in = Cli::try_parse_from(["veloxdesk", "--service-install", "--portable"]).unwrap();
+        assert!(svc_in.service_install && svc_in.is_portable());
+        let svc_un = Cli::try_parse_from(["veloxdesk", "--service-uninstall"]).unwrap();
+        assert!(svc_un.service_uninstall);
+        let svc_run = Cli::try_parse_from(["veloxdesk", "--host", "--service-run", "--config", "veloxdesk.toml"]).unwrap();
+        assert!(svc_run.host && svc_run.service_run);
+
+        assert!(Cli::try_parse_from(["veloxdesk", "--service-status", "--host"]).is_err());
+        assert!(Cli::try_parse_from(["veloxdesk", "--service-install", "--service-uninstall"]).is_err());
     }
 }

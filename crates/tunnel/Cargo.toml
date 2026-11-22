@@ -10,6 +10,14 @@ publish = false
 [dependencies]
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+
+[dev-dependencies]
+veloxdesk-crypto = { workspace = true }
+veloxdesk-transport = { workspace = true }
 
 [lints]
 workspace = true

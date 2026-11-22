@@ -60,6 +60,10 @@ impl HostBackends {
             audio_capture: Some(Arc::new(veloxdesk_audio::create_loopback_capture)),
             audio_encoder: Some(Arc::new(|cfg| Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?)))),
             audio_playback: Some(Arc::new(veloxdesk_audio::create_playback)),
+            clipboard: Some(Arc::new(veloxdesk_clipboard::create_system_clipboard)),
+            privacy: Some(veloxdesk_virtual_display::create_privacy_controller()),
+            file_transfer: Some(veloxdesk_file_transfer::FileTransferConfig::default()),
+            tunnel_policy: Some(veloxdesk_tunnel::TunnelPolicy::default()),
         }
     }
 

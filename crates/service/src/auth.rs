@@ -328,6 +328,20 @@ async fn reject_auth(
     CoreError::AccessDenied(reason.into())
 }
 
+fn default_session_permissions(cfg: &HostConfig) -> Permissions {
+    Permissions {
+        view: true,
+        input: cfg.allow_input,
+        clipboard: true,
+        file_transfer: true,
+        audio: cfg.audio_enabled,
+        tunnel: true,
+        terminal: true,
+        restart: false,
+        privacy_mode: true,
+    }
+}
+
 /// Verify peer identity and execute the M1/M2 authentication handshake after receiving `Hello`.
 pub(crate) async fn authenticate(
     sid: u64,
@@ -364,9 +378,9 @@ pub(crate) async fn authenticate(
     let peer_device_id =
         peer_pk.as_ref().map(device_id_from_public_key).unwrap_or_else(|| hello.device_id.clone());
 
-    // 2. M1 open mode: skip AuthChallenge and auto-accept with configured view/input/audio permissions.
+    // 2. M1 open mode: skip AuthChallenge and auto-accept with configured permissions.
     if cfg.auth.is_open() {
-        let perms = Permissions { view: true, input: cfg.allow_input, audio: cfg.audio_enabled, ..Default::default() };
+        let perms = default_session_permissions(cfg);
         writer
             .send(
                 &Msg::AuthResult(AuthResult {
@@ -523,8 +537,7 @@ pub(crate) async fn authenticate(
         }
         p
     } else {
-        let default_permissions =
-            Permissions { view: true, input: cfg.allow_input, audio: cfg.audio_enabled, ..Default::default() };
+        let default_permissions = default_session_permissions(cfg);
         if cfg.auth.require_accept {
             let Some(handler) = &cfg.auth.approval_handler else {
                 return Err(

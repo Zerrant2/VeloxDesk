@@ -174,6 +174,10 @@ async fn host_quic_loopback_fec_busy_and_shutdown() {
             audio_capture: None,
             audio_encoder: None,
             audio_playback: None,
+            clipboard: None,
+            privacy: None,
+            file_transfer: None,
+            tunnel_policy: None,
         }
     };
     let cfg = HostConfig {
@@ -278,6 +282,10 @@ async fn host_quic_loopback_with_system_codec() {
         audio_capture: None,
         audio_encoder: None,
         audio_playback: None,
+        clipboard: None,
+        privacy: None,
+        file_transfer: None,
+        tunnel_policy: None,
     };
     let cfg = HostConfig {
         bind: addr,
@@ -377,6 +385,10 @@ async fn host_p2p_listener_direct_with_password_auth() {
         audio_capture: None,
         audio_encoder: None,
         audio_playback: None,
+        clipboard: None,
+        privacy: None,
+        file_transfer: None,
+        tunnel_policy: None,
     };
     let cfg = HostConfig { bind: addr, max_fps: 60, idle_fps: 20, auth, ..Default::default() };
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -515,6 +527,10 @@ async fn host_gaming_audio_four_gamepads_and_rumble_over_quic() {
             Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?) as Box<dyn AudioEncoder>)
         })),
         audio_playback: None,
+        clipboard: None,
+        privacy: None,
+        file_transfer: None,
+        tunnel_policy: None,
     };
 
     let cfg = HostConfig {
@@ -612,4 +628,115 @@ async fn host_gaming_audio_four_gamepads_and_rumble_over_quic() {
 
     let _ = stop_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_m4_terminal_privacy_guard_and_file_transfer_over_quic() {
+    use veloxdesk_file_transfer::{FileTransferClient, FileTransferConfig};
+    use veloxdesk_protocol::control::PrivacyMode;
+    use veloxdesk_terminal::{TerminalClient, TerminalEvent};
+    use veloxdesk_virtual_display::{PrivacyController, SimulatedPrivacyController};
+
+    let host_id = DeviceIdentity::generate();
+    let viewer_id = DeviceIdentity::generate();
+    let listener = listen("127.0.0.1:0".parse().unwrap(), &host_id).await.expect("listen");
+    let addr = listener.local_addr();
+
+    let privacy = Arc::new(SimulatedPrivacyController::new());
+    let root = std::env::temp_dir().join(format!("vdk-svc-m4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    let inj_log = Arc::new(Mutex::new(InjLog::default()));
+    let backends = HostBackends {
+        capture: Arc::new(|_| Ok(Box::new(StaticCapture { sent: false }) as Box<dyn FrameCapture>)),
+        encoder: Arc::new(|cfg, _| Ok(Box::new(FakeEncoder { cfg: cfg.clone(), next_id: 0 }) as Box<dyn VideoEncoder>)),
+        injector: Arc::new(move || Ok(Box::new(RecInjector(inj_log.clone())) as Box<dyn InputInjector>)),
+        video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
+        rate: Arc::new(|s, mn, mx| Box::new(TransportAbr(AbrController::new(s, mn, mx)))),
+        audio_capture: None,
+        audio_encoder: None,
+        audio_playback: None,
+        clipboard: None,
+        privacy: Some(privacy.clone()),
+        file_transfer: Some(FileTransferConfig { root_dir: Some(root.clone()), ..Default::default() }),
+        tunnel_policy: None,
+    };
+
+    let cfg = HostConfig { bind: addr, max_fps: 60, audio_enabled: false, ..Default::default() };
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let host_task = tokio::spawn(serve_until(listener, cfg, backends, async {
+        let _ = stop_rx.await;
+    }));
+
+    let ch = Arc::new(connect(addr, &viewer_id, Some(host_id.public_key())).await.expect("connect"));
+    let (send, recv) = ch.open_bi(StreamKind::Control).await.expect("open control");
+    let (mut w, mut r) = framed(send, recv);
+    w.send(
+        &Msg::Hello(Hello {
+            device_id: viewer_id.device_id(),
+            public_key: viewer_id.public_key().to_vec(),
+            protocol_version: 1,
+            ..Default::default()
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+    let Msg::AuthResult(a) = recv_until(&mut r, |_| true).await else { panic!("expected AuthResult") };
+    assert!(a.ok);
+    let _ = recv_until(&mut r, |m| matches!(m, Msg::SessionConfig(_))).await;
+
+    // 1. PrivacyMode enable -> PrivacyModeResult { enabled: true }, RAII auto-restore tested on disconnect!
+    w.send(&Msg::PrivacyMode(PrivacyMode { enable: true }).into()).await.unwrap();
+    let Msg::PrivacyModeResult(pm) = recv_until(&mut r, |m| matches!(m, Msg::PrivacyModeResult(_))).await else {
+        unreachable!()
+    };
+    assert!(pm.enabled && pm.error.is_empty());
+    assert!(privacy.is_enabled());
+
+    // 2. Remote Terminal (ConPTY on Windows / POSIX PTY on Unix) over real QUIC!
+    #[cfg(windows)]
+    let shell = "cmd.exe /C echo VELOXDESK_M4_HOST_OK".to_string();
+    #[cfg(unix)]
+    let shell = "echo VELOXDESK_M4_HOST_OK".to_string();
+    let mut term = TerminalClient::open(ch.as_ref(), 80, 24, shell).await.expect("open terminal");
+    let mut out = Vec::new();
+    let mut code = None;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Ok(ev) = term.recv().await {
+            match ev {
+                TerminalEvent::Data(b) => out.extend_from_slice(&b),
+                TerminalEvent::Exit(c) => {
+                    code = Some(c);
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("terminal output");
+    assert!(String::from_utf8_lossy(&out).contains("VELOXDESK_M4_HOST_OK"));
+    assert_eq!(code, Some(0));
+
+    // 3. File Transfer over real QUIC!
+    let ft = FileTransferClient::new(ch.clone());
+    ft.mkdir("sub").await.expect("mkdir");
+    let entries = ft.list_dir("").await.expect("list_dir");
+    assert!(entries.iter().any(|e| e.name == "sub" && e.is_dir));
+
+    // 4. Close session while privacy mode is still active -> RAII PrivacyGuard MUST auto-restore!
+    w.send(&Msg::Close(Default::default()).into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while privacy.is_enabled() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("PrivacyGuard must auto-restore on session end");
+    assert_eq!(privacy.disable_count(), 1);
+
+    let _ = stop_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
 }

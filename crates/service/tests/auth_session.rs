@@ -193,6 +193,10 @@ fn test_backends(injected: Arc<AtomicUsize>) -> HostBackends {
         audio_capture: None,
         audio_encoder: None,
         audio_playback: None,
+        clipboard: None,
+        privacy: None,
+        file_transfer: None,
+        tunnel_policy: None,
     }
 }
 

@@ -29,9 +29,14 @@ veloxdesk-codec = { workspace = true, optional = true }
 [dev-dependencies]
 veloxdesk-benches = { path = "../benches" }
 veloxdesk-audio = { workspace = true }
+veloxdesk-clipboard = { workspace = true }
+veloxdesk-file-transfer = { workspace = true }
 veloxdesk-render = { workspace = true }
 veloxdesk-server-rendezvous = { workspace = true }
 veloxdesk-server-relay = { workspace = true }
+veloxdesk-terminal = { workspace = true }
+veloxdesk-tunnel = { workspace = true }
+veloxdesk-virtual-display = { workspace = true }
 
 [target."cfg(windows)".dev-dependencies]
 windows = { version = "0.62.2", features = ["Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi_Common"] }
@@ -50,6 +55,10 @@ required-features = ["full"]
 
 [[test]]
 name = "m3_gaming"
+required-features = ["full"]
+
+[[test]]
+name = "m4_rustdesk_parity"
 required-features = ["full"]
 
 [lints]
