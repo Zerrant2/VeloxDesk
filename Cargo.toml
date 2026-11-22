@@ -70,7 +70,7 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 quinn = "0.11"
 wgpu = "30"
-egui = "0.37"
+egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = "0.37"
 clap = { version = "4.6", features = ["derive"] }
 
