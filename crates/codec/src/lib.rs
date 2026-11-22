@@ -613,4 +613,244 @@ mod tests {
             assert!(create_encoder(&cfg, true).is_err());
         }
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn hw_sustained_1080p_1440p_120_240fps_no_pool_leak() {
+        use std::collections::HashSet;
+        use veloxdesk_core_traits::video::GpuHandle;
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let enc_caps = probe_encoders();
+        let dec_caps = probe_decoders();
+        if !enc_caps.iter().any(|c| c.hardware && c.codecs.contains(&VideoCodec::H264))
+            || !dec_caps.iter().any(|c| c.hardware && c.gpu_output && c.codecs.contains(&VideoCodec::H264))
+        {
+            eprintln!("skipping sustained high-FPS GPU test: no HW H.264 enc/dec");
+            return;
+        }
+
+        let dev = win::d3d::create_device(None).expect("d3d11");
+        let luid = win::d3d::device_luid(&dev);
+
+        for &(label, w, h, fps, kbps) in &[
+            ("1080p@120", 1920u32, 1080u32, 120u32, 35_000u32),
+            ("1080p@240", 1920, 1080, 240, 50_000),
+            ("1440p@120", 2560, 1440, 120, 50_000),
+            ("1440p@240", 2560, 1440, 240, 70_000),
+        ] {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut pool = win::d3d::TexturePool::new(desc, false, 2);
+            let holder = pool.get(&dev).expect("src texture");
+
+            let mut cfg = enc_cfg(w, h, VideoCodec::H264);
+            cfg.fps = fps;
+            cfg.bitrate_kbps = kbps;
+            cfg.gpu_input = true;
+            let mut enc = create_encoder(&cfg, true).expect("hw enc");
+            let mut dec = create_decoder(&dec_cfg(w, h, VideoCodec::H264, true), true).expect("hw dec gpu");
+
+            let mut conv_us = Vec::new();
+            let mut enc_us = Vec::new();
+            let mut dec_us = Vec::new();
+            let mut unique_handles: HashSet<usize> = HashSet::new();
+            let mut decoded = 0u32;
+
+            for i in 0..40u32 {
+                let gf = Frame {
+                    width: w,
+                    height: h,
+                    format: PixelFormat::Bgra8,
+                    color_space: ColorSpace::Srgb,
+                    color_range: ColorRange::Full,
+                    data: FrameData::Gpu(win::d3d::gpu_frame(&holder, luid)),
+                    capture_ts: Timestamp(i as u64 * (1_000_000 / fps as u64)),
+                };
+                if let Some(pkt) = enc.encode(&gf, EncodeOptions { force_keyframe: i == 0 }).expect("encode") {
+                    if let Some(df) = dec.decode(&pkt).expect("decode") {
+                        assert_eq!((df.frame.width, df.frame.height), (w, h));
+                        assert_eq!(df.frame.format, PixelFormat::Nv12);
+                        let FrameData::Gpu(ref out_g) = df.frame.data else {
+                            panic!("expected GPU decoded frame");
+                        };
+                        let GpuHandle::D3D11Texture { shared_handle, subresource, .. } = out_g.handle else {
+                            panic!("expected D3D11Texture");
+                        };
+                        assert_eq!(subresource, 0);
+                        unique_handles.insert(shared_handle.expect("shared_handle"));
+                        if i >= 4 {
+                            conv_us.push(pkt.convert_us);
+                            enc_us.push(pkt.encode_us);
+                            dec_us.push(df.decode_us);
+                        }
+                        decoded += 1;
+                    }
+                }
+            }
+
+            assert!(decoded >= 35, "{label}: only decoded {decoded}/40");
+            assert!(
+                unique_handles.len() <= 6,
+                "{label}: decoder texture pool leaked/grew to {} handles (expected <= 6)",
+                unique_handles.len()
+            );
+
+            let pct = |v: &mut Vec<u32>, p: usize| -> u32 {
+                v.sort_unstable();
+                v[(v.len() * p / 100).min(v.len().saturating_sub(1))]
+            };
+            let p50_c = pct(&mut conv_us, 50);
+            let p95_c = pct(&mut conv_us, 95);
+            let p50_e = pct(&mut enc_us, 50);
+            let p95_e = pct(&mut enc_us, 95);
+            let p50_d = pct(&mut dec_us, 50);
+            let p95_d = pct(&mut dec_us, 95);
+            eprintln!(
+                "sustained {label} GPU zero-copy ({decoded}/40, pool={} handles): conv p50={p50_c}us p95={p95_c}us | enc p50={p50_e}us p95={p95_e}us | dec p50={p50_d}us p95={p95_d}us",
+                unique_handles.len()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hw_10bit_hdr_and_yuv444_roundtrips() {
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let enc_caps = probe_encoders();
+        let dec_caps = probe_decoders();
+        let Some(hw_enc) = enc_caps.iter().find(|c| c.hardware) else {
+            eprintln!("skipping 10-bit/4:4:4 HW roundtrip: no HW encoder");
+            return;
+        };
+
+        let (w, h) = (1280u32, 720u32);
+        let dev = win::d3d::create_device(None).expect("d3d11");
+        let luid = win::d3d::device_luid(&dev);
+
+        // 1. 10-bit HDR10 (RGB10A2 -> GPU P010 -> NVENC AV1/HEVC Main10 -> D3D11VA P010 decode if AV1 decoder present)
+        if hw_enc.ten_bit {
+            let desc10 = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R10G10B10A2_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut pool10 = win::d3d::TexturePool::new(desc10, false, 2);
+            let holder10 = pool10.get(&dev).expect("rgb10a2 tex");
+
+            // Test HEVC Main10 10-bit P010 GPU encode (multi-frame).
+            if hw_enc.codecs.contains(&VideoCodec::H265) {
+                let mut cfg = enc_cfg(w, h, VideoCodec::H265);
+                cfg.bit_depth = 10;
+                cfg.input_format = PixelFormat::Rgb10a2;
+                cfg.color_space = ColorSpace::Bt2020Pq;
+                cfg.gpu_input = true;
+                let mut enc10 = win::mf_enc::MfEncoder::new(&cfg).expect("hevc main10 enc");
+                let mut pkts = 0u32;
+                for i in 0..8u32 {
+                    let gf = Frame {
+                        width: w,
+                        height: h,
+                        format: PixelFormat::Rgb10a2,
+                        color_space: ColorSpace::Bt2020Pq,
+                        color_range: ColorRange::Full,
+                        data: FrameData::Gpu(win::d3d::gpu_frame(&holder10, luid)),
+                        capture_ts: Timestamp(i as u64 * 16_667),
+                    };
+                    if let Some(pkt) = enc10.encode(&gf, EncodeOptions { force_keyframe: i == 0 }).expect("hevc 10b enc") {
+                        assert!(!pkt.data.is_empty());
+                        pkts += 1;
+                    }
+                }
+                eprintln!("720p 10-bit HDR10 HEVC Main10 (RGB10A2->P010->NVENC): encoded {pkts}/8 packets");
+                assert!(pkts >= 6);
+            }
+
+            // Test AV1 10-bit full encode->decode roundtrip when both AV1 HW enc & dec support 10-bit.
+            let av1_dec_ok = dec_caps.iter().any(|c| c.hardware && c.ten_bit && c.codecs.contains(&VideoCodec::Av1));
+            if hw_enc.codecs.contains(&VideoCodec::Av1) && av1_dec_ok {
+                let mut cfg = enc_cfg(w, h, VideoCodec::Av1);
+                cfg.bit_depth = 10;
+                cfg.input_format = PixelFormat::Rgb10a2;
+                cfg.color_space = ColorSpace::Bt2020Pq;
+                cfg.gpu_input = true;
+                match win::mf_enc::MfEncoder::new(&cfg) {
+                    Ok(mut enc10) => {
+                        let mut dec10 = win::mf_dec::MfDecoder::new(&dec_cfg(w, h, VideoCodec::Av1, true))
+                            .expect("av1 d3d11va dec");
+                        let mut decoded = 0u32;
+                        let mut out_fmt = None;
+                        let mut unsupported = false;
+                        for i in 0..8u32 {
+                            let gf = Frame {
+                                width: w,
+                                height: h,
+                                format: PixelFormat::Rgb10a2,
+                                color_space: ColorSpace::Bt2020Pq,
+                                color_range: ColorRange::Full,
+                                data: FrameData::Gpu(win::d3d::gpu_frame(&holder10, luid)),
+                                capture_ts: Timestamp(i as u64 * 16_667),
+                            };
+                            match enc10.encode(&gf, EncodeOptions { force_keyframe: i == 0 }) {
+                                Ok(Some(pkt)) => {
+                                    if let Some(df) = dec10.decode(&pkt).expect("av1 10b dec") {
+                                        out_fmt = Some(df.frame.format);
+                                        assert_eq!((df.frame.width, df.frame.height), (w, h));
+                                        assert!(df.frame.is_gpu());
+                                        decoded += 1;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(veloxdesk_core_traits::CoreError::Unsupported(msg)) => {
+                                    eprintln!("AV1 10-bit P010 D3D11 input rejected cleanly by driver: {msg}");
+                                    unsupported = true;
+                                    break;
+                                }
+                                Err(e) => panic!("unexpected AV1 10-bit encode error: {e}"),
+                            }
+                        }
+                        if !unsupported {
+                            eprintln!("720p 10-bit HDR AV1 GPU roundtrip: decoded={decoded}/8 out_fmt={out_fmt:?}");
+                            assert!(decoded >= 4, "expected >=4 AV1 10-bit decoded frames, got {decoded}");
+                        }
+                    }
+                    Err(e) => eprintln!("AV1 10-bit MF encoder rejected config cleanly: {e}"),
+                }
+            }
+        }
+
+        // 2. YUV 4:4:4 probe & graceful behavior (encode if GPU+VideoProcessor accept AYUV, else clean Unsupported).
+        let mut cfg444 = enc_cfg(w, h, VideoCodec::H264);
+        cfg444.chroma = ChromaFormat::Yuv444;
+        match win::mf_enc::MfEncoder::new(&cfg444) {
+            Ok(mut enc444) => {
+                let f = make_bgra_frame(w, h, 1);
+                match enc444.encode(&f, EncodeOptions { force_keyframe: true }) {
+                    Ok(pkt) => eprintln!("720p YUV 4:4:4 HW encode succeeded: pkt={:?}", pkt.map(|p| p.data.len())),
+                    Err(e) => eprintln!("720p YUV 4:4:4 HW encode returned clean error (VideoProcessor/AYUV): {e}"),
+                }
+            }
+            Err(e) => eprintln!("720p YUV 4:4:4 HW init returned clean fallback error: {e}"),
+        }
+    }
 }

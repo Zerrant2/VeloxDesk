@@ -364,9 +364,9 @@ pub(crate) async fn authenticate(
     let peer_device_id =
         peer_pk.as_ref().map(device_id_from_public_key).unwrap_or_else(|| hello.device_id.clone());
 
-    // 2. M1 open mode: skip AuthChallenge and auto-accept with configured view/input permissions.
+    // 2. M1 open mode: skip AuthChallenge and auto-accept with configured view/input/audio permissions.
     if cfg.auth.is_open() {
-        let perms = Permissions { view: true, input: cfg.allow_input, ..Default::default() };
+        let perms = Permissions { view: true, input: cfg.allow_input, audio: cfg.audio_enabled, ..Default::default() };
         writer
             .send(
                 &Msg::AuthResult(AuthResult {
@@ -523,7 +523,8 @@ pub(crate) async fn authenticate(
         }
         p
     } else {
-        let default_permissions = Permissions { view: true, input: cfg.allow_input, ..Default::default() };
+        let default_permissions =
+            Permissions { view: true, input: cfg.allow_input, audio: cfg.audio_enabled, ..Default::default() };
         if cfg.auth.require_accept {
             let Some(handler) = &cfg.auth.approval_handler else {
                 return Err(

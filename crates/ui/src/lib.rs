@@ -17,4 +17,4 @@ pub use connect::{
     parse_rendezvous_addr, parse_target,
 };
 pub use session::{SessionInfo, SessionToolbar, ToolbarAction, settings_window};
-pub use settings::{Mode, Present, Quality, Scale, Settings};
+pub use settings::{FpsCap, Mode, Present, Quality, Scale, Settings};

@@ -60,7 +60,11 @@ struct Args {
     /// Prefer GPU capture frames (zero-copy into the encoder when supported).
     #[arg(long)]
     gpu: bool,
-    /// Include headless wgpu render stage (`OffscreenRenderer::draw`).
+    /// Enable GPU zero-copy decode -> DX12 wgpu import (implies --hw --render; on Windows
+    /// with --synthetic also uses a GPU-resident D3D11 texture ring on the host).
+    #[arg(long)]
+    zero_copy: bool,
+    /// Include headless wgpu render stage (`OffscreenRenderer::draw_frame`).
     #[arg(long)]
     render: bool,
     /// FEC parity percent (0 = sender default).
@@ -148,6 +152,7 @@ struct Shared {
     shards_recovered: AtomicU64,
     feedback_msgs: AtomicU64,
     dropped_latest_wins: AtomicU64,
+    pli_requested: AtomicBool,
     done: AtomicBool,
 }
 
@@ -223,6 +228,85 @@ impl Source for Synthetic {
             color_space: ColorSpace::Srgb,
             color_range: ColorRange::Full,
             data: FrameData::Cpu(vec![Plane { data, stride: w * 4 }]),
+            capture_ts: Timestamp::now(),
+        };
+        Ok((frame, t.elapsed().as_micros() as u32, 0))
+    }
+}
+
+#[cfg(windows)]
+/// GPU-resident synthetic source: pre-rendered ring of 4 D3D11 `BGRA8` textures on the
+/// target adapter LUID, cycling zero-copy into `MfEncoder` with zero CPU→GPU upload per frame.
+struct SyntheticGpu {
+    w: u32,
+    h: u32,
+    luid: u64,
+    ring: Vec<Arc<veloxdesk_codec::win::d3d::TextureHolder>>,
+    n: usize,
+}
+
+#[cfg(windows)]
+impl SyntheticGpu {
+    fn new(w: u32, h: u32, luid: Option<u64>) -> Result<Self> {
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let dev = veloxdesk_codec::win::d3d::create_device(luid)
+            .map_err(|e| anyhow!("create D3D11 device for SyntheticGpu: {e}"))?;
+        let actual_luid = veloxdesk_codec::win::d3d::device_luid(&dev);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut pool = veloxdesk_codec::win::d3d::TexturePool::new(desc, false, 4);
+        let mut synth = Synthetic::new(w, h);
+        let ctx = unsafe { dev.GetImmediateContext() }.map_err(|e| anyhow!("GetImmediateContext: {e}"))?;
+        let mut ring = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let (f, _, _) = synth.next()?;
+            let FrameData::Cpu(ref planes) = f.data else { unreachable!() };
+            let holder = pool.get(&dev).map_err(|e| anyhow!("TexturePool::get: {e}"))?;
+            unsafe {
+                ctx.UpdateSubresource(
+                    &holder.tex,
+                    0,
+                    None,
+                    planes[0].data.as_ptr().cast(),
+                    planes[0].stride as u32,
+                    0,
+                );
+            }
+            ring.push(holder);
+        }
+        unsafe { ctx.Flush() };
+        Ok(Self { w, h, luid: actual_luid, ring, n: 0 })
+    }
+}
+
+#[cfg(windows)]
+impl Source for SyntheticGpu {
+    fn name(&self) -> String {
+        format!("synthetic-gpu {}x{}", self.w, self.h)
+    }
+    fn next(&mut self) -> Result<(Frame, u32, u32)> {
+        let t = Instant::now();
+        let holder = &self.ring[self.n % self.ring.len()];
+        self.n = self.n.wrapping_add(1);
+        let frame = Frame {
+            width: self.w,
+            height: self.h,
+            format: PixelFormat::Bgra8,
+            color_space: ColorSpace::Srgb,
+            color_range: ColorRange::Full,
+            data: FrameData::Gpu(veloxdesk_codec::win::d3d::gpu_frame(holder, self.luid)),
             capture_ts: Timestamp::now(),
         };
         Ok((frame, t.elapsed().as_micros() as u32, 0))
@@ -368,6 +452,11 @@ async fn run(args: Args) -> Result<String> {
                 if last_fb.elapsed() >= Duration::from_millis(5) {
                     last_fb = Instant::now();
                     let fb = rx.poll_feedback(Timestamp::now());
+                    for env in &fb {
+                        if matches!(env.msg, Some(veloxdesk_protocol::control::envelope::Msg::KeyframeRequest(_))) {
+                            shared.pli_requested.store(true, Ordering::Release);
+                        }
+                    }
                     shared.feedback_msgs.fetch_add(fb.len() as u64, Ordering::Relaxed);
                     while let Some(rf) = rx.pop_frame() {
                         if !push_frame(rf) {
@@ -379,25 +468,31 @@ async fn run(args: Args) -> Result<String> {
         })
     };
 
-    let dec_cfg =
-        DecoderConfig { codec, width: stream_w, height: stream_h, prefer_gpu_output: false, shared_device: None };
+    let use_hw = args.hw || args.zero_copy;
+    let do_render = args.render || args.zero_copy;
+    let dec_cfg = DecoderConfig {
+        codec,
+        width: stream_w,
+        height: stream_h,
+        prefer_gpu_output: args.zero_copy,
+        shared_device: None,
+    };
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let decode_thread = {
         let shared = shared.clone();
-        let hw = args.hw;
-        let do_render = args.render;
         thread::Builder::new()
             .name("decode".into())
-            .spawn(move || decode_loop(dec_rx, dec_cfg, hw, do_render, ready_tx, shared))?
+            .spawn(move || decode_loop(dec_rx, dec_cfg, use_hw, do_render, ready_tx, shared))?
     };
 
     // Host: source → encode → VideoSender on a dedicated thread.
     let host_thread = {
         let shared = shared.clone();
-        let args = args.clone();
+        let mut host_args = args.clone();
+        host_args.hw = use_hw;
         thread::Builder::new()
             .name("host".into())
-            .spawn(move || host_loop(args, codec, host_ch, ready_rx, shared))?
+            .spawn(move || host_loop(host_args, codec, host_ch, ready_rx, shared))?
     };
 
     let host_info = tokio::task::spawn_blocking(move || host_thread.join()).await?.map_err(|_| anyhow!("host thread panicked"))??;
@@ -426,8 +521,20 @@ fn host_loop(
     decoder_ready: std::sync::mpsc::Receiver<()>,
     shared: Arc<Shared>,
 ) -> Result<HostInfo> {
-    let mut source: Box<dyn Source> =
-        if args.synthetic { Box::new(Synthetic::new(args.width, args.height)) } else { Box::new(Screen::new(&args)?) };
+    let mut source: Box<dyn Source> = if args.synthetic {
+        #[cfg(windows)]
+        if args.gpu || args.zero_copy {
+            Box::new(SyntheticGpu::new(args.width, args.height, None)?)
+        } else {
+            Box::new(Synthetic::new(args.width, args.height))
+        }
+        #[cfg(not(windows))]
+        {
+            Box::new(Synthetic::new(args.width, args.height))
+        }
+    } else {
+        Box::new(Screen::new(&args)?)
+    };
     let (first, first_cap_us, first_conv_us) = source.next()?;
     let cfg = EncoderConfig {
         codec,
@@ -468,7 +575,7 @@ fn host_loop(
             None => source.next()?,
         };
         let capture_ts = frame.capture_ts;
-        let opts = EncodeOptions { force_keyframe: i == 0 };
+        let opts = EncodeOptions { force_keyframe: i == 0 || shared.pli_requested.swap(false, Ordering::AcqRel) };
         let Some(pkt) = enc.encode(&frame, opts).map_err(|e| anyhow!("encode: {e}"))? else { continue };
         let t = Instant::now();
         sender.send_frame(&pkt).map_err(|e| anyhow!("send_frame: {e}"))?;
@@ -499,8 +606,8 @@ fn spin_until(t: Instant) {
             return;
         }
         let left = t - now;
-        if left > Duration::from_millis(2) {
-            thread::sleep(left - Duration::from_millis(2));
+        if left > Duration::from_millis(4) {
+            thread::sleep(left - Duration::from_millis(4));
         } else {
             thread::yield_now();
         }
@@ -511,6 +618,7 @@ struct DecodeInfo {
     decoder: String,
     hw: bool,
     renderer: Option<String>,
+    zero_copy_frames: u64,
     decoded: u64,
     errors: u64,
     /// (frame_id, recv_complete, decode_us, render_us, finished_ts, recovered)
@@ -536,18 +644,28 @@ fn decode_loop(
     };
     let _ = ready.send(());
     let renderer = offscreen.as_ref().map(|r| format!("{} ({:?})", r.adapter_name, r.backend));
-    let mut info =
-        DecodeInfo { decoder: caps.name.to_string(), hw: caps.hardware, renderer, decoded: 0, errors: 0, rows: Vec::new() };
+    let mut info = DecodeInfo {
+        decoder: caps.name.to_string(),
+        hw: caps.hardware,
+        renderer,
+        zero_copy_frames: 0,
+        decoded: 0,
+        errors: 0,
+        rows: Vec::new(),
+    };
     while let Ok(vf) = rx.recv() {
         let t = Instant::now();
         match dec.decode(&vf.packet) {
             Ok(Some(df)) => {
                 let decode_us = if df.decode_us > 0 { df.decode_us } else { t.elapsed().as_micros() as u32 };
                 let render_us = if let Some(r) = offscreen.as_mut() {
-                    Some(
-                        r.draw(&df.frame, veloxdesk_core_traits::render::ScaleMode::Fit)
-                            .map_err(|e| anyhow!("offscreen draw: {e}"))?,
-                    )
+                    let (us, zc) = r
+                        .draw_frame(&df.frame, veloxdesk_core_traits::render::ScaleMode::Fit)
+                        .map_err(|e| anyhow!("offscreen draw_frame: {e}"))?;
+                    if zc {
+                        info.zero_copy_frames += 1;
+                    }
+                    Some(us)
                 } else {
                     None
                 };
@@ -636,8 +754,13 @@ fn build_report(
     }
     stages.push(e2e);
     s.push_str(&latency_table(&stages));
+    let zc_note = if dec.renderer.is_some() {
+        format!(" · zero_copy {}/{}", dec.zero_copy_frames, dec.decoded)
+    } else {
+        String::new()
+    };
     s.push_str(&format!(
-        "\nframes: sent {sent}, complete {complete} ({:.2}%), decoded {} , decode errors {}, latest-wins drops {} · keyframes {keyframes} · max frame {} KB\n",
+        "\nframes: sent {sent}, complete {complete} ({:.2}%), decoded {} , decode errors {}, latest-wins drops {}{zc_note} · keyframes {keyframes} · max frame {} KB\n",
         100.0 * complete as f64 / sent.max(1) as f64,
         dec.decoded,
         dec.errors,
@@ -654,8 +777,10 @@ fn build_report(
     ));
     if let Some(p) = proxy {
         s.push_str(&format!(
-            "impairment host→viewer: {:?} · datagrams {} dropped(loss) {} dropped(queue) {} → {:.2}% loss\n",
+            "impairment host→viewer: {:?}, latency {:.1}±{:.1} ms · datagrams {} dropped(loss) {} dropped(queue) {} → {:.2}% loss\n",
             args.down_cfg().loss,
+            args.latency_ms,
+            args.jitter_ms,
             p.received,
             p.dropped_loss,
             p.dropped_queue,

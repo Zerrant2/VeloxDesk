@@ -2,7 +2,7 @@
 
 use veloxdesk_protocol::control::DisplayInfo;
 
-use crate::settings::{Mode, Present, Quality, Scale, Settings};
+use crate::settings::{FpsCap, Mode, Present, Quality, Scale, Settings};
 
 /// What the toolbar asks the session to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -10,8 +10,12 @@ pub enum ToolbarAction {
     SetMode(Mode),
     SwitchDisplay(u32),
     SetQuality(Quality),
+    SetFpsCap(FpsCap),
     SetPresent(Present),
     SetScale(Scale),
+    SetAudio(bool),
+    SetMic(bool),
+    TogglePointerLock,
     ToggleHud,
     ToggleFullscreen,
     OpenSettings,
@@ -25,6 +29,8 @@ pub struct SessionInfo {
     pub displays: Vec<DisplayInfo>,
     pub active_display: u32,
     pub hud_visible: bool,
+    pub pointer_locked: bool,
+    pub active_gamepads: u8,
 }
 
 #[derive(Debug, Default)]
@@ -46,9 +52,17 @@ impl SessionToolbar {
                     .inner_margin(egui::Margin::symmetric(8, 3))
                     .show(ui, |ui| {
                         if !self.expanded {
-                            if ui.small_button("▾ VeloxDesk").on_hover_text("Session toolbar").clicked() {
-                                self.expanded = true;
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("▾ VeloxDesk").on_hover_text("Session toolbar").clicked() {
+                                    self.expanded = true;
+                                }
+                                if info.pointer_locked {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(130, 235, 150),
+                                        "Locked (Ctrl+Alt+G)",
+                                    );
+                                }
+                            });
                             return;
                         }
                         ui.horizontal(|ui| {
@@ -107,6 +121,44 @@ impl SessionToolbar {
                                         }
                                     }
                                 });
+                            egui::ComboBox::from_id_salt("veloxdesk-fps")
+                                .selected_text(settings.fps_cap.label())
+                                .show_ui(ui, |ui| {
+                                    for f in FpsCap::ALL {
+                                        if ui.selectable_label(settings.fps_cap == f, f.label()).clicked()
+                                            && settings.fps_cap != f
+                                        {
+                                            settings.fps_cap = f;
+                                            out.push(ToolbarAction::SetFpsCap(f));
+                                        }
+                                    }
+                                });
+                            if ui
+                                .selectable_label(settings.audio_enabled, "Audio")
+                                .on_hover_text("Toggle remote audio playback")
+                                .clicked()
+                            {
+                                settings.audio_enabled = !settings.audio_enabled;
+                                out.push(ToolbarAction::SetAudio(settings.audio_enabled));
+                            }
+                            if ui
+                                .selectable_label(settings.mic_enabled, "Mic")
+                                .on_hover_text("Toggle microphone pass-through")
+                                .clicked()
+                            {
+                                settings.mic_enabled = !settings.mic_enabled;
+                                out.push(ToolbarAction::SetMic(settings.mic_enabled));
+                            }
+                            if ui
+                                .selectable_label(info.pointer_locked, if info.pointer_locked { "Locked" } else { "Lock" })
+                                .on_hover_text("Pointer Lock (Ctrl+Alt+G)")
+                                .clicked()
+                            {
+                                out.push(ToolbarAction::TogglePointerLock);
+                            }
+                            if info.active_gamepads > 0 {
+                                ui.label(format!("Pad×{}", info.active_gamepads));
+                            }
                             if ui.selectable_label(info.hud_visible, "HUD").on_hover_text("Ctrl+Shift+H").clicked() {
                                 out.push(ToolbarAction::ToggleHud);
                             }
@@ -155,6 +207,28 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, settings: &mut Sett
             });
             ui.end_row();
 
+            ui.label("Target FPS");
+            egui::ComboBox::from_id_salt("set-fps").selected_text(settings.fps_cap.label()).show_ui(ui, |ui| {
+                for f in FpsCap::ALL {
+                    ui.selectable_value(&mut settings.fps_cap, f, f.label());
+                }
+            });
+            ui.end_row();
+
+            ui.label("Color / HDR");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut settings.hdr_10bit, "10-bit HDR");
+                ui.checkbox(&mut settings.yuv444, "YUV 4:4:4");
+            });
+            ui.end_row();
+
+            ui.label("Audio");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut settings.audio_enabled, "Remote audio");
+                ui.checkbox(&mut settings.mic_enabled, "Microphone");
+            });
+            ui.end_row();
+
             ui.label("Presentation");
             egui::ComboBox::from_id_salt("set-present").selected_text(settings.present.label()).show_ui(ui, |ui| {
                 for p in Present::ALL {
@@ -180,7 +254,7 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, settings: &mut Sett
             ui.end_row();
 
             ui.label("Gaming mouse");
-            ui.checkbox(&mut settings.relative_mouse_in_gaming, "Lock pointer, relative motion");
+            ui.checkbox(&mut settings.relative_mouse_in_gaming, "Pointer Lock (Ctrl+Alt+G), relative motion");
             ui.end_row();
 
             ui.label("Rendezvous server");
@@ -203,6 +277,15 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, settings: &mut Sett
         }
         if settings.quality != before.quality {
             out.push(ToolbarAction::SetQuality(settings.quality));
+        }
+        if settings.fps_cap != before.fps_cap {
+            out.push(ToolbarAction::SetFpsCap(settings.fps_cap));
+        }
+        if settings.audio_enabled != before.audio_enabled {
+            out.push(ToolbarAction::SetAudio(settings.audio_enabled));
+        }
+        if settings.mic_enabled != before.mic_enabled {
+            out.push(ToolbarAction::SetMic(settings.mic_enabled));
         }
         if settings.mode != before.mode {
             out.push(ToolbarAction::SetMode(settings.mode));
@@ -238,6 +321,8 @@ mod tests {
             ],
             active_display: 0,
             hud_visible: false,
+            pointer_locked: true,
+            active_gamepads: 2,
         };
         let mut screen = crate::connect::ConnectScreen::new(&settings);
         let mut open = true;

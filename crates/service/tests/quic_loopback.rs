@@ -171,6 +171,9 @@ async fn host_quic_loopback_fec_busy_and_shutdown() {
             injector: Arc::new(move || Ok(Box::new(RecInjector(inj_log.clone())) as Box<dyn InputInjector>)),
             video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
             rate: Arc::new(|s, mn, mx| Box::new(TransportAbr(AbrController::new(s, mn, mx)))),
+            audio_capture: None,
+            audio_encoder: None,
+            audio_playback: None,
         }
     };
     let cfg = HostConfig {
@@ -272,6 +275,9 @@ async fn host_quic_loopback_with_system_codec() {
         injector: Arc::new(move || Ok(Box::new(RecInjector(inj_log.clone())) as Box<dyn InputInjector>)),
         video_sink: sys.video_sink,
         rate: sys.rate,
+        audio_capture: None,
+        audio_encoder: None,
+        audio_playback: None,
     };
     let cfg = HostConfig {
         bind: addr,
@@ -368,6 +374,9 @@ async fn host_p2p_listener_direct_with_password_auth() {
         injector: Arc::new(move || Ok(Box::new(RecInjector(inj_log.clone())) as Box<dyn InputInjector>)),
         video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
         rate: Arc::new(|s, mn, mx| Box::new(TransportAbr(AbrController::new(s, mn, mx)))),
+        audio_capture: None,
+        audio_encoder: None,
+        audio_playback: None,
     };
     let cfg = HostConfig { bind: addr, max_fps: 60, idle_fps: 20, auth, ..Default::default() };
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -415,6 +424,191 @@ async fn host_p2p_listener_direct_with_password_auth() {
     assert!(a.ok, "auth failed: {}", a.reason);
     let Msg::SessionConfig(sc) = recv_until(&mut r, |_| true).await else { panic!("expected SessionConfig") };
     assert_eq!(sc.video.unwrap().width, 320);
+
+    let _ = stop_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_gaming_audio_four_gamepads_and_rumble_over_quic() {
+    use veloxdesk_core_traits::audio::{
+        AudioCapture, AudioCaptureConfig, AudioCodecId, AudioDecoder, AudioEncoder, AudioFormat, AudioFrame,
+    };
+    use veloxdesk_core_traits::input::{GamepadState, Rumble};
+    use veloxdesk_protocol::media::MediaKind;
+    use veloxdesk_transport::{AudioReceiver, datagram_kind, encode_gamepad_datagram};
+
+    struct ToneCap;
+    impl AudioCapture for ToneCap {
+        fn backend(&self) -> &'static str {
+            "tone-m3"
+        }
+        fn start(&mut self, cfg: &AudioCaptureConfig) -> Result<AudioFormat> {
+            Ok(cfg.format)
+        }
+        fn read(&mut self, _timeout: Duration) -> Result<Option<AudioFrame>> {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(Some(AudioFrame {
+                format: AudioFormat::STEREO_48K,
+                samples: vec![0.25f32; 240 * 2], // 5 ms @ 48 kHz stereo
+                capture_ts: Timestamp::now(),
+            }))
+        }
+        fn stop(&mut self) {}
+    }
+
+    struct RumbleInjector {
+        pads: Arc<Mutex<Vec<(u32, u32)>>>,
+        pending_rumble: Vec<InputFeedback>,
+    }
+    impl InputInjector for RumbleInjector {
+        fn caps(&self) -> InputCaps {
+            InputCaps {
+                backend: "rumble-rec",
+                gamepads: true,
+                gamepad_backend: Some("mock"),
+                max_gamepads: 4,
+                ..Default::default()
+            }
+        }
+        fn set_displays(&mut self, _d: &[DisplayGeometry]) {}
+        fn inject(&mut self, e: &InputEvent) -> Result<()> {
+            if let Some(InputEventKind::Gamepad(gp)) = &e.event {
+                self.pads.lock().unwrap().push((gp.pad_id, gp.seq));
+                // Trigger rumble feedback for pad 2 on seq 10.
+                if gp.pad_id == 2 && gp.seq == 10 {
+                    self.pending_rumble.push(InputFeedback::Rumble(Rumble {
+                        pad_id: 2,
+                        low_freq: 45000,
+                        high_freq: 15000,
+                    }));
+                }
+            }
+            Ok(())
+        }
+        fn release_all(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn poll_feedback(&mut self) -> Vec<InputFeedback> {
+            std::mem::take(&mut self.pending_rumble)
+        }
+    }
+
+    let host_id = DeviceIdentity::generate();
+    let viewer_id = DeviceIdentity::generate();
+    let listener = listen("127.0.0.1:0".parse().unwrap(), &host_id).await.expect("listen");
+    let addr = listener.local_addr();
+
+    let pad_log = Arc::new(Mutex::new(Vec::new()));
+    let pad_log_c = pad_log.clone();
+    let backends = HostBackends {
+        capture: Arc::new(|_| Ok(Box::new(StaticCapture { sent: false }) as Box<dyn FrameCapture>)),
+        encoder: Arc::new(|cfg, _| Ok(Box::new(FakeEncoder { cfg: cfg.clone(), next_id: 0 }) as Box<dyn VideoEncoder>)),
+        injector: Arc::new(move || {
+            Ok(Box::new(RumbleInjector { pads: pad_log_c.clone(), pending_rumble: Vec::new() })
+                as Box<dyn InputInjector>)
+        }),
+        video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
+        rate: Arc::new(|s, mn, mx| Box::new(TransportAbr(AbrController::new(s, mn, mx)))),
+        audio_capture: Some(Arc::new(|| Ok(Box::new(ToneCap) as Box<dyn AudioCapture>))),
+        audio_encoder: Some(Arc::new(|cfg| {
+            Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?) as Box<dyn AudioEncoder>)
+        })),
+        audio_playback: None,
+    };
+
+    let cfg = HostConfig {
+        bind: addr,
+        max_fps: 60,
+        audio_enabled: true,
+        audio_frame_ms: 5.0,
+        audio_bitrate_kbps: 128,
+        ..Default::default()
+    };
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let host_task = tokio::spawn(serve_until(listener, cfg, backends, async {
+        let _ = stop_rx.await;
+    }));
+
+    let ch = connect(addr, &viewer_id, Some(host_id.public_key())).await.expect("connect");
+    let (send, recv) = ch.open_bi(StreamKind::Control).await.expect("open control");
+    let (mut w, mut r) = framed(send, recv);
+    w.send(
+        &Msg::Hello(Hello {
+            device_id: viewer_id.device_id(),
+            public_key: viewer_id.public_key().to_vec(),
+            protocol_version: 1,
+            mode: 1, // Gaming
+            audio_codecs: vec![AudioCodecId::Opus as i32],
+            ..Default::default()
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+    let Msg::AuthResult(a) = recv_until(&mut r, |_| true).await else { panic!("expected AuthResult") };
+    assert!(a.ok);
+    let Msg::SessionConfig(sc) = recv_until(&mut r, |_| true).await else { panic!("expected SessionConfig") };
+    let acfg = sc.audio.expect("SessionConfig.audio must be advertised");
+    assert_eq!(acfg.sample_rate, 48_000);
+    assert_eq!(acfg.frame_duration_us, 5_000);
+
+    // 1. Receive >= 3 Opus audio datagrams and decode them with OpusDecoder.
+    let mut dec = veloxdesk_audio::OpusDecoder::new(AudioFormat::STEREO_48K, Duration::from_millis(5)).unwrap();
+    let mut audio_pkts = 0u32;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while audio_pkts < 3 {
+            let d = ch.recv_datagram().await.expect("recv_datagram");
+            if datagram_kind(&d) == Some(MediaKind::Audio)
+                && let Some((0, pkt)) = AudioReceiver::parse_datagram(&d)
+            {
+                let pcm = dec.decode(Some(&pkt)).expect("opus decode");
+                assert_eq!(pcm.frames_per_channel(), 240);
+                audio_pkts += 1;
+            }
+        }
+    })
+    .await
+    .expect("timed out receiving audio datagrams");
+
+    // 2. Send 4 simultaneous gamepads + a stale seq for pad 0 (which must be dropped!).
+    for pad_id in 0..4u32 {
+        let dg = encode_gamepad_datagram(&GamepadState {
+            pad_id,
+            connected: true,
+            buttons: 0x1000,
+            seq: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        ch.send_datagram(dg).unwrap();
+    }
+    // Stale seq=9 for pad 0 must be filtered out by host GamepadSeqFilter.
+    let stale = encode_gamepad_datagram(&GamepadState {
+        pad_id: 0,
+        connected: true,
+        buttons: 0x2000,
+        seq: 9,
+        ..Default::default()
+    })
+    .unwrap();
+    ch.send_datagram(stale).unwrap();
+
+    // Expect Msg::Rumble back on control stream for pad 2!
+    let Msg::Rumble(rumble) = recv_until(&mut r, |m| matches!(m, Msg::Rumble(_))).await else { unreachable!() };
+    assert_eq!((rumble.pad_id, rumble.low_freq, rumble.high_freq), (2, 45000, 15000));
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while pad_log.lock().unwrap().len() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all 4 pads should be delivered");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let received = pad_log.lock().unwrap().clone();
+    assert_eq!(received.len(), 4, "stale seq=9 must have been dropped; got {received:?}");
+    assert!(!received.contains(&(0, 9)));
 
     let _ = stop_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();

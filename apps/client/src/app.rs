@@ -199,12 +199,15 @@ impl App {
         }
         self.settings.push_recent(&address);
         self.settings.save_default();
-        let (vw, vh, hz) = self
+        let (vw, vh, monitor_hz) = self
             .surface
             .as_ref()
             .and_then(|s| s.window().current_monitor())
             .map(|m| (m.size().width, m.size().height, m.refresh_rate_millihertz().unwrap_or(60_000) / 1000))
             .unwrap_or((1920, 1080, 60));
+        let hz = self.settings.fps_cap.fps().max(monitor_hz.min(self.settings.fps_cap.fps()));
+        let prefer_gpu_decode = self.settings.prefer_hw_decode
+            && self.surface.as_ref().is_some_and(|s| !s.caps().zero_copy_import.is_empty());
         let label = match &target {
             ConnectTarget::Direct(a) => a.to_string(),
             ConnectTarget::DeviceId(id) => format_device_id(id),
@@ -217,6 +220,11 @@ impl App {
             mode: self.settings.mode.to_wire(),
             max_bitrate_kbps: self.settings.quality.bitrate_kbps(),
             prefer_hw_decode: self.settings.prefer_hw_decode,
+            prefer_gpu_decode,
+            audio_enabled: self.settings.audio_enabled,
+            mic_enabled: self.settings.mic_enabled,
+            hdr_10bit: self.settings.hdr_10bit,
+            yuv444: self.settings.yuv444,
             viewer_size: (vw, vh),
             viewer_refresh_hz: hz,
         };
@@ -306,6 +314,7 @@ impl App {
             s.window().set_cursor_visible(true);
         }
         self.pointer_locked = false;
+        self.session_info.pointer_locked = false;
     }
 
     fn lock_pointer(&mut self) {
@@ -318,7 +327,16 @@ impl App {
         if ok {
             w.set_cursor_visible(false);
             self.pointer_locked = true;
-            tracing::info!("pointer locked (Ctrl+Shift+L to release)");
+            self.session_info.pointer_locked = true;
+            tracing::info!("pointer locked (Ctrl+Alt+G to release)");
+        }
+    }
+
+    fn toggle_pointer_lock(&mut self) {
+        if self.pointer_locked {
+            self.release_pointer();
+        } else if matches!(self.state, State::Session { .. }) {
+            self.lock_pointer();
         }
     }
 
@@ -367,6 +385,23 @@ impl App {
                 }
                 self.settings.save_default();
             }
+            ToolbarAction::SetFpsCap(f) => {
+                tracing::info!(fps = f.fps(), "target FPS cap updated (applies on reconnect)");
+                self.settings.save_default();
+            }
+            ToolbarAction::SetAudio(on) => {
+                if let State::Session { handle, .. } = &self.state {
+                    handle.send(SessionCommand::SetAudio(on));
+                }
+                self.settings.save_default();
+            }
+            ToolbarAction::SetMic(on) => {
+                if let State::Session { handle, .. } = &self.state {
+                    handle.send(SessionCommand::SetMic(on));
+                }
+                self.settings.save_default();
+            }
+            ToolbarAction::TogglePointerLock => self.toggle_pointer_lock(),
             ToolbarAction::SetPresent(p) => {
                 self.present_override = None;
                 if let Some(s) = &mut self.surface {
@@ -530,10 +565,25 @@ impl App {
                 hud.snapshot.resolution = (msg.frame.width, msg.frame.height);
                 hud.snapshot.decoder = self.decoder.0.clone();
                 hud.snapshot.hw_decode = self.decoder.1;
+                hud.snapshot.zero_copy = stats.zero_copy;
+                let active_pads = shared.active_gamepads.load(Ordering::Relaxed);
+                self.session_info.active_gamepads = active_pads;
                 if let Some(snap) = hud.maybe_publish(Instant::now()) {
                     drop(hud);
+                    let audio_ms = shared.audio_buf_us.load(Ordering::Relaxed) as f64 / 1000.0;
+                    let mut parts = Vec::new();
+                    if audio_ms > 0.0 || self.settings.audio_enabled {
+                        parts.push(format!("audio buf {audio_ms:.1} ms"));
+                    }
+                    if active_pads > 0 {
+                        parts.push(format!("gamepads {active_pads}"));
+                    }
+                    if self.pointer_locked {
+                        parts.push("pointer locked (Ctrl+Alt+G)".into());
+                    }
                     if let Some(s) = &mut self.surface {
                         s.set_hud(snap);
+                        s.set_hud_extra((!parts.is_empty()).then(|| parts.join(" · ")));
                     }
                 }
             }
@@ -694,6 +744,10 @@ impl App {
         let PhysicalKey::Code(code) = event.physical_key else { return };
         let down = event.state == ElementState::Pressed;
         // Local hotkeys (never forwarded).
+        if down && self.modifiers.control_key() && self.modifiers.alt_key() && code == KeyCode::KeyG {
+            self.toggle_pointer_lock();
+            return;
+        }
         if down && self.modifiers.control_key() && self.modifiers.shift_key() {
             if is_toggle_shortcut(code, self.modifiers) {
                 self.toggle_hud();
@@ -701,11 +755,7 @@ impl App {
             }
             match code {
                 KeyCode::KeyL => {
-                    if self.pointer_locked {
-                        self.release_pointer();
-                    } else if matches!(self.state, State::Session { .. }) && self.relative_mode() {
-                        self.lock_pointer();
-                    }
+                    self.toggle_pointer_lock();
                     return;
                 }
                 KeyCode::KeyF => {

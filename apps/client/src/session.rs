@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU8, AtomicU32};
 
 use parking_lot::Mutex;
 use veloxdesk_core_traits::Timestamp;
@@ -52,6 +52,8 @@ pub enum SessionCommand {
     Input(InputEvent),
     SwitchDisplay(u32),
     SetMaxBitrate(u32),
+    SetAudio(bool),
+    SetMic(bool),
     Disconnect,
 }
 
@@ -65,6 +67,10 @@ pub struct SessionShared {
     /// Smoothed render time (µs) reported back in `ReceiverReport`.
     pub render_us: AtomicU32,
     pub decode_us: AtomicU32,
+    /// Current viewer audio buffer depth (jitter buffer + playback device) in µs, for the HUD.
+    pub audio_buf_us: AtomicU32,
+    /// Number of currently attached local physical gamepads (0..=4).
+    pub active_gamepads: Arc<AtomicU8>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +83,12 @@ pub struct ConnectOptions {
     pub mode: SessionMode,
     pub max_bitrate_kbps: u32,
     pub prefer_hw_decode: bool,
+    /// Request zero-copy GPU textures from `veloxdesk-codec` when `VideoSurface` supports DX12 import.
+    pub prefer_gpu_decode: bool,
+    pub audio_enabled: bool,
+    pub mic_enabled: bool,
+    pub hdr_10bit: bool,
+    pub yuv444: bool,
     pub viewer_size: (u32, u32),
     pub viewer_refresh_hz: u32,
 }

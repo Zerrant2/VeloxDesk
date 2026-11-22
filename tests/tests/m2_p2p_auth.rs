@@ -140,6 +140,9 @@ fn synth_backends(recorded_input: Arc<Mutex<Vec<InputEvent>>>) -> HostBackends {
         injector: Arc::new(move || Ok(Box::new(RecordingInjector { events: recorded_input.clone() }))),
         video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
         rate: Arc::new(|start, min, max| Box::new(TransportAbr(AbrController::new(start, min, max)))),
+        audio_capture: None,
+        audio_encoder: None,
+        audio_playback: None,
     }
 }
 

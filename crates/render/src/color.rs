@@ -1,9 +1,9 @@
 //! YUV → RGB conversion matrices (shared by the WGSL shader and CPU reference code).
 
-use veloxdesk_core_traits::video::{ColorRange, ColorSpace};
+use veloxdesk_core_traits::video::{ColorRange, ColorSpace, PixelFormat};
 
 /// 3×4 row-major affine matrix: `rgb[i] = dot(m[i], [y, u, v, 1])` with `y,u,v` in 0..=1
-/// (normalized 8-bit code values as sampled from `R8Unorm`/`Rg8Unorm` textures).
+/// (normalized code values as sampled from `R8Unorm`/`Rg8Unorm` or `R16Unorm`/`Rg16Unorm`).
 pub type YuvMatrix = [[f32; 4]; 3];
 
 /// Luma coefficients `(Kr, Kb)` of a color space.
@@ -15,14 +15,37 @@ fn coefficients(cs: ColorSpace) -> (f32, f32) {
     }
 }
 
-/// Matrix converting normalized Y'CbCr (as sampled) to non-linear R'G'B' in 0..=1.
+/// Matrix converting normalized 8-bit Y'CbCr (as sampled) to non-linear R'G'B' in 0..=1.
 pub fn yuv_to_rgb_matrix(cs: ColorSpace, range: ColorRange) -> YuvMatrix {
+    yuv_to_rgb_matrix_for(PixelFormat::Nv12, cs, range)
+}
+
+/// Matrix converting normalized Y'CbCr for `format` (8-bit or 10-bit P010) to non-linear R'G'B'.
+pub fn yuv_to_rgb_matrix_for(format: PixelFormat, cs: ColorSpace, range: ColorRange) -> YuvMatrix {
     let (kr, kb) = coefficients(cs);
     let kg = 1.0 - kr - kb;
-    // Y = ys*y + yo ; C = cs*c + co
-    let (ys, yo, csc, co) = match range {
-        ColorRange::Limited => (255.0 / 219.0, -16.0 / 219.0, 255.0 / 224.0, -128.0 / 224.0),
-        ColorRange::Full => (1.0, 0.0, 1.0, -128.0 / 255.0),
+    // P010 stores 10-bit samples in the top bits of 16-bit unorm (shifted left by 6):
+    // limited Y = [64..=940] << 6 = [4096..=60160] / 65535; C = 512 << 6 = 32768 / 65535, span 896 << 6 = 57344.
+    let (ys, yo, csc, co) = if format.is_10bit() {
+        match range {
+            ColorRange::Limited => (
+                65535.0 / 56064.0,
+                -4096.0 / 56064.0,
+                65535.0 / 57344.0,
+                -32768.0 / 57344.0,
+            ),
+            ColorRange::Full => (
+                65535.0 / 65472.0,
+                0.0,
+                65535.0 / 65472.0,
+                -32768.0 / 65472.0,
+            ),
+        }
+    } else {
+        match range {
+            ColorRange::Limited => (255.0 / 219.0, -16.0 / 219.0, 255.0 / 224.0, -128.0 / 224.0),
+            ColorRange::Full => (1.0, 0.0, 1.0, -128.0 / 255.0),
+        }
     };
     let cr_r = 2.0 * (1.0 - kr);
     let cb_g = -2.0 * kb * (1.0 - kb) / kg;

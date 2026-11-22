@@ -1,18 +1,21 @@
 //! Headless renderer: same pipeline, offscreen RGBA target with readback. Used by tests
-//! and by headless benches (`render_us` without a window).
+//! and by headless benches (`render_us` without a window), including Windows DX12 zero-copy
+//! GPU frame import.
 
 use std::time::Instant;
 
-use veloxdesk_core_traits::render::ScaleMode;
+use veloxdesk_core_traits::render::{RendererCaps, ScaleMode};
 use veloxdesk_core_traits::video::Frame;
 use veloxdesk_core_traits::{CoreError, Result};
 
 use crate::pipeline::VideoPipeline;
+use crate::zero_copy::{GpuImporter, create_importer, requested_features};
 
 pub struct OffscreenRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: VideoPipeline,
+    importer: Box<dyn GpuImporter>,
     target: wgpu::Texture,
     readback: wgpu::Buffer,
     size: (u32, u32),
@@ -22,9 +25,23 @@ pub struct OffscreenRenderer {
 }
 
 impl OffscreenRenderer {
-    /// Create a headless device (any backend, falls back to software adapters).
+    /// Create a headless device (prefers DX12 on Windows for zero-copy import, with fallback
+    /// to any available adapter).
     pub fn new(width: u32, height: u32) -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        #[cfg(windows)]
+        if let Ok(r) = Self::new_with_backends(width, height, wgpu::Backends::DX12) {
+            return Ok(r);
+        }
+        Self::new_with_backends(width, height, wgpu::Backends::all())
+    }
+
+    /// Create a headless device restricted to `backends`.
+    pub fn new_with_backends(width: u32, height: u32, backends: wgpu::Backends) -> Result<Self> {
+        let desc = wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        };
+        let instance = wgpu::Instance::new(desc);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
@@ -34,10 +51,12 @@ impl OffscreenRenderer {
         .map_err(|e| CoreError::unsupported(format!("no GPU adapter: {e}")))?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("veloxdesk-offscreen"),
+            required_features: requested_features(&adapter),
             required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
             ..Default::default()
         }))
         .map_err(|e| CoreError::platform(format!("request_device: {e}")))?;
+        let importer = create_importer(&adapter, &device);
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let pipeline = VideoPipeline::new(&device, &queue, format);
         let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -62,6 +81,7 @@ impl OffscreenRenderer {
             device,
             queue,
             pipeline,
+            importer,
             target,
             readback,
             size: (width, height),
@@ -71,10 +91,33 @@ impl OffscreenRenderer {
         })
     }
 
-    /// Upload + draw + wait for GPU completion. Returns elapsed µs (CPU+GPU, no readback).
-    pub fn draw(&mut self, frame: &Frame, scale: ScaleMode) -> Result<u32> {
+    /// Renderer capabilities (including `zero_copy_import: ["D3D11Texture"]` on DX12).
+    pub fn caps(&self) -> RendererCaps {
+        let backend = match self.backend {
+            wgpu::Backend::Dx12 => "dx12",
+            wgpu::Backend::Vulkan => "vulkan",
+            wgpu::Backend::Metal => "metal",
+            wgpu::Backend::Gl => "gl",
+            wgpu::Backend::BrowserWebGpu => "webgpu",
+            _ => "noop",
+        };
+        RendererCaps {
+            backend,
+            zero_copy_import: self.importer.supported_kinds(),
+            hdr: false,
+            present_modes: Vec::new(),
+        }
+    }
+
+    /// Adapter LUID on Windows when zero-copy DX12 import is active.
+    pub fn adapter_luid(&self) -> Option<u64> {
+        self.importer.adapter_luid()
+    }
+
+    /// Upload/import + draw + wait for GPU completion. Returns `(elapsed_us, zero_copy)`.
+    pub fn draw_frame(&mut self, frame: &Frame, scale: ScaleMode) -> Result<(u32, bool)> {
         let t0 = Instant::now();
-        self.pipeline.upload(frame)?;
+        let zero_copy = self.pipeline.upload_or_import(frame, self.importer.as_mut())?;
         self.pipeline.prepare(self.size, scale, None);
         let view = self.target.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -98,7 +141,13 @@ impl OffscreenRenderer {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| CoreError::platform(format!("poll: {e}")))?;
-        Ok(t0.elapsed().as_micros() as u32)
+        self.pipeline.release_previous_gpu_keepalive();
+        Ok((t0.elapsed().as_micros() as u32, zero_copy))
+    }
+
+    /// Upload/import + draw + wait for GPU completion. Returns elapsed µs (CPU+GPU, no readback).
+    pub fn draw(&mut self, frame: &Frame, scale: ScaleMode) -> Result<u32> {
+        Ok(self.draw_frame(frame, scale)?.0)
     }
 
     /// Draw then read the target back as tightly packed RGBA8.

@@ -3,14 +3,19 @@
 //! Independent of the window surface so it can also render into offscreen targets (tests,
 //! headless benches). [`crate::VideoSurface`] wraps it together with egui.
 
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use veloxdesk_core_traits::render::ScaleMode;
 use veloxdesk_core_traits::video::{
     ColorRange, ColorSpace, CursorImage, Frame, FrameData, PixelFormat,
 };
 use veloxdesk_core_traits::{CoreError, Result};
 
-use crate::color::{YuvMatrix, yuv_to_rgb_matrix};
+use crate::color::{YuvMatrix, yuv_to_rgb_matrix_for};
 use crate::layout::{VideoRect, compute_video_rect, video_to_window};
+use crate::zero_copy::{GpuImporter, ImportedGpuViews};
 
 const PARAMS_SIZE: u64 = 96;
 
@@ -62,6 +67,17 @@ pub fn plan_uploads(frame: &Frame, plane_lens: &[(usize, usize)]) -> Result<Vec<
             };
             vec![y, uv]
         }
+        PixelFormat::P010 => {
+            let (_, ys) = get(0)?;
+            let y = PlaneUpload { plane: 0, offset: 0, stride: ys, width: w, height: h, bytes_per_pixel: 2 };
+            let uv = if plane_lens.len() >= 2 {
+                let (_, s) = get(1)?;
+                PlaneUpload { plane: 1, offset: 0, stride: s, width: cw, height: ch, bytes_per_pixel: 4 }
+            } else {
+                PlaneUpload { plane: 0, offset: ys * h as usize, stride: ys, width: cw, height: ch, bytes_per_pixel: 4 }
+            };
+            vec![y, uv]
+        }
         PixelFormat::I420 => {
             let (_, ys) = get(0)?;
             let y = PlaneUpload { plane: 0, offset: 0, stride: ys, width: w, height: h, bytes_per_pixel: 1 };
@@ -81,6 +97,27 @@ pub fn plan_uploads(frame: &Frame, plane_lens: &[(usize, usize)]) -> Result<Vec<
                     y,
                     PlaneUpload { plane: 0, offset: u_off, stride: cs, width: cw, height: ch, bytes_per_pixel: 1 },
                     PlaneUpload { plane: 0, offset: v_off, stride: cs, width: cw, height: ch, bytes_per_pixel: 1 },
+                ]
+            }
+        }
+        PixelFormat::Yuv444 => {
+            let (_, ys) = get(0)?;
+            let y = PlaneUpload { plane: 0, offset: 0, stride: ys, width: w, height: h, bytes_per_pixel: 1 };
+            if plane_lens.len() >= 3 {
+                let (_, us) = get(1)?;
+                let (_, vs) = get(2)?;
+                vec![
+                    y,
+                    PlaneUpload { plane: 1, offset: 0, stride: us, width: w, height: h, bytes_per_pixel: 1 },
+                    PlaneUpload { plane: 2, offset: 0, stride: vs, width: w, height: h, bytes_per_pixel: 1 },
+                ]
+            } else {
+                let u_off = ys * h as usize;
+                let v_off = u_off + ys * h as usize;
+                vec![
+                    y,
+                    PlaneUpload { plane: 0, offset: u_off, stride: ys, width: w, height: h, bytes_per_pixel: 1 },
+                    PlaneUpload { plane: 0, offset: v_off, stride: ys, width: w, height: h, bytes_per_pixel: 1 },
                 ]
             }
         }
@@ -104,8 +141,20 @@ struct VideoTextures {
     format: PixelFormat,
     width: u32,
     height: u32,
+    /// Actual sampling format (e.g. `Nv12` when `P010` is downsampled to 8-bit on adapters
+    /// without `TEXTURE_FORMAT_16BIT_NORM`).
+    sample_format: PixelFormat,
     textures: Vec<wgpu::Texture>,
     bind_group: wgpu::BindGroup,
+}
+
+struct ActiveGpuFrame {
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    tex_size: (u32, u32),
+    cache_key: u64,
+    keepalive: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 struct CursorTexture {
@@ -124,7 +173,13 @@ pub struct VideoPipeline {
     blend: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     dummy: wgpu::TextureView,
+    supports_16bit_norm: bool,
     video: Option<VideoTextures>,
+    gpu_bind_groups: HashMap<u64, wgpu::BindGroup>,
+    active_gpu: Option<ActiveGpuFrame>,
+    /// Previous GPU frame keepalive kept alive across one submit so the GPU finishes sampling
+    /// before the decoder's `TexturePool` can recycle the backing D3D11 texture.
+    prev_gpu_keepalive: Option<Arc<dyn Any + Send + Sync>>,
     video_params: wgpu::Buffer,
     color: (ColorSpace, ColorRange),
     cursor: Option<CursorTexture>,
@@ -132,13 +187,20 @@ pub struct VideoPipeline {
     cursor_visible: bool,
 }
 
-fn params_bytes(rect: [f32; 4], uv: [f32; 4], m: &YuvMatrix, mode: Mode) -> [u8; PARAMS_SIZE as usize] {
+fn params_bytes(
+    rect: [f32; 4],
+    uv: [f32; 4],
+    m: &YuvMatrix,
+    mode: Mode,
+    hdr_pq: bool,
+) -> [u8; PARAMS_SIZE as usize] {
     let mut out = [0u8; PARAMS_SIZE as usize];
     let floats = rect.iter().chain(uv.iter()).chain(m.iter().flatten());
     for (i, f) in floats.enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
     }
     out[80..84].copy_from_slice(&(mode as u32).to_le_bytes());
+    out[84..88].copy_from_slice(&(u32::from(hdr_pq)).to_le_bytes());
     out
 }
 
@@ -254,7 +316,11 @@ impl VideoPipeline {
             blend,
             sampler,
             dummy,
+            supports_16bit_norm: device.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM),
             video: None,
+            gpu_bind_groups: HashMap::new(),
+            active_gpu: None,
+            prev_gpu_keepalive: None,
             video_params: mk_buf("veloxdesk-video-params"),
             color: (ColorSpace::Bt709, ColorRange::Limited),
             cursor: None,
@@ -263,9 +329,12 @@ impl VideoPipeline {
         }
     }
 
-    /// Size of the currently uploaded video, if any.
+    /// Size of the currently uploaded/imported video, if any.
     pub fn video_size(&self) -> Option<(u32, u32)> {
-        self.video.as_ref().map(|v| (v.width, v.height))
+        self.active_gpu
+            .as_ref()
+            .map(|g| (g.width, g.height))
+            .or_else(|| self.video.as_ref().map(|v| (v.width, v.height)))
     }
 
     fn bind_group(&self, label: &str, buf: &wgpu::Buffer, views: [&wgpu::TextureView; 3]) -> wgpu::BindGroup {
@@ -305,35 +374,125 @@ impl VideoPipeline {
         }
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         use wgpu::TextureFormat as T;
-        let specs: Vec<(u32, u32, T)> = match format {
-            PixelFormat::Bgra8 => vec![(w, h, T::Bgra8Unorm)],
-            PixelFormat::Rgba8 => vec![(w, h, T::Rgba8Unorm)],
-            PixelFormat::Nv12 => vec![(w, h, T::R8Unorm), (cw, ch, T::Rg8Unorm)],
-            _ => vec![(w, h, T::R8Unorm), (cw, ch, T::R8Unorm), (cw, ch, T::R8Unorm)],
+        let (sample_format, specs): (PixelFormat, Vec<(u32, u32, T)>) = match format {
+            PixelFormat::Bgra8 => (format, vec![(w, h, T::Bgra8Unorm)]),
+            PixelFormat::Rgba8 => (format, vec![(w, h, T::Rgba8Unorm)]),
+            PixelFormat::Nv12 => (format, vec![(w, h, T::R8Unorm), (cw, ch, T::Rg8Unorm)]),
+            PixelFormat::P010 if self.supports_16bit_norm => {
+                (PixelFormat::P010, vec![(w, h, T::R16Unorm), (cw, ch, T::Rg16Unorm)])
+            }
+            PixelFormat::P010 => (PixelFormat::Nv12, vec![(w, h, T::R8Unorm), (cw, ch, T::Rg8Unorm)]),
+            PixelFormat::Yuv444 => {
+                (format, vec![(w, h, T::R8Unorm), (w, h, T::R8Unorm), (w, h, T::R8Unorm)])
+            }
+            _ => (format, vec![(w, h, T::R8Unorm), (cw, ch, T::R8Unorm), (cw, ch, T::R8Unorm)]),
         };
         let textures: Vec<wgpu::Texture> =
             specs.iter().map(|&(tw, th, f)| self.create_texture("veloxdesk-video-plane", tw, th, f)).collect();
         let views: Vec<wgpu::TextureView> = textures.iter().map(|t| t.create_view(&Default::default())).collect();
         let v = |i: usize| views.get(i).unwrap_or(&self.dummy);
         let bind_group = self.bind_group("veloxdesk-video-bg", &self.video_params, [v(0), v(1), v(2)]);
-        tracing::debug!(?format, w, h, "video textures (re)created");
-        self.video = Some(VideoTextures { format, width: w, height: h, textures, bind_group });
+        tracing::debug!(?format, ?sample_format, w, h, "video textures (re)created");
+        self.video = Some(VideoTextures { format, width: w, height: h, sample_format, textures, bind_group });
     }
 
-    /// Upload a frame (CPU path). GPU frames return `Unsupported` until the zero-copy
-    /// import lands (see [`crate::zero_copy`]).
+    /// Upload a CPU frame or zero-copy import a GPU frame via `importer`. Returns `true` when
+    /// the zero-copy GPU path was used.
+    pub fn upload_or_import(&mut self, frame: &Frame, importer: &mut dyn GpuImporter) -> Result<bool> {
+        match &frame.data {
+            FrameData::Gpu(g) => {
+                let imported = importer.import(g, frame.format, frame.width, frame.height)?;
+                self.bind_imported_gpu(frame, imported, g.keepalive.clone());
+                Ok(true)
+            }
+            FrameData::Cpu(_) => {
+                self.upload(frame)?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn bind_imported_gpu(
+        &mut self,
+        frame: &Frame,
+        imported: ImportedGpuViews,
+        keepalive: Option<Arc<dyn Any + Send + Sync>>,
+    ) {
+        let key = imported.cache_key;
+        if !self.gpu_bind_groups.contains_key(&key) {
+            if self.gpu_bind_groups.len() >= 16 {
+                self.gpu_bind_groups.clear();
+            }
+            let bg = self.bind_group(
+                "veloxdesk-gpu-video-bg",
+                &self.video_params,
+                [&imported.y_view, &imported.uv_view, &self.dummy],
+            );
+            self.gpu_bind_groups.insert(key, bg);
+        }
+        self.color = (frame.color_space, frame.color_range);
+        self.prev_gpu_keepalive = self.active_gpu.take().and_then(|g| g.keepalive);
+        self.active_gpu = Some(ActiveGpuFrame {
+            format: frame.format,
+            width: frame.width,
+            height: frame.height,
+            tex_size: imported.tex_size,
+            cache_key: key,
+            keepalive,
+        });
+    }
+
+    /// Release the previous GPU frame keepalive after GPU submission/wait.
+    pub fn release_previous_gpu_keepalive(&mut self) {
+        self.prev_gpu_keepalive = None;
+    }
+
+    /// Upload a frame (CPU path). GPU frames return `Unsupported` (use [`Self::upload_or_import`]).
     pub fn upload(&mut self, frame: &Frame) -> Result<()> {
         let planes = match &frame.data {
             FrameData::Cpu(p) => p,
             FrameData::Gpu(_) => {
-                return Err(CoreError::unsupported("renderer: GPU frame import not available (CPU path only)"));
+                return Err(CoreError::unsupported("renderer: GPU frame requires upload_or_import"));
             }
         };
+        self.prev_gpu_keepalive = self.active_gpu.take().and_then(|g| g.keepalive);
         let lens: Vec<(usize, usize)> = planes.iter().map(|p| (p.data.len(), p.stride)).collect();
         let ups = plan_uploads(frame, &lens)?;
         self.ensure_video_textures(frame.format, frame.width, frame.height);
         self.color = (frame.color_space, frame.color_range);
         let video = self.video.as_ref().expect("textures ensured");
+        if frame.format == PixelFormat::P010 && video.sample_format == PixelFormat::Nv12 {
+            // Fallback for adapters without TEXTURE_FORMAT_16BIT_NORM: take MSB of each u16.
+            for (u, tex) in ups.iter().zip(video.textures.iter()) {
+                let src = &planes[u.plane].data;
+                let dst_bpp = (u.bytes_per_pixel / 2) as usize;
+                let dst_row = u.width as usize * dst_bpp;
+                let mut down = vec![0u8; dst_row * u.height as usize];
+                for row in 0..u.height as usize {
+                    let s_row = &src[u.offset + row * u.stride..u.offset + row * u.stride + u.width as usize * u.bytes_per_pixel as usize];
+                    let d_row = &mut down[row * dst_row..(row + 1) * dst_row];
+                    for (i, d) in d_row.iter_mut().enumerate() {
+                        *d = s_row[i * 2 + 1];
+                    }
+                }
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &down,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(dst_row as u32),
+                        rows_per_image: Some(u.height),
+                    },
+                    wgpu::Extent3d { width: u.width, height: u.height, depth_or_array_layers: 1 },
+                );
+            }
+            return Ok(());
+        }
         for (u, tex) in ups.iter().zip(video.textures.iter()) {
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -393,16 +552,25 @@ impl VideoPipeline {
     /// Write per-frame uniforms. `cursor` = position in video pixels (None = hidden).
     /// Returns the video rectangle in target pixels.
     pub fn prepare(&mut self, target: (u32, u32), scale: ScaleMode, cursor: Option<(i32, i32)>) -> Option<VideoRect> {
-        let video = self.video.as_ref()?;
-        let vsize = (video.width, video.height);
+        let (vsize, format, sample_format, uv_rect) = if let Some(g) = &self.active_gpu {
+            let u1 = (g.width as f32 / g.tex_size.0.max(1) as f32).min(1.0);
+            let v1 = (g.height as f32 / g.tex_size.1.max(1) as f32).min(1.0);
+            ((g.width, g.height), g.format, g.format, [0.0, 0.0, u1, v1])
+        } else if let Some(v) = &self.video {
+            ((v.width, v.height), v.format, v.sample_format, [0.0, 0.0, 1.0, 1.0])
+        } else {
+            return None;
+        };
         let rect = compute_video_rect(scale, vsize, target);
-        let mode = match video.format {
-            PixelFormat::Nv12 => Mode::Nv12,
-            PixelFormat::I420 => Mode::I420,
+        let mode = match format {
+            PixelFormat::Nv12 | PixelFormat::P010 => Mode::Nv12,
+            PixelFormat::I420 | PixelFormat::Yuv444 => Mode::I420,
             _ => Mode::RgbOpaque,
         };
-        let m = yuv_to_rgb_matrix(self.color.0, self.color.1);
-        self.queue.write_buffer(&self.video_params, 0, &params_bytes(rect.to_ndc(target), [0.0, 0.0, 1.0, 1.0], &m, mode));
+        let m = yuv_to_rgb_matrix_for(sample_format, self.color.0, self.color.1);
+        let hdr_pq = self.color.0 == ColorSpace::Bt2020Pq;
+        self.queue
+            .write_buffer(&self.video_params, 0, &params_bytes(rect.to_ndc(target), uv_rect, &m, mode, hdr_pq));
 
         self.cursor_visible = false;
         if let (Some(c), Some((cx, cy))) = (&self.cursor, cursor) {
@@ -414,7 +582,7 @@ impl VideoPipeline {
             self.queue.write_buffer(
                 &self.cursor_params,
                 0,
-                &params_bytes(crect.to_ndc(target), [0.0, 0.0, 1.0, 1.0], &m, Mode::RgbaBlend),
+                &params_bytes(crect.to_ndc(target), [0.0, 0.0, 1.0, 1.0], &m, Mode::RgbaBlend, false),
             );
             self.cursor_visible = true;
         }
@@ -423,9 +591,14 @@ impl VideoPipeline {
 
     /// Record the draw calls (video first, then cursor) into an open render pass.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        let Some(video) = &self.video else { return };
+        let bg = if let Some(g) = &self.active_gpu {
+            self.gpu_bind_groups.get(&g.cache_key)
+        } else {
+            self.video.as_ref().map(|v| &v.bind_group)
+        };
+        let Some(bg) = bg else { return };
         pass.set_pipeline(&self.opaque);
-        pass.set_bind_group(0, &video.bind_group, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.draw(0..4, 0..1);
         if self.cursor_visible
             && let Some(c) = &self.cursor
@@ -478,8 +651,9 @@ mod tests {
     #[test]
     fn params_layout() {
         let m = [[1.0; 4]; 3];
-        let b = params_bytes([1.0, 2.0, 3.0, 4.0], [0.0; 4], &m, Mode::I420);
+        let b = params_bytes([1.0, 2.0, 3.0, 4.0], [0.0; 4], &m, Mode::I420, true);
         assert_eq!(f32::from_le_bytes(b[4..8].try_into().unwrap()), 2.0);
         assert_eq!(u32::from_le_bytes(b[80..84].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(b[84..88].try_into().unwrap()), 1);
     }
 }

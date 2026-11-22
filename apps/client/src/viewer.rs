@@ -22,26 +22,35 @@ mod net {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, bail};
     use crossbeam_channel::{Receiver, Sender, TrySendError};
     use tokio::sync::mpsc;
     use tokio::time::{interval, timeout};
+    use veloxdesk_audio::{AudioJitterBuffer, JitterConfig, OpusDecoder, OpusEncoder};
+    use veloxdesk_core_traits::audio::{
+        AudioCaptureConfig, AudioCodecId, AudioEncoder, AudioEncoderConfig, AudioFormat, EncodedAudio,
+    };
     use veloxdesk_core_traits::video::{CursorImage, DecoderConfig, VideoCodec, VideoDecoder};
     use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
     use veloxdesk_crypto::DeviceIdentity;
     use veloxdesk_crypto::auth::{Argon2Params, derive_password_key, password_proof, sign_pubkey_challenge};
     use veloxdesk_protocol::control::{
-        AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, Close, Envelope, Hello, InputEvent, Ping,
-        SessionConfig, SwitchDisplay, VideoCodecCap, VideoConfig, envelope::Msg,
+        AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, Close, Envelope, GamepadState,
+        Hello, InputEvent, Ping, SessionConfig, SwitchDisplay, VideoCodecCap, VideoConfig, envelope::Msg,
     };
+    use veloxdesk_protocol::media::MediaKind;
     use veloxdesk_protocol::{PROTOCOL_VERSION, StreamKind};
     use veloxdesk_render::winit::event_loop::EventLoopProxy;
-    use veloxdesk_transport::{ControlSender, ReceivedFrame, VideoReceiver, framed};
+    use veloxdesk_transport::{
+        AudioReceiver, AudioSender, ControlSender, ReceivedFrame, VideoReceiver, datagram_kind,
+        encode_gamepad_datagram, framed,
+    };
     use veloxdesk_ui::{ConnectTarget, format_device_id};
 
     use crate::app::UserEvent;
+    use crate::gamepad::GamepadPoller;
     use crate::session::{ConnectOptions, DecodedMsg, SessionCommand, SessionEvent, SessionHandle, SessionShared};
 
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -130,6 +139,7 @@ mod net {
     impl DecoderHandle {
         fn spawn(
             prefer_hw: bool,
+            prefer_gpu: bool,
             shared: Arc<SessionShared>,
             proxy: EventLoopProxy<UserEvent>,
         ) -> anyhow::Result<Self> {
@@ -141,7 +151,7 @@ mod net {
             let pli = pli_requested.clone();
             let join = std::thread::Builder::new()
                 .name("viewer-decoder".into())
-                .spawn(move || decoder_loop(rx, prefer_hw, shared, proxy, need_kf, pli))
+                .spawn(move || decoder_loop(rx, prefer_hw, prefer_gpu, shared, proxy, need_kf, pli))
                 .context("spawning viewer decoder thread")?;
             Ok(Self { tx, rx_peek, need_keyframe, pli_requested, join: Some(join) })
         }
@@ -208,6 +218,7 @@ mod net {
     fn decoder_loop(
         rx: Receiver<DecoderMsg>,
         prefer_hw: bool,
+        prefer_gpu: bool,
         shared: Arc<SessionShared>,
         proxy: EventLoopProxy<UserEvent>,
         need_keyframe: Arc<AtomicBool>,
@@ -228,7 +239,7 @@ mod net {
                     if active_cfg == Some(key) && decoder.is_some() {
                         continue;
                     }
-                    match open_decoder(codec, vcfg.width, vcfg.height, prefer_hw, &proxy) {
+                    match open_decoder(codec, vcfg.width, vcfg.height, prefer_hw, prefer_gpu, &proxy) {
                         Ok(dec) => {
                             decoder = Some(dec);
                             active_cfg = Some(key);
@@ -245,7 +256,14 @@ mod net {
                         && rf.packet.width > 0
                         && rf.packet.height > 0
                     {
-                        match open_decoder(rf.packet.codec, rf.packet.width, rf.packet.height, prefer_hw, &proxy) {
+                        match open_decoder(
+                            rf.packet.codec,
+                            rf.packet.width,
+                            rf.packet.height,
+                            prefer_hw,
+                            prefer_gpu,
+                            &proxy,
+                        ) {
                             Ok(dec) => {
                                 active_cfg = Some((rf.packet.codec, rf.packet.width, rf.packet.height));
                                 decoder = Some(dec);
@@ -312,15 +330,22 @@ mod net {
         width: u32,
         height: u32,
         prefer_hw: bool,
+        prefer_gpu: bool,
         proxy: &EventLoopProxy<UserEvent>,
     ) -> veloxdesk_core_traits::Result<Box<dyn VideoDecoder>> {
-        // M1 uses CPU NV12 upload (`veloxdesk-render` zero-copy import is M3).
-        let cfg = DecoderConfig { codec, width, height, prefer_gpu_output: false, shared_device: None };
+        let cfg = DecoderConfig {
+            codec,
+            width,
+            height,
+            prefer_gpu_output: prefer_hw && prefer_gpu,
+            shared_device: None,
+        };
         let dec = veloxdesk_codec::create_decoder(&cfg, prefer_hw)?;
         let caps = dec.caps();
         tracing::info!(
             decoder = caps.name,
             hardware = caps.hardware,
+            gpu_output = caps.gpu_output && cfg.prefer_gpu_output,
             ?codec,
             width,
             height,
@@ -333,14 +358,262 @@ mod net {
         Ok(dec)
     }
 
+    // ───────────────────────── Audio playback & mic threads (M3) ─────────────────────────
+
+    struct AudioPlaybackHandle {
+        tx: Sender<EncodedAudio>,
+        enabled: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl AudioPlaybackHandle {
+        fn spawn(cfg: Option<&AudioConfig>, initial_enabled: bool, shared: Arc<SessionShared>) -> Option<Self> {
+            let fmt = cfg
+                .map(|c| AudioFormat {
+                    sample_rate: c.sample_rate.max(8_000),
+                    channels: c.channels.clamp(1, 2) as u16,
+                })
+                .unwrap_or(AudioFormat::STEREO_48K);
+            let frame_us = cfg.map(|c| c.frame_duration_us).filter(|&u| u >= 2_500).unwrap_or(5_000);
+            let (tx, rx) = crossbeam_channel::bounded::<EncodedAudio>(64);
+            let enabled = Arc::new(AtomicBool::new(initial_enabled));
+            let stop = Arc::new(AtomicBool::new(false));
+            let enabled_bg = enabled.clone();
+            let stop_bg = stop.clone();
+            let join = std::thread::Builder::new()
+                .name("viewer-audio-out".into())
+                .spawn(move || audio_playback_loop(rx, fmt, frame_us, enabled_bg, stop_bg, shared))
+                .ok()?;
+            Some(Self { tx, enabled, stop, join: Some(join) })
+        }
+
+        fn push(&self, pkt: EncodedAudio) {
+            let _ = self.tx.try_send(pkt);
+        }
+
+        fn set_enabled(&self, on: bool) {
+            self.enabled.store(on, Ordering::Relaxed);
+        }
+
+        fn stop(mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    impl Drop for AudioPlaybackHandle {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    fn audio_playback_loop(
+        rx: Receiver<EncodedAudio>,
+        fmt: AudioFormat,
+        frame_us: u32,
+        enabled: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        shared: Arc<SessionShared>,
+    ) {
+        let frame_dur = Duration::from_micros(frame_us as u64);
+        let mut decoder = match OpusDecoder::new(fmt, frame_dur) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("OpusDecoder init failed (audio disabled): {e}");
+                return;
+            }
+        };
+        let mut playback = match veloxdesk_audio::create_playback() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("audio playback unavailable: {e}");
+                return;
+            }
+        };
+        let target_buf = (frame_dur * 3).max(Duration::from_millis(15));
+        if let Err(e) = playback.start(fmt, target_buf) {
+            tracing::warn!("audio playback start failed: {e}");
+            return;
+        }
+        tracing::info!(backend = playback.backend(), rate = fmt.sample_rate, ch = fmt.channels, frame_us, "audio playback ready");
+
+        let mut jb = AudioJitterBuffer::new(JitterConfig {
+            frame_duration: frame_dur,
+            target_delay: (frame_dur * 3).max(Duration::from_millis(15)),
+            max_delay: Duration::from_millis(80),
+        });
+        let mut next_tick = Instant::now() + frame_dur;
+        while !stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            if now < next_tick {
+                match rx.recv_timeout(next_tick - now) {
+                    Ok(pkt) => {
+                        jb.push(pkt);
+                        while let Ok(more) = rx.try_recv() {
+                            jb.push(more);
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            let now = Instant::now();
+            if now < next_tick {
+                continue;
+            }
+            next_tick += frame_dur;
+            if next_tick + frame_dur * 4 < now {
+                next_tick = now + frame_dur;
+            }
+            match jb.pop_decoded(&mut decoder) {
+                Ok(Some(pcm)) => {
+                    if enabled.load(Ordering::Relaxed) {
+                        let _ = playback.push(&pcm);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!("audio decode error: {e}"),
+            }
+            let total_buf_us = playback.buffered_us().saturating_add(jb.stats().buffered_us);
+            shared.audio_buf_us.store(total_buf_us, Ordering::Relaxed);
+        }
+        playback.stop();
+        shared.audio_buf_us.store(0, Ordering::Relaxed);
+    }
+
+    struct MicCaptureHandle {
+        enabled: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MicCaptureHandle {
+        fn spawn(ch: Arc<dyn TransportChannel>, initial_enabled: bool) -> Self {
+            let enabled = Arc::new(AtomicBool::new(initial_enabled));
+            let stop = Arc::new(AtomicBool::new(false));
+            let enabled_bg = enabled.clone();
+            let stop_bg = stop.clone();
+            let join = std::thread::Builder::new()
+                .name("viewer-mic".into())
+                .spawn(move || mic_capture_loop(ch, enabled_bg, stop_bg))
+                .ok();
+            Self { enabled, stop, join }
+        }
+
+        fn set_enabled(&self, on: bool) {
+            self.enabled.store(on, Ordering::Relaxed);
+        }
+
+        fn stop(mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    impl Drop for MicCaptureHandle {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    fn mic_capture_loop(ch: Arc<dyn TransportChannel>, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+        let mut sender = AudioSender::new(ch, 1);
+        let mut cap: Option<Box<dyn veloxdesk_core_traits::AudioCapture>> = None;
+        let mut enc: Option<OpusEncoder> = None;
+
+        while !stop.load(Ordering::Relaxed) {
+            if !enabled.load(Ordering::Relaxed) {
+                if let Some(mut c) = cap.take() {
+                    c.stop();
+                }
+                enc = None;
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            if cap.is_none() {
+                let mut c = match veloxdesk_audio::create_mic_capture() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("mic capture unavailable: {e}");
+                        enabled.store(false, Ordering::Relaxed);
+                        continue;
+                    }
+                };
+                let cfg = AudioCaptureConfig {
+                    format: AudioFormat::STEREO_48K,
+                    chunk: Duration::from_millis(5),
+                    device: None,
+                    microphone: true,
+                };
+                match c.start(&cfg) {
+                    Ok(fmt) => {
+                        let ecfg = AudioEncoderConfig {
+                            format: fmt,
+                            bitrate_kbps: 64,
+                            frame_duration: Duration::from_millis(5),
+                            low_delay: true,
+                        };
+                        match OpusEncoder::new(&ecfg) {
+                            Ok(e) => {
+                                tracing::info!(backend = c.backend(), ?fmt, "viewer microphone streaming enabled");
+                                cap = Some(c);
+                                enc = Some(e);
+                            }
+                            Err(e) => {
+                                tracing::warn!("mic OpusEncoder failed: {e}");
+                                c.stop();
+                                enabled.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("mic start failed: {e}");
+                        enabled.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+            let (Some(c), Some(e)) = (cap.as_mut(), enc.as_mut()) else { continue };
+            match c.read(Duration::from_millis(20)) {
+                Ok(Some(pcm)) => {
+                    if let Ok(pkts) = e.encode(&pcm) {
+                        for pkt in pkts {
+                            let _ = sender.send(&pkt);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!("mic read error: {e}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        if let Some(mut c) = cap.take() {
+            c.stop();
+        }
+    }
+
     fn build_hello(id: &DeviceIdentity, opts: &ConnectOptions) -> Hello {
         let mut video_caps = Vec::new();
         for cap in veloxdesk_codec::probe_decoders() {
             for codec in cap.codecs {
+                let want_444 = cap.yuv444 && opts.yuv444;
+                let want_10 = cap.ten_bit && opts.hdr_10bit;
                 if let Some(existing) = video_caps.iter_mut().find(|c: &&mut VideoCodecCap| c.codec == codec as i32) {
                     existing.hw_decode |= cap.hardware;
-                    existing.yuv444 |= cap.yuv444;
-                    existing.ten_bit |= cap.ten_bit;
+                    existing.yuv444 |= want_444;
+                    existing.ten_bit |= want_10;
                 } else {
                     video_caps.push(VideoCodecCap {
                         codec: codec as i32,
@@ -348,8 +621,8 @@ mod net {
                         max_width: 3840,
                         max_height: 2160,
                         max_fps: 240,
-                        yuv444: cap.yuv444,
-                        ten_bit: cap.ten_bit,
+                        yuv444: want_444,
+                        ten_bit: want_10,
                     });
                 }
             }
@@ -366,7 +639,7 @@ mod net {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             mode: opts.mode as i32,
             video_caps,
-            audio_codecs: Vec::new(),
+            audio_codecs: if opts.audio_enabled { vec![AudioCodec::Opus as i32] } else { Vec::new() },
             viewer_width: opts.viewer_size.0,
             viewer_height: opts.viewer_size.1,
             viewer_refresh_hz: opts.viewer_refresh_hz,
@@ -506,13 +779,32 @@ mod net {
         });
 
         // 5. Dedicated decoder thread (ADR-006).
-        let decoder = match DecoderHandle::spawn(opts.prefer_hw_decode, shared.clone(), proxy.clone()) {
+        let decoder = match DecoderHandle::spawn(
+            opts.prefer_hw_decode,
+            opts.prefer_gpu_decode,
+            shared.clone(),
+            proxy.clone(),
+        ) {
             Ok(d) => d,
             Err(e) => {
                 ch.close(1, "decoder thread failed");
                 return Some(format!("{e:#}"));
             }
         };
+
+        // 5b. Audio playback thread, optional microphone thread, and physical gamepad poller (M3).
+        let audio_out = AudioPlaybackHandle::spawn(initial_cfg.audio.as_ref(), opts.audio_enabled, shared.clone());
+        let mic = MicCaptureHandle::spawn(ch.clone(), opts.mic_enabled);
+        let (gp_tx, mut gp_rx) = mpsc::unbounded_channel::<GamepadState>();
+        let gamepads = GamepadPoller::start(gp_tx, shared.active_gamepads.clone());
+        let gp_ch = ch.clone();
+        let gp_writer = tokio::spawn(async move {
+            while let Some(state) = gp_rx.recv().await {
+                if let Ok(dgram) = encode_gamepad_datagram(&state) {
+                    let _ = gp_ch.send_datagram(dgram);
+                }
+            }
+        });
 
         // 6. Initialize VideoReceiver + notify UI of initial SessionConfig.
         let mut receiver = VideoReceiver::new();
@@ -540,19 +832,33 @@ mod net {
                     match dgram {
                         Ok(buf) => {
                             let now = Timestamp::now();
-                            shared.hud.lock().on_bytes_received(buf.len());
-                            if let Some(rf) = receiver.push_datagram(&buf, now)
-                                && !decoder.push_frame(rf)
-                            {
-                                receiver.request_keyframe();
-                            }
-                            while let Some(rf) = receiver.pop_frame() {
-                                if !decoder.push_frame(rf) {
-                                    receiver.request_keyframe();
+                            match datagram_kind(&buf) {
+                                Some(MediaKind::Audio) => {
+                                    if let Some((stream_id, pkt)) = AudioReceiver::parse_datagram(&buf)
+                                        && stream_id == 0
+                                        && pkt.codec == AudioCodecId::Opus
+                                        && let Some(ao) = &audio_out
+                                    {
+                                        ao.push(pkt);
+                                    }
                                 }
+                                Some(MediaKind::Video) | None => {
+                                    shared.hud.lock().on_bytes_received(buf.len());
+                                    if let Some(rf) = receiver.push_datagram(&buf, now)
+                                        && !decoder.push_frame(rf)
+                                    {
+                                        receiver.request_keyframe();
+                                    }
+                                    while let Some(rf) = receiver.pop_frame() {
+                                        if !decoder.push_frame(rf) {
+                                            receiver.request_keyframe();
+                                        }
+                                    }
+                                    let fb = receiver.poll_feedback(now);
+                                    send_feedback(fb, &ctrl_out_tx, &shared);
+                                }
+                                Some(_) => {}
                             }
-                            let fb = receiver.poll_feedback(now);
-                            send_feedback(fb, &ctrl_out_tx, &shared);
                         }
                         Err(CoreError::Closed) => break Some("host closed connection".into()),
                         Err(e) => break Some(format!("transport error: {e}")),
@@ -607,6 +913,9 @@ mod net {
                                     visible: cp.visible,
                                 }));
                             }
+                            Some(Msg::Rumble(r)) => {
+                                GamepadPoller::apply_rumble(&r);
+                            }
                             Some(Msg::BitrateUpdate(b)) => {
                                 tracing::debug!(
                                     bitrate_kbps = b.bitrate_kbps,
@@ -649,6 +958,14 @@ mod net {
                                 .into(),
                             );
                         }
+                        Some(SessionCommand::SetAudio(on)) => {
+                            if let Some(ao) = &audio_out {
+                                ao.set_enabled(on);
+                            }
+                        }
+                        Some(SessionCommand::SetMic(on)) => {
+                            mic.set_enabled(on);
+                        }
                         Some(SessionCommand::SubmitPassword(_)) | Some(SessionCommand::CancelAuth) => {}
                         Some(SessionCommand::Disconnect) | None => {
                             let _ = ctrl_out_tx.send(
@@ -690,10 +1007,16 @@ mod net {
         };
 
         // 8. Clean teardown.
+        gamepads.stop();
+        mic.stop();
+        if let Some(ao) = audio_out {
+            ao.stop();
+        }
         drop(input_tx);
         drop(ctrl_out_tx);
         let _ = timeout(Duration::from_millis(200), ctrl_writer).await;
         let _ = timeout(Duration::from_millis(200), input_writer).await;
+        let _ = timeout(Duration::from_millis(200), gp_writer).await;
         ch.close(0, "session ended");
         decoder.stop();
         close_reason

@@ -48,7 +48,7 @@ impl RateController for TransportAbr {
 }
 
 impl HostBackends {
-    /// Production capture, input, QUIC FEC sender and ABR, with a caller-provided encoder
+    /// Production capture, input, audio, QUIC FEC sender and ABR, with a caller-provided encoder
     /// factory (useful for tests or custom encoders).
     pub fn with_encoder(encoder: Arc<EncoderFactory>) -> Self {
         Self {
@@ -57,11 +57,14 @@ impl HostBackends {
             injector: Arc::new(veloxdesk_input::create_injector),
             video_sink: Arc::new(|ch, stream_id| Box::new(TransportVideoSink(VideoSender::new(ch, stream_id)))),
             rate: Arc::new(|start, min, max| Box::new(TransportAbr(AbrController::new(start, min, max)))),
+            audio_capture: Some(Arc::new(veloxdesk_audio::create_loopback_capture)),
+            audio_encoder: Some(Arc::new(|cfg| Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?)))),
+            audio_playback: Some(Arc::new(veloxdesk_audio::create_playback)),
         }
     }
 
     /// Production backends for this OS (`veloxdesk-capture`, `veloxdesk-codec`,
-    /// `veloxdesk-input`, `veloxdesk-transport`).
+    /// `veloxdesk-audio`, `veloxdesk-input`, `veloxdesk-transport`).
     pub fn system() -> Self {
         Self::with_encoder(Arc::new(veloxdesk_codec::create_encoder))
     }

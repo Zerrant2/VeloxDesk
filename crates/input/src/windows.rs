@@ -27,6 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::core::{Action, InjectorCore, VirtualBounds};
+use crate::gamepad::{GamepadDriver, GamepadRouter};
 use crate::keymap::hid_to_win_scancode;
 
 /// Tag placed in `dwExtraInfo` so local hooks can recognise injected events.
@@ -35,6 +36,8 @@ pub const INJECTED_TAG: usize = 0x5644_4B31; // "VDK1"
 pub struct SendInputInjector {
     core: InjectorCore,
     buf: Vec<INPUT>,
+    gamepad_router: GamepadRouter,
+    gamepad: Box<dyn GamepadDriver>,
 }
 
 // SAFETY: INPUT is plain data; the buffer is only used from the owning thread.
@@ -42,7 +45,16 @@ unsafe impl Send for SendInputInjector {}
 
 impl SendInputInjector {
     pub fn new() -> Self {
-        Self { core: InjectorCore::new(), buf: Vec::with_capacity(16) }
+        Self::with_gamepad_driver(crate::gamepad_win::open_driver())
+    }
+
+    pub fn with_gamepad_driver(gamepad: Box<dyn GamepadDriver>) -> Self {
+        Self {
+            core: InjectorCore::new(),
+            buf: Vec::with_capacity(16),
+            gamepad_router: GamepadRouter::new(),
+            gamepad,
+        }
     }
 
     fn bounds(&self) -> VirtualBounds {
@@ -118,6 +130,7 @@ impl SendInputInjector {
                     self.push_key(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
                 }
             }
+            Action::Gamepad(_) => {}
         }
     }
 
@@ -140,7 +153,12 @@ impl SendInputInjector {
 
     fn run(&mut self, actions: &[Action]) -> Result<()> {
         for a in actions {
-            self.encode(a);
+            if let Action::Gamepad(state) = a {
+                let g_actions = self.gamepad_router.apply(state);
+                self.gamepad.apply_actions(&g_actions)?;
+            } else {
+                self.encode(a);
+            }
         }
         self.flush()
     }
@@ -182,14 +200,15 @@ pub(crate) fn button_flags(button: MouseButton, down: bool) -> (u32, i32) {
 
 impl InputInjector for SendInputInjector {
     fn caps(&self) -> InputCaps {
+        let gp_backend = self.gamepad.backend_name();
         InputCaps {
             backend: "SendInput",
             keyboard: true,
             mouse_absolute: true,
             mouse_relative: true,
-            gamepads: false,
-            gamepad_backend: None,
-            max_gamepads: 0,
+            gamepads: gp_backend.is_some(),
+            gamepad_backend: gp_backend,
+            max_gamepads: self.gamepad.max_gamepads(),
             touch: false,
         }
     }
@@ -204,12 +223,15 @@ impl InputInjector for SendInputInjector {
     }
 
     fn release_all(&mut self) -> Result<()> {
+        let gp_disc = self.gamepad_router.disconnect_all();
+        let gp_res = self.gamepad.apply_actions(&gp_disc);
         let actions = self.core.release_actions();
-        self.run(&actions)
+        let kb_res = self.run(&actions);
+        kb_res.and(gp_res)
     }
 
     fn poll_feedback(&mut self) -> Vec<InputFeedback> {
-        Vec::new()
+        self.gamepad.poll_feedback()
     }
 }
 
@@ -249,5 +271,67 @@ mod tests {
             assert_eq!(inj.buf[5].Anonymous.ki.wScan, 0xD83D);
         }
         inj.buf.clear();
+    }
+
+    #[test]
+    fn injector_routes_gamepads_rumble_and_release() {
+        use veloxdesk_core_traits::input::{GamepadState, InputEventKind, Rumble};
+        use crate::gamepad::{GamepadDriver, XInputReport, xinput_btn};
+
+        struct FakePad {
+            plugged: [bool; 4],
+            updates: usize,
+            rumbles: Vec<Rumble>,
+        }
+        impl GamepadDriver for FakePad {
+            fn backend_name(&self) -> Option<&'static str> {
+                Some("fake-vigem")
+            }
+            fn max_gamepads(&self) -> u32 {
+                4
+            }
+            fn connect(&mut self, pad_id: u32) -> Result<()> {
+                self.plugged[pad_id as usize] = true;
+                Ok(())
+            }
+            fn update(&mut self, _pad_id: u32, _report: XInputReport) -> Result<()> {
+                self.updates += 1;
+                Ok(())
+            }
+            fn disconnect(&mut self, pad_id: u32) -> Result<()> {
+                self.plugged[pad_id as usize] = false;
+                Ok(())
+            }
+            fn poll_rumble(&mut self) -> Vec<Rumble> {
+                std::mem::take(&mut self.rumbles)
+            }
+        }
+
+        let drv = FakePad {
+            plugged: [false; 4],
+            updates: 0,
+            rumbles: vec![Rumble { pad_id: 0, low_freq: 40000, high_freq: 20000 }],
+        };
+        let mut inj = SendInputInjector::with_gamepad_driver(Box::new(drv));
+        let caps = inj.caps();
+        assert!(caps.gamepads);
+        assert_eq!(caps.gamepad_backend, Some("fake-vigem"));
+        assert_eq!(caps.max_gamepads, 4);
+
+        let ev = InputEvent {
+            ts_us: 1,
+            event: Some(InputEventKind::Gamepad(GamepadState {
+                pad_id: 0,
+                connected: true,
+                buttons: xinput_btn::A as u32,
+                seq: 1,
+                ..Default::default()
+            })),
+        };
+        inj.inject(&ev).unwrap();
+        assert_eq!(inj.gamepad_router.connected_count(), 1);
+        assert_eq!(inj.poll_feedback(), vec![InputFeedback::Rumble(Rumble { pad_id: 0, low_freq: 40000, high_freq: 20000 })]);
+        inj.release_all().unwrap();
+        assert_eq!(inj.gamepad_router.connected_count(), 0);
     }
 }

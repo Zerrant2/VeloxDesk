@@ -76,6 +76,7 @@ pub struct AbrController {
     budget: f64,
     parity: u8,
     loss_ema: f64,
+    recv_kbps_ema: f64,
     overuse_reports: u32,
     last_decrease: Option<Timestamp>,
     last_report: Option<Timestamp>,
@@ -91,11 +92,13 @@ impl AbrController {
     pub fn with_config(start_kbps: u32, cfg: AbrConfig) -> Self {
         let parity = cfg.min_parity_percent.min(cfg.max_parity_percent);
         let enc = start_kbps.clamp(cfg.min_kbps, cfg.max_kbps) as f64;
+        let budget = enc * (1.0 + parity as f64 / 100.0);
         Self {
-            budget: enc * (1.0 + parity as f64 / 100.0),
+            budget,
             parity,
             cfg,
             loss_ema: 0.0,
+            recv_kbps_ema: budget,
             overuse_reports: 0,
             last_decrease: None,
             last_report: None,
@@ -148,10 +151,20 @@ impl AbrController {
             let a = if loss > self.loss_ema { 0.5 } else { 0.05 };
             self.loss_ema += a * (loss - self.loss_ema);
         }
+        if rr.frames_unrecoverable > 0 {
+            self.loss_ema = self.loss_ema.max(0.05);
+        }
         let loss_now = if total > 0 { rr.packets_lost as f64 / total as f64 } else { 0.0 };
 
-        // Parity ratio.
-        let p = (2.0 * self.loss_ema).clamp(self.cfg.min_parity_percent as f64 / 100.0, self.cfg.max_parity_percent as f64 / 100.0);
+        // Smooth measured receive throughput so a single jitter-perturbed 50 ms interval
+        // never causes a cliff-drop during Overuse.
+        if rr.recv_kbps > 0 {
+            self.recv_kbps_ema += 0.25 * (rr.recv_kbps as f64 - self.recv_kbps_ema);
+        }
+
+        // Parity ratio: clamp(2 * loss_ema, min, max).
+        let p = (2.0 * self.loss_ema)
+            .clamp(self.cfg.min_parity_percent as f64 / 100.0, self.cfg.max_parity_percent as f64 / 100.0);
         self.parity = ((p * 100.0).ceil() as u8).clamp(self.cfg.min_parity_percent, self.cfg.max_parity_percent);
 
         // Delay-gradient detector.
@@ -175,10 +188,17 @@ impl AbrController {
             self.budget *= 1.0 - 0.5 * loss_now.min(0.8);
             self.last_decrease = Some(now);
         } else if self.state == UsageState::Overuse && can_decrease {
-            let base = if rr.recv_kbps > 0 { self.budget.min(rr.recv_kbps as f64) } else { self.budget };
+            let smoothed = self.recv_kbps_ema.max(self.budget * 0.5);
+            let base = if rr.recv_kbps > 0 { self.budget.min(smoothed) } else { self.budget };
             self.budget = base * self.cfg.decrease_factor;
             self.last_decrease = Some(now);
+        } else if (self.loss_ema >= 0.03 || rr.frames_unrecoverable > 0) && can_decrease {
+            // Moderate sustained loss (3-10%) or unrecoverable frame: gentle step-down.
+            self.budget *= 0.92;
+            self.last_decrease = Some(now);
         } else if self.state == UsageState::Normal
+            && self.loss_ema < 0.02
+            && rr.frames_unrecoverable == 0
             && self.last_decrease.is_none_or(|t| now.since(t) >= self.cfg.hold_after_decrease_us)
         {
             self.budget *= 1.0 + self.cfg.increase_per_sec * dt_us as f64 / 1e6;
@@ -271,5 +291,34 @@ mod tests {
         assert_eq!(abr.bitrate_kbps(), 1_000);
         run(&mut abr, &mut t, 2000, &rr(1000, 0, 0.0, 5000));
         assert_eq!(abr.bitrate_kbps(), 3_000);
+    }
+
+    #[test]
+    fn adapts_smoothly_under_loss_and_jitter_then_recovers() {
+        let mut abr = AbrController::new(25_000, 2_000, 60_000);
+        let mut t = 0;
+
+        // Phase 1: 4% loss + 5-15 ms jitter (delay gradient spikes + oscillating recv_kbps).
+        for i in 0..20 {
+            t += 50_000;
+            let grad = if i % 3 == 0 { 650.0 } else if i % 3 == 1 { 320.0 } else { -200.0 };
+            // Occasional low 50 ms sample due to jitter burst must not cliff-drop bitrate.
+            let measured = if i == 5 { 3_000 } else { 20_000 };
+            abr.on_report(&rr(960, 40, grad, measured), Timestamp(t));
+        }
+        let degraded_kbps = abr.bitrate_kbps();
+        let degraded_parity = abr.parity_percent();
+        assert!(degraded_kbps < 22_000, "expected bitrate step-down, got {degraded_kbps}");
+        assert!(degraded_kbps > 5_000, "must not cliff-drop under jitter, got {degraded_kbps}");
+        assert!(degraded_parity >= 8, "expected parity >= 8% at 4% loss, got {degraded_parity}");
+
+        // Phase 2: link becomes clean -> bitrate ramps smoothly back up and parity decays.
+        run(&mut abr, &mut t, 160, &rr(1000, 0, 0.0, 30_000)); // 8 s clean
+        let recovered_kbps = abr.bitrate_kbps();
+        assert!(
+            recovered_kbps > degraded_kbps * 120 / 100,
+            "expected >=20% recovery above {degraded_kbps}, got {recovered_kbps}"
+        );
+        assert_eq!(abr.parity_percent(), 5);
     }
 }

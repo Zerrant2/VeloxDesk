@@ -18,6 +18,8 @@ use veloxdesk_core_traits::input::{
 use veloxdesk_core_traits::{CoreError, Result};
 
 use crate::core::{Action, InjectorCore, VirtualBounds};
+use crate::gamepad::{GamepadDriver, GamepadRouter};
+use crate::gamepad_linux::UinputGamepadDriver;
 use crate::keymap::{hid_to_evdev, EVDEV_MAX_KEY};
 
 // linux/input-event-codes.h
@@ -178,6 +180,8 @@ pub struct UinputInjector {
     core: InjectorCore,
     kbd: UinputDevice,
     abs: UinputDevice,
+    gamepad_router: GamepadRouter,
+    gamepad: UinputGamepadDriver,
 }
 
 impl UinputInjector {
@@ -212,7 +216,13 @@ impl UinputInjector {
             abs.ioctl_ptr(UI_ABS_SETUP, &s)?;
         }
         abs.create("VeloxDesk Virtual Pointer", 2)?;
-        Ok(Self { core: InjectorCore::new(), kbd, abs })
+        Ok(Self {
+            core: InjectorCore::new(),
+            kbd,
+            abs,
+            gamepad_router: GamepadRouter::new(),
+            gamepad: UinputGamepadDriver::new(),
+        })
     }
 
     fn bounds(&self) -> VirtualBounds {
@@ -277,6 +287,10 @@ impl UinputInjector {
                         self.kbd.sync()?;
                     }
                 }
+                Action::Gamepad(state) => {
+                    let g_actions = self.gamepad_router.apply(state);
+                    self.gamepad.apply_actions(&g_actions)?;
+                }
             }
         }
         self.abs.sync()?;
@@ -306,9 +320,9 @@ impl InputInjector for UinputInjector {
             keyboard: true,
             mouse_absolute: true,
             mouse_relative: true,
-            gamepads: false,
-            gamepad_backend: None,
-            max_gamepads: 0,
+            gamepads: true,
+            gamepad_backend: self.gamepad.backend_name(),
+            max_gamepads: self.gamepad.max_gamepads(),
             touch: false,
         }
     }
@@ -323,11 +337,14 @@ impl InputInjector for UinputInjector {
     }
 
     fn release_all(&mut self) -> Result<()> {
+        let gp_disc = self.gamepad_router.disconnect_all();
+        let gp_res = self.gamepad.apply_actions(&gp_disc);
         let actions = self.core.release_actions();
-        self.run(&actions)
+        let kb_res = self.run(&actions);
+        kb_res.and(gp_res)
     }
 
     fn poll_feedback(&mut self) -> Vec<InputFeedback> {
-        Vec::new()
+        self.gamepad.poll_feedback()
     }
 }

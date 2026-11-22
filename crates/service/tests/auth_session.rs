@@ -190,6 +190,9 @@ fn test_backends(injected: Arc<AtomicUsize>) -> HostBackends {
         injector: Arc::new(move || Ok(Box::new(CountingInjector(injected.clone())) as Box<dyn InputInjector>)),
         video_sink: Arc::new(|_, _| Box::new(NullSink)),
         rate: Arc::new(|s, mn, mx| Box::new(SimpleRate::new(s, mn, mx))),
+        audio_capture: None,
+        audio_encoder: None,
+        audio_playback: None,
     }
 }
 

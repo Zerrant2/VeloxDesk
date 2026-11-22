@@ -110,6 +110,35 @@ impl Scale {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FpsCap {
+    #[default]
+    Fps60,
+    Fps120,
+    Fps144,
+    Fps240,
+}
+
+impl FpsCap {
+    pub const ALL: [FpsCap; 4] = [FpsCap::Fps60, FpsCap::Fps120, FpsCap::Fps144, FpsCap::Fps240];
+    pub fn fps(self) -> u32 {
+        match self {
+            FpsCap::Fps60 => 60,
+            FpsCap::Fps120 => 120,
+            FpsCap::Fps144 => 144,
+            FpsCap::Fps240 => 240,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            FpsCap::Fps60 => "60 FPS",
+            FpsCap::Fps120 => "120 FPS",
+            FpsCap::Fps144 => "144 FPS",
+            FpsCap::Fps240 => "240 FPS",
+        }
+    }
+}
+
 /// Max entries kept in the recent-connections list.
 pub const MAX_RECENT: usize = 10;
 
@@ -121,12 +150,21 @@ pub struct Settings {
     pub rendezvous_server: String,
     pub mode: Mode,
     pub quality: Quality,
+    pub fps_cap: FpsCap,
     pub present: Present,
     pub scale: Scale,
     pub show_hud: bool,
     pub prefer_hw_decode: bool,
-    /// Gaming mode: lock the pointer and send relative motion.
+    /// Gaming mode: lock the pointer and send relative motion (`Ctrl+Alt+G`).
     pub relative_mouse_in_gaming: bool,
+    /// Request 10-bit HDR (P010 / HEVC Main10 / AV1 10-bit) when supported.
+    pub hdr_10bit: bool,
+    /// Request YUV 4:4:4 full chroma when supported.
+    pub yuv444: bool,
+    /// Play incoming remote desktop audio (Opus low-delay).
+    pub audio_enabled: bool,
+    /// Stream local microphone to the host (track 1).
+    pub mic_enabled: bool,
 }
 
 impl Default for Settings {
@@ -136,11 +174,16 @@ impl Default for Settings {
             rendezvous_server: String::new(),
             mode: Mode::Desktop,
             quality: Quality::Balanced,
+            fps_cap: FpsCap::Fps120,
             present: Present::Mailbox,
             scale: Scale::Fit,
             show_hud: false,
             prefer_hw_decode: true,
             relative_mouse_in_gaming: true,
+            hdr_10bit: false,
+            yuv444: false,
+            audio_enabled: true,
+            mic_enabled: false,
         }
     }
 }

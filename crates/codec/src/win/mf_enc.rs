@@ -216,6 +216,8 @@ impl Session {
                 (VideoCodec::H265, ChromaFormat::Yuv420, 8) => eAVEncH265VProfile_Main_420_8.0 as u32,
                 (VideoCodec::H265, ChromaFormat::Yuv420, 10) => eAVEncH265VProfile_Main_420_10.0 as u32,
                 (VideoCodec::H265, ChromaFormat::Yuv444, 8) => eAVEncH265VProfile_Main_444_8.0 as u32,
+                (VideoCodec::Av1, ChromaFormat::Yuv420, 8) => eAVEncAV1VProfile_Main_420_8.0 as u32,
+                (VideoCodec::Av1, ChromaFormat::Yuv420, 10) => eAVEncAV1VProfile_Main_420_10.0 as u32,
                 _ => 0,
             };
             if profile != 0 {
@@ -597,6 +599,8 @@ impl MfEncoder {
             s.transform.ProcessInput(0, &sample, 0).map_err(|e| {
                 if e.code() == MF_E_NOTACCEPTING {
                     CoreError::reinit("MF encoder not accepting input")
+                } else if e.code() == MF_E_UNSUPPORTED_D3D_TYPE {
+                    CoreError::unsupported(format!("MF encoder D3D input type unsupported: {e}"))
                 } else {
                     CoreError::platform(format!("ProcessInput: {e}"))
                 }

@@ -4145,6 +4145,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "veloxdesk-audio",
  "veloxdesk-codec",
  "veloxdesk-core-traits",
  "veloxdesk-crypto",
@@ -4153,6 +4154,7 @@ dependencies = [
  "veloxdesk-service",
  "veloxdesk-transport",
  "veloxdesk-ui",
+ "windows",
  "winit",
 ]
 
@@ -4186,6 +4188,7 @@ dependencies = [
  "veloxdesk-protocol",
  "veloxdesk-render",
  "veloxdesk-transport",
+ "windows",
 ]
 
 [[package]]
@@ -4294,9 +4297,11 @@ dependencies = [
  "egui-winit",
  "pollster",
  "tracing",
+ "veloxdesk-codec",
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
  "wgpu",
+ "windows",
  "winit",
 ]
 
@@ -4355,6 +4360,7 @@ dependencies = [
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
+ "veloxdesk-audio",
  "veloxdesk-capture",
  "veloxdesk-codec",
  "veloxdesk-core-traits",
@@ -4380,15 +4386,18 @@ dependencies = [
  "bytes",
  "prost",
  "tokio",
+ "veloxdesk-audio",
  "veloxdesk-benches",
  "veloxdesk-codec",
  "veloxdesk-core-traits",
  "veloxdesk-crypto",
  "veloxdesk-protocol",
+ "veloxdesk-render",
  "veloxdesk-server-relay",
  "veloxdesk-server-rendezvous",
  "veloxdesk-service",
  "veloxdesk-transport",
+ "windows",
 ]
 
 [[package]]

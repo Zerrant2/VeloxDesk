@@ -12,7 +12,7 @@ use winit::window::Window;
 use crate::hud;
 use crate::layout::{VideoRect, window_to_video, window_to_video_clamped};
 use crate::pipeline::VideoPipeline;
-use crate::zero_copy::{GpuImporter, NoImport};
+use crate::zero_copy::{GpuImporter, create_importer, requested_features};
 
 /// Construction options.
 #[derive(Debug, Clone)]
@@ -101,6 +101,7 @@ pub struct VideoSurface {
     egui_renderer: egui_wgpu::Renderer,
     cursor: Option<(i32, i32)>,
     hud: Option<HudSnapshot>,
+    hud_extra: Option<String>,
     hud_visible: bool,
     video_rect: Option<VideoRect>,
     repaint_at: Option<Instant>,
@@ -133,10 +134,12 @@ impl VideoSurface {
         .map_err(|e| CoreError::unsupported(format!("no GPU adapter: {e}")))?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("veloxdesk"),
+            required_features: requested_features(&adapter),
             required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
             ..Default::default()
         }))
         .map_err(|e| CoreError::platform(format!("request_device: {e}")))?;
+        let importer = create_importer(&adapter, &device);
 
         let caps = surface.get_capabilities(&adapter);
         // Non-sRGB target: video and egui are both gamma-encoded already.
@@ -191,12 +194,13 @@ impl VideoSurface {
             present_mode,
             scale_mode: opts.scale_mode,
             pipeline,
-            importer: Box::new(NoImport),
+            importer,
             egui_ctx,
             egui_state,
             egui_renderer,
             cursor: None,
             hud: None,
+            hud_extra: None,
             hud_visible: false,
             video_rect: None,
             repaint_at: None,
@@ -240,6 +244,14 @@ impl VideoSurface {
     pub fn set_hud(&mut self, snapshot: HudSnapshot) {
         self.hud = Some(snapshot);
     }
+    /// Extra status line rendered below the standard HUD (e.g. audio buffer, gamepads, pointer lock).
+    pub fn set_hud_extra(&mut self, extra: Option<String>) {
+        self.hud_extra = extra;
+    }
+    /// Adapter LUID on Windows when zero-copy DX12 import is active.
+    pub fn adapter_luid(&self) -> Option<u64> {
+        self.importer.adapter_luid()
+    }
     /// When egui wants the next repaint (animations, tooltips); `None` = idle.
     pub fn repaint_deadline(&self) -> Option<Instant> {
         self.repaint_at
@@ -275,12 +287,9 @@ impl VideoSurface {
     pub fn render(&mut self, frame: Option<&Frame>, ui: &mut dyn FnMut(&mut egui::Ui)) -> Result<PresentStats> {
         let t0 = Instant::now();
         let mut bd = RenderBreakdown::default();
+        let mut zero_copy = false;
         if let Some(f) = frame {
-            if let veloxdesk_core_traits::video::FrameData::Gpu(g) = &f.data {
-                // Zero-copy path (M3): importer validates and fails over to an error.
-                self.importer.import(g, f.width, f.height)?;
-            }
-            self.pipeline.upload(f)?;
+            zero_copy = self.pipeline.upload_or_import(f, self.importer.as_mut())?;
         }
         let t_up = Instant::now();
         bd.upload_us = (t_up - t0).as_micros() as u32;
@@ -289,10 +298,11 @@ impl VideoSurface {
         let raw = self.egui_state.take_egui_input(&self.window);
         let hud_visible = self.hud_visible;
         let hud_snap = self.hud.clone();
+        let hud_extra = self.hud_extra.clone();
         let full = self.egui_ctx.run_ui(raw, |root| {
             ui(root);
             if hud_visible && let Some(s) = &hud_snap {
-                hud::show_hud(root, s, None);
+                hud::show_hud(root, s, hud_extra.as_deref());
             }
         });
         self.egui_state.handle_platform_output(&self.window, full.platform_output);
@@ -388,7 +398,7 @@ impl VideoSurface {
         bd.present_us = (t_end - t_sub).as_micros() as u32;
         bd.total_us = (t_end - t0).as_micros() as u32;
         self.last = bd;
-        Ok(PresentStats { render_us: bd.total_us, zero_copy: false })
+        Ok(PresentStats { render_us: bd.total_us, zero_copy })
     }
 }
 

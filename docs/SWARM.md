@@ -189,3 +189,46 @@ pub async fn connect_p2p(opts: P2pConnectOptions, id: &DeviceIdentity) -> Result
 * `ConnectScreen` accepts either a **9-digit Device ID** (with optional spaces e.g. `123 456 789`) OR direct `ip[:port]` / `host[:port]`, plus Rendezvous server field in Settings.
 * Password prompt modal (on `AuthChallenge` requiring password/OTP) and interactive incoming-session Accept modal (displaying caller ID, fingerprint, granular `Permissions` toggles, "Trust peer", Accept/Reject).
 * `apps/client` CLI: `--rendezvous <addr>`, `--password <pw>`, `--connect <id-or-ip:port>` (auto-detects 9-digit ID → `connect_p2p`), HUD displays real `PathKind` (`Direct` / `P2P Direct` / `Relay`).
+
+---
+
+## M3 cross-crate APIs (Gaming Mode — Parsec Class)
+
+### `veloxdesk-transport::media` (net-worker)
+```rust
+/// Low-latency audio datagrams (`MediaKind::Audio`, 24-byte `MediaHeader`).
+/// `stream_id = 0` host system audio, `stream_id = 1` viewer microphone.
+pub struct AudioSender;
+impl AudioSender {
+    pub fn new(ch: Arc<dyn TransportChannel>, stream_id: u8) -> Self;
+    pub fn set_redundant(&mut self, enabled: bool); // optional duplicate send under >2% loss
+    pub fn send(&mut self, pkt: &EncodedAudio) -> Result<()>;
+}
+pub struct AudioReceiver;
+impl AudioReceiver {
+    pub fn parse_datagram(dgram: &[u8]) -> Option<(u8 /* stream_id */, EncodedAudio)>;
+}
+
+/// Idempotent gamepad snapshots (`MediaKind::GamepadState`, 24-byte `MediaHeader` + prost `GamepadState`).
+pub fn encode_gamepad_datagram(state: &GamepadState) -> Result<Bytes>;
+pub fn decode_gamepad_datagram(dgram: &[u8]) -> Option<GamepadState>;
+```
+
+### `veloxdesk-render::zero_copy` (render-ui-worker)
+* Windows DX12 importer: opens `GpuHandle::D3D11Texture { shared_handle, adapter_luid }` via `ID3D12Device::OpenSharedHandle` + `wgpu::hal::api::Dx12::Device::texture_from_raw` (`NV12` / `P010`), caches imported textures by `shared_handle`, verifies LUID match, falls back to CPU readback if unavailable.
+* `VideoRenderer::caps().zero_copy_import` reports `["D3D11Texture"]` when DX12 zero-copy is active.
+* `video.wgsl` + `VideoPipeline` support `Nv12`, `I420`, `Bgra8/Rgba8`, **`P010` (10-bit HDR10 PQ→SDR tone-map / passthrough)**, and **`Yuv444` (3-plane full chroma)**.
+* `OffscreenRenderer::new_with_backends(w, h, backends)` (or `new` preferring DX12 on Windows) exposes `draw_frame(&mut self, frame: &Frame, scale: ScaleMode) -> Result<(u32, bool /* zero_copy */)>`.
+
+### `veloxdesk-input` M3 virtual gamepads (sys-worker)
+* Windows: ViGEmBus virtual X360 controllers (up to 4 simultaneous pads, direct Win32 `SetupDi` + `DeviceIoControl` — zero vcpkg) + rumble notifications drained via `InputInjector::poll_feedback() -> Vec<InputFeedback::Rumble>`. Graceful fallback when ViGEmBus driver is not installed.
+* Linux (`#[cfg(target_os = "linux")]`): `/dev/uinput` virtual X360 gamepads (up to 4 pads) with `EV_FF` rumble feedback.
+
+### `veloxdesk-service` M3 additions (sys-worker)
+* `HostConfig` / `HostArgs` add: `ten_bit: bool` (`--hdr`), `chroma: ChromaFormat` (`--yuv444`), `audio_enabled: bool` (`--no-audio`), `audio_bitrate_kbps: u32`, `audio_frame_ms: f32` (2.5/5/10/20), `allow_mic: bool`.
+* `HostBackends` adds optional `audio_capture` / `audio_encoder` / `audio_playback` factories (wired in `HostBackends::system()` to `veloxdesk-audio`).
+* `run_session` wires: host WASAPI loopback → `OpusEncoder` → `AudioSender` (gated by `permissions.audio`), incoming `MediaKind::GamepadState` datagrams (per-pad monotonic `seq` filter) → `InputThread`, and `InputFeedback::Rumble` → `Msg::Rumble` on control stream!
+
+### `veloxdesk-ui` & `apps/client` M3 additions (render-ui-worker)
+* Settings & toolbar: FPS (`60/120/144/240`), 10-bit HDR, YUV 4:4:4, Audio / Mic toggles, Pointer Lock (`Ctrl+Alt+G`).
+* Viewer requests `prefer_gpu_output = true` when `VideoSurface` supports zero-copy import, displays `zero_copy` and `audio_buf_ms` in HUD, plays received `MediaKind::Audio` through `AudioJitterBuffer` + `OpusDecoder` + `veloxdesk_audio::create_playback()`, polls local physical gamepads (multi-player) and applies incoming `Msg::Rumble`!

@@ -1,6 +1,7 @@
 //! VeloxDesk client and host application (`veloxdesk`).
 
 mod app;
+mod gamepad;
 mod input;
 mod latest;
 mod session;
@@ -96,6 +97,10 @@ struct Cli {
     #[arg(long)]
     sw_decode: bool,
 
+    /// Stream local microphone audio to the host (track 1).
+    #[arg(long)]
+    mic: bool,
+
     /// Host options (used with `--host`).
     #[cfg(feature = "net")]
     #[command(flatten)]
@@ -167,6 +172,21 @@ fn main() -> ExitCode {
     }
     if cli.sw_decode {
         settings.prefer_hw_decode = false;
+    }
+    if cli.mic {
+        settings.mic_enabled = true;
+    }
+    #[cfg(feature = "net")]
+    {
+        if cli.host_args.no_audio {
+            settings.audio_enabled = false;
+        }
+        if cli.host_args.hdr {
+            settings.hdr_10bit = true;
+        }
+        if cli.host_args.yuv444 {
+            settings.yuv444 = true;
+        }
     }
 
     let launch = if cli.test_pattern {

@@ -7,15 +7,21 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use veloxdesk_core_traits::input::DisplayGeometry;
-use veloxdesk_core_traits::video::{Display, VideoCodec};
+use veloxdesk_core_traits::audio::AudioCodecId;
+use veloxdesk_core_traits::input::{DisplayGeometry, InputEvent, InputEventKind, InputFeedback};
+use veloxdesk_core_traits::video::{ChromaFormat, Display, VideoCodec};
 use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
 use veloxdesk_protocol::StreamKind;
 use veloxdesk_protocol::control::{
-    BitrateUpdate, Close, DisplayInfo, Envelope, Hello, Pong, SessionConfig, SessionMode, VideoConfig, envelope::Msg,
+    AudioConfig, BitrateUpdate, Close, DisplayInfo, Envelope, Hello, Pong, SessionConfig, SessionMode, VideoConfig,
+    envelope::Msg,
 };
-use veloxdesk_transport::{ControlReceiver, ControlSender, framed};
+use veloxdesk_protocol::media::MediaKind;
+use veloxdesk_transport::{
+    AudioReceiver, ControlReceiver, ControlSender, datagram_kind, decode_gamepad_datagram, framed,
+};
 
+use crate::audio::{AudioParams, AudioPipeline, MicHandle, MicPlayback, frame_ms_to_us};
 use crate::backends::{HostBackends, RateController, RateDecision};
 use crate::config::HostConfig;
 use crate::inject::{InputHandle, InputThread};
@@ -65,17 +71,27 @@ pub fn negotiate_params(cfg: &HostConfig, hello: &Hello) -> VideoParams {
         bitrate = bitrate.min(hello.max_bitrate_kbps.max(cfg.min_bitrate_kbps));
     }
     let gaming = hello.mode == SessionMode::Gaming as i32;
+    let codec = negotiate_codec(cfg.codec, hello);
+    let viewer_cap = hello.video_caps.iter().find(|c| c.codec == codec as i32);
+    let ten_bit = cfg.ten_bit && viewer_cap.is_none_or(|c| c.ten_bit);
+    let chroma = if cfg.chroma == ChromaFormat::Yuv444 && viewer_cap.is_none_or(|c| c.yuv444) {
+        ChromaFormat::Yuv444
+    } else {
+        ChromaFormat::Yuv420
+    };
     VideoParams {
         stream_id: 0,
         display: cfg.display,
         max_fps: fps,
         bitrate_kbps: bitrate,
-        codec: negotiate_codec(cfg.codec, hello),
+        codec,
         prefer_hw: cfg.prefer_hw,
         prefer_gpu: cfg.prefer_gpu,
         draw_cursor: !gaming,
         idle_fps: cfg.idle_fps,
         parity_percent: cfg.fec_parity_percent,
+        ten_bit,
+        chroma,
     }
 }
 
@@ -106,6 +122,7 @@ struct State {
     displays: Vec<Display>,
     active: u32,
     video: Option<VideoConfig>,
+    audio: Option<AudioConfig>,
     mode: i32,
 }
 
@@ -115,7 +132,7 @@ impl State {
             displays: self.displays.iter().map(display_info).collect(),
             active_display: self.active,
             video: self.video.clone(),
-            audio: None,
+            audio: self.audio.clone(),
             host_name: host_name(),
             host_os: std::env::consts::OS.to_string(),
             mode: self.mode,
@@ -179,13 +196,47 @@ pub async fn run_session_until(
     let auth = crate::auth::authenticate(sid, &hello, &ch, &cfg, &mut writer, &mut reader).await?;
     summary.peer_device_id = auth.peer_device_id;
     let allow_input = auth.permissions.input && cfg.allow_input;
+    let viewer_accepts_opus =
+        hello.audio_codecs.is_empty() || hello.audio_codecs.contains(&(AudioCodecId::Opus as i32));
+    let allow_audio = cfg.audio_enabled && auth.permissions.audio && viewer_accepts_opus;
+    let allow_mic = cfg.allow_mic && auth.permissions.audio;
 
-    // 3. start pipeline, wait until displays + encoder are known.
+    // 3. start video, audio and input pipelines, wait until displays + encoder are known.
     let params = negotiate_params(&cfg, &hello);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let pipeline = VideoPipeline::start(params.clone(), &backends, ch.clone(), ev_tx)?;
-    let input = if allow_input { Some(InputThread::start(backends.injector.clone())?) } else { None };
-    let mut st = State { displays: Vec::new(), active: 0, video: None, mode: hello.mode };
+    let (fb_tx, mut fb_rx) = mpsc::unbounded_channel::<InputFeedback>();
+    let input =
+        if allow_input { Some(InputThread::start_with_feedback(backends.injector.clone(), Some(fb_tx))?) } else { None };
+    let audio_frame_us = frame_ms_to_us(cfg.audio_frame_ms).unwrap_or(5_000);
+    let (audio, audio_cfg) = if allow_audio && backends.audio_capture.is_some() && backends.audio_encoder.is_some() {
+        match AudioPipeline::start(
+            AudioParams { stream_id: 0, bitrate_kbps: cfg.audio_bitrate_kbps, frame_duration_us: audio_frame_us },
+            &backends,
+            ch.clone(),
+        ) {
+            Ok((p, c)) => (Some(p), Some(c)),
+            Err(e) => {
+                tracing::warn!(session = sid, "host audio unavailable (continuing video-only): {e}");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let mic = if allow_mic && backends.audio_playback.is_some() {
+        match MicPlayback::start(audio_frame_us, &backends) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!(session = sid, "host mic playback unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut st = State { displays: Vec::new(), active: 0, video: None, audio: audio_cfg, mode: hello.mode };
     let ready = timeout(HANDSHAKE_TIMEOUT, async {
         while st.video.is_none() || st.displays.is_empty() {
             match ev_rx.recv().await {
@@ -214,7 +265,7 @@ pub async fn run_session_until(
         tracing::error!(session = sid, "session start failed: {e}");
         let _ = writer.send(&Msg::Close(Close { code: CLOSE_HOST_ERROR, reason: e.clone() }).into()).await;
         let _ = writer.finish().await;
-        shutdown(pipeline, input).await;
+        shutdown(pipeline, input, audio, mic).await;
         ch.close(CLOSE_HOST_ERROR, &e);
         return Err(CoreError::platform(e));
     }
@@ -231,16 +282,20 @@ pub async fn run_session_until(
         }
         let _ = writer.finish().await;
     });
-    // 5. extra streams (input) accepted in the background.
+    // 5. extra streams (input) and incoming media datagrams (gamepads + optional mic).
     if let Some(i) = &input {
         tasks.spawn(accept_streams(ch.clone(), i.handle()));
+    }
+    let input_handle = input.as_ref().map(|i| i.handle());
+    let mic_handle = mic.as_ref().and_then(|m| m.handle());
+    if input_handle.is_some() || mic_handle.is_some() {
+        tasks.spawn(recv_media_datagrams(ch.clone(), input_handle.clone(), mic_handle));
     }
 
     // 6. main loop
     let mut rate: Box<dyn RateController> =
         (backends.rate)(params.bitrate_kbps, cfg.min_bitrate_kbps, params.bitrate_kbps);
     let mut viewer_cap = params.bitrate_kbps;
-    let input_handle = input.as_ref().map(|i| i.handle());
     let reason = loop {
         if *stop.borrow() {
             let _ = out.send(Msg::Close(Close { code: CLOSE_NORMAL, reason: "host shutting down".into() }).into());
@@ -251,6 +306,13 @@ pub async fn run_session_until(
                 if changed.is_err() || *stop.borrow() {
                     let _ = out.send(Msg::Close(Close { code: CLOSE_NORMAL, reason: "host shutting down".into() }).into());
                     break "host shutting down".to_string();
+                }
+            }
+            Some(fb) = fb_rx.recv() => {
+                match fb {
+                    InputFeedback::Rumble(r) => {
+                        let _ = out.send(Msg::Rumble(r).into());
+                    }
                 }
             }
             msg = reader.recv() => {
@@ -268,6 +330,11 @@ pub async fn run_session_until(
                     Some(Msg::KeyframeRequest(_)) => pipeline.request_keyframe(),
                     Some(Msg::Nack(n)) => pipeline.nack(n),
                     Some(Msg::ReceiverReport(rr)) => {
+                        if let Some(a) = &audio {
+                            let total = rr.packets_received + rr.packets_lost;
+                            let loss = if total == 0 { 0.0 } else { rr.packets_lost as f64 / total as f64 };
+                            a.set_redundant(loss > 0.02);
+                        }
                         if let Some(d) = rate.on_report(&rr, Timestamp::now()) {
                             let d = RateDecision { bitrate_kbps: d.bitrate_kbps.min(viewer_cap), ..d };
                             pipeline.apply_rate(d);
@@ -329,20 +396,87 @@ pub async fn run_session_until(
     // the writer task ends once `out` is dropped and drained
     let _ = timeout(Duration::from_millis(300), writer_task).await;
     tasks.abort_all();
-    let input_stats = shutdown(pipeline, input).await;
+    let input_stats = shutdown(pipeline, input, audio, mic).await;
     summary.input_events = input_stats;
     ch.close(CLOSE_NORMAL, "session ended");
     Ok(summary)
 }
 
-/// Stop video threads and the injector (which releases all keys); returns input events.
-async fn shutdown(pipeline: VideoPipeline, input: Option<InputThread>) -> u64 {
+/// Stop video, audio and input threads (releasing all keys and virtual gamepads); returns input events.
+async fn shutdown(
+    pipeline: VideoPipeline,
+    input: Option<InputThread>,
+    audio: Option<AudioPipeline>,
+    mic: Option<MicPlayback>,
+) -> u64 {
     tokio::task::spawn_blocking(move || {
         pipeline.stop();
+        if let Some(a) = audio {
+            a.stop();
+        }
+        if let Some(m) = mic {
+            m.stop();
+        }
         input.map(|i| i.stop().events).unwrap_or(0)
     })
     .await
     .unwrap_or(0)
+}
+
+/// Per-pad wrap-safe monotonic sequence filter for incoming `MediaKind::GamepadState` datagrams.
+#[derive(Default)]
+struct GamepadSeqFilter {
+    last: [Option<u32>; 4],
+}
+
+impl GamepadSeqFilter {
+    fn accept(&mut self, pad_id: u32, seq: u32) -> bool {
+        let idx = pad_id as usize;
+        if idx >= self.last.len() {
+            return false;
+        }
+        let fresh = match self.last[idx] {
+            None => true,
+            Some(0) if seq == 0 => true,
+            Some(prev) => (seq.wrapping_sub(prev) as i32) > 0,
+        };
+        if fresh {
+            self.last[idx] = Some(seq);
+        }
+        fresh
+    }
+}
+
+/// Receive viewer → host media datagrams (`GamepadState` and optional viewer microphone `Audio` track 1).
+async fn recv_media_datagrams(
+    ch: Arc<dyn TransportChannel>,
+    input: Option<InputHandle>,
+    mic: Option<MicHandle>,
+) {
+    let mut seq_filter = GamepadSeqFilter::default();
+    while let Ok(dgram) = ch.recv_datagram().await {
+        match datagram_kind(&dgram) {
+            Some(MediaKind::GamepadState) => {
+                if let Some(h) = &input
+                    && let Some(gp) = decode_gamepad_datagram(&dgram)
+                    && seq_filter.accept(gp.pad_id, gp.seq)
+                {
+                    h.inject(InputEvent {
+                        ts_us: Timestamp::now().as_micros(),
+                        event: Some(InputEventKind::Gamepad(gp)),
+                    });
+                }
+            }
+            Some(MediaKind::Audio) => {
+                if let Some(m) = &mic
+                    && let Some((1, pkt)) = AudioReceiver::parse_datagram(&dgram)
+                {
+                    m.push(pkt);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Accept viewer-opened streams; `Input` streams feed the injector.

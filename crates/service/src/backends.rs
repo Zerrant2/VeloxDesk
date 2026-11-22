@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use veloxdesk_core_traits::audio::{AudioCapture, AudioEncoder, AudioEncoderConfig, AudioPlayback};
 use veloxdesk_core_traits::video::{EncodedPacket, EncoderConfig};
 use veloxdesk_core_traits::{FrameCapture, InputInjector, Result, Timestamp, TransportChannel, VideoEncoder};
 use veloxdesk_protocol::control::{Nack, ReceiverReport};
@@ -34,6 +35,9 @@ pub type InjectorFactory = dyn Fn() -> Result<Box<dyn InputInjector>> + Send + S
 pub type SinkFactory = dyn Fn(Arc<dyn TransportChannel>, u8) -> Box<dyn VideoSink> + Send + Sync;
 /// `(start_kbps, min_kbps, max_kbps)` → controller.
 pub type RateFactory = dyn Fn(u32, u32, u32) -> Box<dyn RateController> + Send + Sync;
+pub type AudioCaptureFactory = dyn Fn() -> Result<Box<dyn AudioCapture>> + Send + Sync;
+pub type AudioEncoderFactory = dyn Fn(&AudioEncoderConfig) -> Result<Box<dyn AudioEncoder>> + Send + Sync;
+pub type AudioPlaybackFactory = dyn Fn() -> Result<Box<dyn AudioPlayback>> + Send + Sync;
 
 /// Factories for every platform-dependent stage. Cheap to clone (Arc'd closures).
 #[derive(Clone)]
@@ -43,6 +47,19 @@ pub struct HostBackends {
     pub injector: Arc<InjectorFactory>,
     pub video_sink: Arc<SinkFactory>,
     pub rate: Arc<RateFactory>,
+    pub audio_capture: Option<Arc<AudioCaptureFactory>>,
+    pub audio_encoder: Option<Arc<AudioEncoderFactory>>,
+    pub audio_playback: Option<Arc<AudioPlaybackFactory>>,
+}
+
+impl HostBackends {
+    /// Remove audio factories (convenient for video-only headless tests).
+    pub fn without_audio(mut self) -> Self {
+        self.audio_capture = None;
+        self.audio_encoder = None;
+        self.audio_playback = None;
+        self
+    }
 }
 
 /// Simple GCC-flavoured fallback controller (used when no transport ABR is wired):

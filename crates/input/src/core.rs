@@ -4,10 +4,10 @@
 
 use std::collections::BTreeSet;
 
-use veloxdesk_core_traits::input::{DisplayGeometry, InputEvent, InputEventKind, MouseButton};
+use veloxdesk_core_traits::input::{DisplayGeometry, GamepadState, InputEvent, InputEventKind, MouseButton};
 
 /// One primitive action executed by an OS backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Absolute position in virtual-desktop pixels.
     MoveAbs { x: i32, y: i32 },
@@ -18,6 +18,8 @@ pub enum Action {
     /// USB HID usage (page 0x07).
     Key { usage: u32, down: bool },
     Text(String),
+    /// Virtual gamepad state update (XInput layout, up to 4 pads).
+    Gamepad(GamepadState),
 }
 
 /// Bounding box of all displays in virtual-desktop pixels.
@@ -133,7 +135,8 @@ impl InjectorCore {
                     vec![Action::Text(t.text.clone())]
                 }
             }
-            InputEventKind::Gamepad(_) | InputEventKind::Touch(_) => Vec::new(),
+            InputEventKind::Gamepad(g) => vec![Action::Gamepad(g.clone())],
+            InputEventKind::Touch(_) => Vec::new(),
         }
     }
 

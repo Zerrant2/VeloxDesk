@@ -11,9 +11,14 @@
 //! Virtual gamepads (ViGEmBus / uinput) are M3.
 
 pub mod core;
+pub mod gamepad;
 pub mod keymap;
 pub mod text;
 
+#[cfg(target_os = "linux")]
+mod gamepad_linux;
+#[cfg(windows)]
+mod gamepad_win;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(windows)]

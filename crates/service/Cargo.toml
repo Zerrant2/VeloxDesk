@@ -19,6 +19,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
 toml = "0.9"
 tracing.workspace = true
+veloxdesk-audio = { workspace = true }
 veloxdesk-capture = { workspace = true }
 veloxdesk-codec = { workspace = true }
 veloxdesk-core-traits = { workspace = true }

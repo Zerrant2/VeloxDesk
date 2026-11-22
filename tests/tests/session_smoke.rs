@@ -162,6 +162,9 @@ async fn host_viewer_session_end_to_end() {
         },
         video_sink: Arc::new(|ch, sid| Box::new(RealSink(VideoSender::new(ch, sid)))),
         rate: Arc::new(|start, min, max| Box::new(RealAbr(AbrController::new(start, min, max)))),
+        audio_capture: None,
+        audio_encoder: None,
+        audio_playback: None,
     };
 
     let cfg = Arc::new(HostConfig {

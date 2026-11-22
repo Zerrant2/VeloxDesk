@@ -2,13 +2,17 @@
 //! applies events in order. Dropping every [`InputHandle`] releases all keys/buttons.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
+use tokio::sync::mpsc::UnboundedSender;
 use veloxdesk_core_traits::Timestamp;
-use veloxdesk_core_traits::input::{DisplayGeometry, InputEvent};
+use veloxdesk_core_traits::input::{DisplayGeometry, InputEvent, InputFeedback};
 
 use crate::backends::InjectorFactory;
+
+const FEEDBACK_POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 enum InputCmd {
     Event(InputEvent),
@@ -52,8 +56,17 @@ pub struct InputThread {
 
 impl InputThread {
     pub fn start(factory: Arc<InjectorFactory>) -> std::io::Result<Self> {
+        Self::start_with_feedback(factory, None)
+    }
+
+    pub fn start_with_feedback(
+        factory: Arc<InjectorFactory>,
+        feedback: Option<UnboundedSender<InputFeedback>>,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = channel();
-        let join = std::thread::Builder::new().name("vdk-input".into()).spawn(move || run(factory, rx))?;
+        let join = std::thread::Builder::new()
+            .name("vdk-input".into())
+            .spawn(move || run(factory, rx, feedback))?;
         Ok(Self { handle: Some(InputHandle { tx }), join: Some(join) })
     }
 
@@ -70,7 +83,18 @@ impl InputThread {
     }
 }
 
-fn run(factory: Arc<InjectorFactory>, rx: Receiver<InputCmd>) -> InputStats {
+fn drain_feedback(inj: &mut dyn veloxdesk_core_traits::InputInjector, tx: Option<&UnboundedSender<InputFeedback>>) {
+    let Some(tx) = tx else { return };
+    for fb in inj.poll_feedback() {
+        let _ = tx.send(fb);
+    }
+}
+
+fn run(
+    factory: Arc<InjectorFactory>,
+    rx: Receiver<InputCmd>,
+    feedback: Option<UnboundedSender<InputFeedback>>,
+) -> InputStats {
     let mut stats = InputStats::default();
     let mut injector = match factory() {
         Ok(i) => {
@@ -83,32 +107,40 @@ fn run(factory: Arc<InjectorFactory>, rx: Receiver<InputCmd>) -> InputStats {
         }
     };
     let mut warned = false;
-    while let Ok(cmd) = rx.recv() {
-        if matches!(cmd, InputCmd::Shutdown) {
-            break;
-        }
-        let Some(inj) = injector.as_mut() else { continue };
-        match cmd {
-            InputCmd::Event(ev) => {
-                let t0 = Timestamp::now();
-                stats.events += 1;
-                if let Err(e) = inj.inject(&ev) {
-                    stats.errors += 1;
-                    if !warned {
-                        tracing::warn!("input injection failed: {e}");
-                        warned = true;
-                    }
-                } else {
-                    warned = false;
+    loop {
+        match rx.recv_timeout(FEEDBACK_POLL_INTERVAL) {
+            Ok(InputCmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(inj) = injector.as_deref_mut() {
+                    drain_feedback(inj, feedback.as_ref());
                 }
-                stats.max_inject_us = stats.max_inject_us.max(t0.elapsed_us());
             }
-            InputCmd::Displays(d) => inj.set_displays(&d),
-            InputCmd::Shutdown => {}
-            InputCmd::ReleaseAll => {
-                if let Err(e) = inj.release_all() {
-                    tracing::warn!("release_all failed: {e}");
+            Ok(cmd) => {
+                let Some(inj) = injector.as_deref_mut() else { continue };
+                match cmd {
+                    InputCmd::Event(ev) => {
+                        let t0 = Timestamp::now();
+                        stats.events += 1;
+                        if let Err(e) = inj.inject(&ev) {
+                            stats.errors += 1;
+                            if !warned {
+                                tracing::warn!("input injection failed: {e}");
+                                warned = true;
+                            }
+                        } else {
+                            warned = false;
+                        }
+                        stats.max_inject_us = stats.max_inject_us.max(t0.elapsed_us());
+                    }
+                    InputCmd::Displays(d) => inj.set_displays(&d),
+                    InputCmd::Shutdown => break,
+                    InputCmd::ReleaseAll => {
+                        if let Err(e) = inj.release_all() {
+                            tracing::warn!("release_all failed: {e}");
+                        }
+                    }
                 }
+                drain_feedback(inj, feedback.as_ref());
             }
         }
     }

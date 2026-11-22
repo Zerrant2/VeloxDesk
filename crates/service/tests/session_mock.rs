@@ -247,6 +247,9 @@ async fn full_session_over_memory_transport() {
             injector: Arc::new(move || Ok(Box::new(RecInjector(inj_log.clone())) as Box<dyn InputInjector>)),
             video_sink: Arc::new(move |_ch, _sid| Box::new(RecSink(sink_log.clone())) as Box<dyn VideoSink>),
             rate: Arc::new(|s, mn, mx| Box::new(SimpleRate::new(s, mn, mx)) as Box<dyn veloxdesk_service::RateController>),
+            audio_capture: None,
+            audio_encoder: None,
+            audio_playback: None,
         }
     };
     let cfg = Arc::new(HostConfig { max_fps: 60, bitrate_kbps: 10_000, ..Default::default() });

@@ -14,12 +14,16 @@ use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use veloxdesk_core_traits::audio::{AudioCodecId, EncodedAudio};
 use veloxdesk_core_traits::video::{EncodedPacket, VideoCodec};
 use veloxdesk_core_traits::{Timestamp, TransportChannel};
 use veloxdesk_crypto::DeviceIdentity;
 use veloxdesk_protocol::StreamKind;
-use veloxdesk_protocol::control::{Envelope, Ping, envelope::Msg};
-use veloxdesk_transport::{QuicChannel, VideoReceiver, VideoSender, connect, framed, listen};
+use veloxdesk_protocol::control::{Envelope, GamepadState, Ping, envelope::Msg};
+use veloxdesk_transport::{
+    AudioReceiver, AudioSender, QuicChannel, VideoReceiver, VideoSender, connect,
+    decode_gamepad_datagram, encode_gamepad_datagram, framed, listen,
+};
 
 fn payload(frame_id: u32, len: usize) -> Bytes {
     let mut x = frame_id.wrapping_mul(2_654_435_761).wrapping_add(1) as u64;
@@ -257,6 +261,51 @@ async fn video_120fps_with_random_loss() {
             assert_eq!(r.delivered, r.frames, "all frames must be recovered at {loss}");
             assert_eq!(r.discontinuities, 0);
         }
+    })
+    .await
+    .expect("timed out (UDP loopback blocked?)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audio_and_gamepad_datagrams_over_quic_loopback() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (host, viewer, _, _) = session().await;
+
+        // Host -> viewer Opus system audio (stream_id = 0).
+        let mut audio_tx = AudioSender::new(Arc::new(host.clone()), 0);
+        let audio_pkt = EncodedAudio {
+            data: Bytes::from_static(b"opus-5ms-encoded-payload"),
+            codec: AudioCodecId::Opus,
+            seq: 101,
+            capture_ts: Timestamp(42_000),
+            duration_us: 5_000,
+        };
+        audio_tx.send(&audio_pkt).unwrap();
+        let raw_audio = viewer.recv_datagram().await.unwrap();
+        let (stream_id, rx_audio) = AudioReceiver::parse_datagram(&raw_audio).expect("valid audio datagram");
+        assert_eq!(stream_id, 0);
+        assert_eq!(rx_audio.codec, AudioCodecId::Opus);
+        assert_eq!(rx_audio.seq, 101);
+        assert_eq!(rx_audio.duration_us, 5_000);
+        assert_eq!(rx_audio.data, audio_pkt.data);
+
+        // Viewer -> host GamepadState snapshot.
+        let gp = GamepadState {
+            pad_id: 1,
+            connected: true,
+            buttons: 0xF00F,
+            left_trigger: 64,
+            right_trigger: 200,
+            left_x: -12_000,
+            left_y: 24_000,
+            right_x: 100,
+            right_y: -100,
+            seq: 77,
+        };
+        viewer.send_datagram(encode_gamepad_datagram(&gp).unwrap()).unwrap();
+        let raw_gp = host.recv_datagram().await.unwrap();
+        let rx_gp = decode_gamepad_datagram(&raw_gp).expect("valid gamepad datagram");
+        assert_eq!(rx_gp, gp);
     })
     .await
     .expect("timed out (UDP loopback blocked?)");

@@ -10,8 +10,9 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use veloxdesk_crypto::auth::PasswordHash;
 use veloxdesk_protocol::DEFAULT_DIRECT_PORT;
-use veloxdesk_protocol::control::VideoCodec;
+use veloxdesk_protocol::control::{ChromaFormat, VideoCodec};
 
+use crate::audio::frame_ms_to_us;
 use crate::auth::{HostAuthConfig, TrustedPeer, encode_hex_pubkey, parse_hex_pubkey};
 
 /// Everything the host pipeline needs. Construct with [`HostConfig::default`],
@@ -51,6 +52,18 @@ pub struct HostConfig {
     pub rendezvous: Option<SocketAddr>,
     /// Authentication and authorization policy (defaults to M1 open mode; enabled via CLI/TOML or struct).
     pub auth: HostAuthConfig,
+    /// Enable 10-bit HDR (P010 / HEVC Main10 / AV1 10-bit) when hardware supports it (M3).
+    pub ten_bit: bool,
+    /// Chroma subsampling (`Yuv420` default, or `Yuv444` full chroma when supported) (M3).
+    pub chroma: ChromaFormat,
+    /// Enable low-latency Opus system-audio loopback streaming (`stream_id = 0`) (M3).
+    pub audio_enabled: bool,
+    /// Opus audio target bitrate in kbit/s (default 128).
+    pub audio_bitrate_kbps: u32,
+    /// Opus frame duration in ms (`2.5`, `5.0`, `10.0`, `20.0`; default `5.0`).
+    pub audio_frame_ms: f32,
+    /// Allow viewer microphone audio playback (`stream_id = 1`) on the host.
+    pub allow_mic: bool,
 }
 
 impl Default for HostConfig {
@@ -71,6 +84,12 @@ impl Default for HostConfig {
             identity_path: None,
             rendezvous: None,
             auth: HostAuthConfig::open(),
+            ten_bit: false,
+            chroma: ChromaFormat::Yuv420,
+            audio_enabled: true,
+            audio_bitrate_kbps: 128,
+            audio_frame_ms: 5.0,
+            allow_mic: false,
         }
     }
 }
@@ -116,6 +135,28 @@ pub struct HostConfigFile {
     pub require_accept: Option<bool>,
     pub allow_no_auth: Option<bool>,
     pub trusted_peers: Option<Vec<TrustedPeerFile>>,
+    pub ten_bit: Option<bool>,
+    pub chroma: Option<String>,
+    pub audio_enabled: Option<bool>,
+    pub audio_bitrate_kbps: Option<u32>,
+    pub audio_frame_ms: Option<f32>,
+    pub allow_mic: Option<bool>,
+}
+
+/// Parse a chroma format name: `yuv420`/`420` or `yuv444`/`444`.
+pub fn parse_chroma(s: &str) -> anyhow::Result<ChromaFormat> {
+    Ok(match s.trim().to_ascii_lowercase().as_str() {
+        "yuv420" | "420" | "4:2:0" => ChromaFormat::Yuv420,
+        "yuv444" | "444" | "4:4:4" => ChromaFormat::Yuv444,
+        other => bail!("unknown chroma format {other:?} (expected yuv420 or yuv444)"),
+    })
+}
+
+pub fn chroma_name(c: ChromaFormat) -> &'static str {
+    match c {
+        ChromaFormat::Yuv420 => "yuv420",
+        ChromaFormat::Yuv444 => "yuv444",
+    }
 }
 
 /// Parse a codec name: `h264`/`avc`, `h265`/`hevc`, `av1`, `vp9` (case-insensitive).
@@ -147,7 +188,11 @@ impl HostConfig {
             ($($f:ident),*) => { $( if let Some(v) = file.$f.clone() { self.$f = v; } )* };
         }
         set!(bind, max_fps, bitrate_kbps, min_bitrate_kbps, prefer_hw, prefer_gpu, idle_fps,
-             fec_parity_percent, max_sessions, allow_input);
+             fec_parity_percent, max_sessions, allow_input, ten_bit, audio_enabled, audio_bitrate_kbps,
+             audio_frame_ms, allow_mic);
+        if let Some(ch) = &file.chroma {
+            self.chroma = parse_chroma(ch)?;
+        }
         if let Some(d) = file.display {
             self.display = Some(d);
         }
@@ -238,6 +283,12 @@ impl HostConfig {
             require_accept: Some(self.auth.require_accept),
             allow_no_auth: Some(self.auth.allow_no_auth),
             trusted_peers,
+            ten_bit: Some(self.ten_bit),
+            chroma: Some(chroma_name(self.chroma).to_string()),
+            audio_enabled: Some(self.audio_enabled),
+            audio_bitrate_kbps: Some(self.audio_bitrate_kbps),
+            audio_frame_ms: Some(self.audio_frame_ms),
+            allow_mic: Some(self.allow_mic),
         };
         toml::to_string(&f).unwrap_or_default()
     }
@@ -265,6 +316,14 @@ impl HostConfig {
             && otp.is_empty()
         {
             bail!("one_time_password must not be empty");
+        }
+        if self.audio_enabled {
+            if !(16..=512).contains(&self.audio_bitrate_kbps) {
+                bail!("audio_bitrate_kbps must be 16..=512, got {}", self.audio_bitrate_kbps);
+            }
+            if frame_ms_to_us(self.audio_frame_ms).is_none() {
+                bail!("audio_frame_ms must be 2.5, 5, 10, or 20, got {}", self.audio_frame_ms);
+            }
         }
         Ok(())
     }
@@ -323,6 +382,24 @@ pub struct HostArgs {
     /// Explicitly allow unauthenticated connections (useful on trusted LANs).
     #[arg(long)]
     pub allow_no_auth: bool,
+    /// Enable 10-bit HDR capture/encoding (P010 / HEVC Main10 / AV1 10-bit).
+    #[arg(long)]
+    pub hdr: bool,
+    /// Enable YUV 4:4:4 full-chroma encoding when supported by the GPU encoder.
+    #[arg(long)]
+    pub yuv444: bool,
+    /// Disable host system-audio streaming.
+    #[arg(long)]
+    pub no_audio: bool,
+    /// Opus audio bitrate in kbit/s (default: 128).
+    #[arg(long, value_name = "KBPS")]
+    pub audio_bitrate_kbps: Option<u32>,
+    /// Opus audio frame duration in ms: 2.5, 5, 10, or 20 (default: 5).
+    #[arg(long, value_name = "MS")]
+    pub audio_frame_ms: Option<f32>,
+    /// Allow viewer microphone audio playback on the host.
+    #[arg(long)]
+    pub allow_mic: bool,
 }
 
 impl HostArgs {
@@ -359,6 +436,24 @@ impl HostArgs {
         }
         if self.view_only {
             cfg.allow_input = false;
+        }
+        if self.hdr {
+            cfg.ten_bit = true;
+        }
+        if self.yuv444 {
+            cfg.chroma = ChromaFormat::Yuv444;
+        }
+        if self.no_audio {
+            cfg.audio_enabled = false;
+        }
+        if let Some(v) = self.audio_bitrate_kbps {
+            cfg.audio_bitrate_kbps = v;
+        }
+        if let Some(v) = self.audio_frame_ms {
+            cfg.audio_frame_ms = v;
+        }
+        if self.allow_mic {
+            cfg.allow_mic = true;
         }
         if let Some(phc) = &self.password_hash {
             cfg.auth.permanent_password_hash = Some(

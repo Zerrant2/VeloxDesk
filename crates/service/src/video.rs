@@ -35,6 +35,10 @@ pub struct VideoParams {
     /// Static-screen refresh rate (re-encode of the last frame); 0 = off.
     pub idle_fps: u32,
     pub parity_percent: u8,
+    /// Enable 10-bit HDR (P010 / HEVC Main10 / AV1 10-bit) when supported.
+    pub ten_bit: bool,
+    /// Preferred chroma format (`Yuv420` or `Yuv444`).
+    pub chroma: ChromaFormat,
 }
 
 /// Events from the pipeline threads to the session task.
@@ -167,10 +171,10 @@ impl CaptureLoop {
         let cfg = CaptureConfig {
             display: d.id.clone(),
             max_fps: self.params.max_fps,
-            preferred_format: PixelFormat::Bgra8,
+            preferred_format: if self.params.ten_bit { PixelFormat::Rgb10a2 } else { PixelFormat::Bgra8 },
             prefer_gpu: self.params.prefer_gpu,
             draw_cursor: self.params.draw_cursor,
-            hdr: false,
+            hdr: self.params.ten_bit,
         };
         cap.start(&cfg)?;
         tracing::info!(display = d.index, name = %d.name, w = d.width, h = d.height, hz = d.refresh_hz,
@@ -382,11 +386,15 @@ impl EncodeLoop {
             return true;
         }
         self.encoder = None;
-        let mut codecs = vec![self.params.codec];
-        if self.params.codec != VideoCodec::H264 {
-            codecs.push(VideoCodec::H264);
+        let want_depth = if self.params.ten_bit { 10u8 } else { 8u8 };
+        let mut attempts = vec![(self.params.codec, self.params.chroma, want_depth)];
+        if want_depth != 8 || self.params.chroma != ChromaFormat::Yuv420 {
+            attempts.push((self.params.codec, ChromaFormat::Yuv420, 8));
         }
-        for codec in codecs {
+        if self.params.codec != VideoCodec::H264 {
+            attempts.push((VideoCodec::H264, ChromaFormat::Yuv420, 8));
+        }
+        for (codec, chroma, bit_depth) in attempts {
             let cfg = EncoderConfig {
                 codec,
                 width: frame.width,
@@ -394,8 +402,8 @@ impl EncodeLoop {
                 fps: self.params.max_fps,
                 bitrate_kbps: self.bitrate_kbps,
                 rate_control: RateControl::Cbr,
-                chroma: ChromaFormat::Yuv420,
-                bit_depth: 8,
+                chroma,
+                bit_depth,
                 gop: None,
                 intra_refresh: false,
                 input_format: frame.format,
@@ -406,16 +414,16 @@ impl EncodeLoop {
                 Ok(enc) => {
                     let caps = enc.caps();
                     let zero_copy = frame.is_gpu() && caps.gpu_input_formats.contains(&frame.format);
-                    tracing::info!(encoder = caps.name, hw = caps.hardware, ?codec, w = frame.width,
-                        h = frame.height, zero_copy, "encoder ready");
+                    tracing::info!(encoder = caps.name, hw = caps.hardware, ?codec, ?chroma, bit_depth,
+                        w = frame.width, h = frame.height, zero_copy, "encoder ready");
                     let _ = self.events.send(VideoEvent::Config(VideoConfig {
                         codec: codec as i32,
                         width: frame.width,
                         height: frame.height,
                         fps: self.params.max_fps,
                         bitrate_kbps: self.bitrate_kbps,
-                        chroma: ChromaFormat::Yuv420 as i32,
-                        bit_depth: 8,
+                        chroma: chroma as i32,
+                        bit_depth: bit_depth as u32,
                         encoder_name: caps.name.to_string(),
                         hw_encoder: caps.hardware,
                         zero_copy,
@@ -426,7 +434,7 @@ impl EncodeLoop {
                     self.dims = (frame.width, frame.height);
                     return true;
                 }
-                Err(e) => tracing::warn!(?codec, "encoder creation failed: {e}"),
+                Err(e) => tracing::warn!(?codec, ?chroma, bit_depth, "encoder creation failed: {e}"),
             }
         }
         let _ = self.events.send(VideoEvent::Fatal("no usable video encoder".into()));
