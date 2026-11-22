@@ -1,0 +1,19 @@
+[package]
+name = "veloxdesk-server"
+description = "VeloxDesk self-hosted rendezvous + relay server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "veloxdesk-server"
+path = "src/main.rs"
+
+[dependencies]
+veloxdesk-core-traits = { workspace = true }
+veloxdesk-protocol = { workspace = true }
+
+[lints]
+workspace = true

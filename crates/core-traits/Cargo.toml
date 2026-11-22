@@ -1,0 +1,17 @@
+[package]
+name = "veloxdesk-core-traits"
+description = "VeloxDesk platform-neutral traits and frame types (capture, codec, audio, input, transport, render)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+veloxdesk-protocol = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+
+[lints]
+workspace = true

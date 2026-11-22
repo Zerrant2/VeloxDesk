@@ -1,0 +1,15 @@
+[package]
+name = "veloxdesk-capture"
+description = "Screen capture backends: DXGI/WGC (Windows), PipeWire/X11 (Linux), ScreenCaptureKit (macOS)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+veloxdesk-core-traits = { workspace = true }
+veloxdesk-protocol = { workspace = true }
+
+[lints]
+workspace = true

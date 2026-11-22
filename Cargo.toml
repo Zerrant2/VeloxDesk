@@ -1,0 +1,97 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/core-traits",
+    "crates/crypto",
+    "crates/transport",
+    "crates/server-rendezvous",
+    "crates/server-relay",
+    "crates/capture",
+    "crates/codec",
+    "crates/audio",
+    "crates/render",
+    "crates/ui",
+    "crates/input",
+    "crates/clipboard",
+    "crates/file-transfer",
+    "crates/tunnel",
+    "crates/terminal",
+    "crates/virtual-display",
+    "crates/service",
+    "apps/client",
+    "apps/server",
+    "tests",
+    "benches",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/veloxdesk/veloxdesk"
+authors = ["VeloxDesk contributors"]
+
+# Shared dependency versions. Crates opt in with `dep = { workspace = true }`.
+# Crate-specific dependencies live in each crate's own Cargo.toml (see ARCHITECTURE §10).
+[workspace.dependencies]
+# internal
+veloxdesk-protocol = { path = "crates/protocol" }
+veloxdesk-core-traits = { path = "crates/core-traits" }
+veloxdesk-crypto = { path = "crates/crypto" }
+veloxdesk-transport = { path = "crates/transport" }
+veloxdesk-server-rendezvous = { path = "crates/server-rendezvous" }
+veloxdesk-server-relay = { path = "crates/server-relay" }
+veloxdesk-capture = { path = "crates/capture" }
+veloxdesk-codec = { path = "crates/codec" }
+veloxdesk-audio = { path = "crates/audio" }
+veloxdesk-render = { path = "crates/render" }
+veloxdesk-ui = { path = "crates/ui" }
+veloxdesk-input = { path = "crates/input" }
+veloxdesk-clipboard = { path = "crates/clipboard" }
+veloxdesk-file-transfer = { path = "crates/file-transfer" }
+veloxdesk-tunnel = { path = "crates/tunnel" }
+veloxdesk-terminal = { path = "crates/terminal" }
+veloxdesk-virtual-display = { path = "crates/virtual-display" }
+veloxdesk-service = { path = "crates/service" }
+
+# external (shared)
+prost = "0.14"
+bytes = "1.12"
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1.54", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+quinn = "0.11"
+wgpu = "30"
+egui = "0.37"
+egui-wgpu = "0.37"
+clap = { version = "4.6", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+# Media hot paths should be fast even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1

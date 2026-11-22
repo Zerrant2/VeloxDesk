@@ -1,0 +1,15 @@
+[package]
+name = "veloxdesk-benches"
+description = "Pipeline latency benchmarks and network impairment simulator."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+veloxdesk-core-traits = { workspace = true }
+veloxdesk-protocol = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "veloxdesk-codec"
+description = "GPU color conversion and hardware/software video encoders and decoders."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+veloxdesk-core-traits = { workspace = true }
+veloxdesk-protocol = { workspace = true }
+
+[lints]
+workspace = true

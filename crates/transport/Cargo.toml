@@ -1,0 +1,15 @@
+[package]
+name = "veloxdesk-transport"
+description = "QUIC (quinn) sessions: RFC 9221 datagrams, Reed-Solomon FEC, ABR, NACK/PLI, NAT traversal client."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+veloxdesk-core-traits = { workspace = true }
+veloxdesk-protocol = { workspace = true }
+
+[lints]
+workspace = true
