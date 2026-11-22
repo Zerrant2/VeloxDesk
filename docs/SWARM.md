@@ -96,3 +96,96 @@ pub struct VideoSurface; // impl VideoRenderer; owns wgpu device/surface, compos
 `veloxdesk --host [--bind 0.0.0.0:21118]` (calls `run_host`) and `veloxdesk --connect <ip:port>`
 (viewer: connect → Hello → SessionConfig → VideoReceiver → decoder thread → VideoSurface,
 winit input → InputEvent on the Input stream, HUD with real per-stage ms).
+
+---
+
+## M2 cross-crate APIs (Self-Hosted P2P & E2EE)
+
+All M2 wire formats use existing `veloxdesk-protocol` messages (`control::Auth*`, `control::Permissions`, `rendezvous::*`) without breaking M1 compatibility.
+
+### Wire framing on multiplexed UDP socket (zero collision with QUIC RFC 9000 fixed bit `0x40`)
+* Rendezvous packet: `[0x01, b'V', b'D', b'Z'] || protobuf(RendezvousMessage)`
+* Relay packet: `[0x02, b'V', b'D', b'R'] || token[16] || raw_quic_payload` (empty payload = register/keepalive for `token`)
+* NAT punch probe: `[0x03, b'V', b'D', b'P'] || punch_id(u64 LE)`
+
+### `veloxdesk-crypto::auth` (net-worker)
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Argon2Params { pub m_cost_kib: u32, pub t_cost: u32, pub p_cost: u32 }
+impl Default for Argon2Params { /* e.g. 19456 KiB, t=2, p=1 */ }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasswordHash { pub salt: Vec<u8>, pub params: Argon2Params, pub derived_key: [u8; 32] }
+impl PasswordHash {
+    pub fn hash(password: &str) -> Result<Self>;
+    pub fn hash_with(password: &str, params: Argon2Params) -> Result<Self>;
+    pub fn to_phc_string(&self) -> String;
+    pub fn from_phc_string(s: &str) -> Result<Self>;
+}
+
+pub fn derive_password_key(password: &str, salt: &[u8], params: Argon2Params) -> Result<[u8; 32]>;
+pub fn password_proof(derived_key: &[u8; 32], nonce: &[u8]) -> [u8; 32]; // HMAC-SHA256
+pub fn verify_password_proof(derived_key: &[u8; 32], nonce: &[u8], proof: &[u8]) -> bool; // constant-time
+pub fn generate_nonce() -> [u8; 32];
+pub fn generate_otp(len: usize) -> String; // unambiguous alphanumeric (no 0/O/1/I/l)
+pub fn sign_pubkey_challenge(id: &DeviceIdentity, nonce: &[u8], host_pk: &[u8; 32]) -> [u8; 64]; // Ed25519(nonce || host_pk)
+pub fn verify_pubkey_challenge(peer_pk: &[u8; 32], nonce: &[u8], host_pk: &[u8; 32], proof: &[u8]) -> bool;
+pub fn sign_register_peer(id: &DeviceIdentity, local_addrs: Vec<String>, nat_type: NatType, timestamp_unix_ms: u64) -> RegisterPeer;
+pub fn verify_register_peer(msg: &RegisterPeer, now_unix_ms: u64, max_skew_ms: u64) -> Result<[u8; 32]>;
+```
+
+### `veloxdesk-server-rendezvous` & `veloxdesk-server-relay` & `apps/server` (net-worker)
+```rust
+// veloxdesk-server-rendezvous
+pub struct RendezvousConfig { pub bind: SocketAddr, pub relay_addr: Option<SocketAddr>, pub peer_ttl: Duration, pub keepalive_secs: u32 }
+pub struct RendezvousServer { .. }
+impl RendezvousServer {
+    pub async fn bind(cfg: RendezvousConfig) -> Result<Self>;
+    pub fn local_addr(&self) -> SocketAddr;
+    pub async fn run(self) -> Result<()>;
+    pub async fn run_until(self, shutdown: watch::Receiver<bool>) -> Result<()>;
+}
+
+// veloxdesk-server-relay (zero-knowledge UDP forwarder; sees ciphertext only)
+pub struct RelayConfig { pub bind: SocketAddr, pub session_ttl: Duration }
+pub struct RelayServer { .. }
+impl RelayServer {
+    pub async fn bind(cfg: RelayConfig) -> Result<Self>;
+    pub fn local_addr(&self) -> SocketAddr;
+    pub async fn run(self) -> Result<()>;
+    pub async fn run_until(self, shutdown: watch::Receiver<bool>) -> Result<()>;
+}
+```
+`apps/server` (`veloxdesk-server`): `--rendezvous-bind 0.0.0.0:21116`, `--relay-bind 0.0.0.0:21117`, `--public-relay-addr <addr>`, `--peer-ttl 90`.
+
+### `veloxdesk-transport::p2p` (net-worker)
+```rust
+pub struct P2pConnectOptions {
+    pub rendezvous: SocketAddr,
+    pub target_id: String, // 9-digit device id
+    pub direct_timeout: Duration, // e.g. 2.5s before automatic relay fallback
+    pub relay_only: bool, // forces zero-knowledge relay (used for tests / strict firewalls)
+    pub expected_peer: Option<[u8; 32]>, // optional pinned pubkey; otherwise verified against PeerInfo.public_key -> device_id
+}
+/// Host listener multiplexing direct LAN QUIC, rendezvous registration + NAT punching, and relay tunneling on one UDP socket.
+pub struct P2pListener { .. }
+impl P2pListener {
+    pub async fn bind(bind: SocketAddr, rendezvous: Option<SocketAddr>, id: &DeviceIdentity) -> Result<Self>;
+    pub fn local_addr(&self) -> SocketAddr;
+    pub async fn accept(&self) -> Result<QuicChannel>; // sets PathKind::Direct / P2p / Relay
+    pub fn shutdown(&self);
+}
+/// Viewer connect by 9-digit Device ID: lookup + IPv6/LAN-first UDP hole punching -> automatic zero-knowledge relay fallback.
+pub async fn connect_p2p(opts: P2pConnectOptions, id: &DeviceIdentity) -> Result<QuicChannel>;
+```
+
+### `veloxdesk-service` M2 additions (sys-worker)
+* `HostConfig` adds: `rendezvous: Option<SocketAddr>`, `auth: HostAuthConfig` (`one_time_password: Option<String>`, `auto_otp: bool`, `permanent_password_hash: Option<PasswordHash>`, `trusted_peers: Vec<TrustedPeer>`, `require_accept: bool`, `allow_no_auth: bool`).
+* `ApprovalRequest` / `ApprovalDecision` + `ApprovalHandler` callback (`Arc<dyn Fn(ApprovalRequest) -> Pin<Box<dyn Future<Output = ApprovalDecision> + Send>> + Send + Sync>`) for interactive accept dialogs with granular `Permissions` and "remember trusted peer".
+* `run_session` enforces full `Hello -> AuthChallenge -> AuthResponse -> AuthResult` (verifies TLS peer public key == `Hello.public_key`, Argon2id+HMAC proofs, OTP rotation, trusted Ed25519 pubkeys, granular `Permissions` enforcement).
+* `run_host` uses `P2pListener` when `cfg.rendezvous.is_some()` (otherwise direct `listen`), keeping M1 LAN behavior intact.
+
+### `veloxdesk-ui` & `apps/client` M2 additions (render-ui-worker)
+* `ConnectScreen` accepts either a **9-digit Device ID** (with optional spaces e.g. `123 456 789`) OR direct `ip[:port]` / `host[:port]`, plus Rendezvous server field in Settings.
+* Password prompt modal (on `AuthChallenge` requiring password/OTP) and interactive incoming-session Accept modal (displaying caller ID, fingerprint, granular `Permissions` toggles, "Trust peer", Accept/Reject).
+* `apps/client` CLI: `--rendezvous <addr>`, `--password <pw>`, `--connect <id-or-ip:port>` (auto-detects 9-digit ID → `connect_p2p`), HUD displays real `PathKind` (`Direct` / `P2P Direct` / `Relay`).

@@ -12,12 +12,14 @@
 pub mod abr;
 pub mod control;
 pub mod fec;
+pub mod p2p;
 pub mod quic;
 pub mod receiver;
 
 pub use abr::{AbrConfig, AbrController, AbrDecision, UsageState};
 pub use control::{ControlReceiver, ControlSender, framed};
 pub use fec::{FrameLayout, Packetizer, SendStats, VideoSender};
+pub use p2p::{P2pConnectOptions, P2pListener, connect_p2p};
 pub use quic::{Listener, QuicChannel, connect, listen, listen_with, low_latency_transport_config};
 pub use receiver::{ReceivedFrame, ReceiverConfig, ReceiverStats, VideoReceiver};
 

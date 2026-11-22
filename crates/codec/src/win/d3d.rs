@@ -284,8 +284,46 @@ impl GpuTimer {
     }
 }
 
-/// BGRA (or RGBA) → NV12 colour conversion on the GPU with the fixed-function video
-/// processor. Input/output views are cached per texture.
+/// Lightweight D3D11 event query used to ensure a GPU copy into a shared NT-handle
+/// texture has retired before another device (e.g. wgpu DX12 `OpenSharedHandle`) reads it.
+pub struct GpuSync {
+    query: ID3D11Query,
+}
+
+// SAFETY: D3D11 queries are free-threaded on a multithread-protected device.
+unsafe impl Send for GpuSync {}
+
+impl GpuSync {
+    pub fn new(dev: &ID3D11Device) -> Option<Self> {
+        let mut q = None;
+        let desc = D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 };
+        // SAFETY: valid device and stack desc.
+        unsafe { dev.CreateQuery(&desc, Some(&mut q)).ok()? };
+        q.map(|query| Self { query })
+    }
+
+    /// Issue the event query, flush the immediate context, and spin-wait until retired.
+    pub fn flush_and_wait(&self, ctx: &ID3D11DeviceContext) {
+        // SAFETY: query belongs to `ctx`'s device.
+        unsafe {
+            ctx.End(&self.query);
+            ctx.Flush();
+            let mut done = 0i32;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            while std::time::Instant::now() < deadline {
+                if ctx.GetData(&self.query, Some((&raw mut done).cast()), size_of_val(&done) as u32, 0).is_ok()
+                    && done != 0
+                {
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// BGRA / RGBA / RGB10A2 → NV12 or P010 colour conversion on the GPU with the fixed-function
+/// video processor. Input/output views are cached per texture.
 pub struct Nv12Converter {
     dev: ID3D11Device,
     ctx: ID3D11DeviceContext,
@@ -299,6 +337,7 @@ pub struct Nv12Converter {
     timer: Option<GpuTimer>,
     in_w: u32,
     in_h: u32,
+    out_fmt: DXGI_FORMAT,
 }
 
 // SAFETY: see TextureHolder; all calls happen on the single encode thread.
@@ -306,6 +345,29 @@ unsafe impl Send for Nv12Converter {}
 
 impl Nv12Converter {
     pub fn new(dev: &ID3D11Device, in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> Result<Self> {
+        Self::new_for_format(
+            dev,
+            in_w,
+            in_h,
+            out_w,
+            out_h,
+            DXGI_FORMAT_NV12,
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_format(
+        dev: &ID3D11Device,
+        in_w: u32,
+        in_h: u32,
+        out_w: u32,
+        out_h: u32,
+        out_fmt: DXGI_FORMAT,
+        in_cs: DXGI_COLOR_SPACE_TYPE,
+        out_cs: DXGI_COLOR_SPACE_TYPE,
+    ) -> Result<Self> {
         // SAFETY: COM calls on a valid device; descriptors live on the stack.
         unsafe {
             let ctx = dev.GetImmediateContext().map_err(win_err("GetImmediateContext"))?;
@@ -322,23 +384,23 @@ impl Nv12Converter {
                 Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
             };
             let vpe = vdev.CreateVideoProcessorEnumerator(&cd).map_err(win_err("CreateVideoProcessorEnumerator"))?;
-            let fl = vpe.CheckVideoProcessorFormat(DXGI_FORMAT_NV12).unwrap_or(0);
+            let fl = vpe.CheckVideoProcessorFormat(out_fmt).unwrap_or(0);
             if fl & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0 {
-                return Err(CoreError::unsupported("video processor cannot output NV12"));
+                return Err(CoreError::unsupported(format!("video processor cannot output {out_fmt:?}")));
             }
             let vp = vdev.CreateVideoProcessor(&vpe, 0).map_err(win_err("CreateVideoProcessor"))?;
             vctx.VideoProcessorSetStreamFrameFormat(&vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
             vctx.VideoProcessorSetStreamAutoProcessingMode(&vp, 0, false);
             if let Ok(v1) = vctx.cast::<ID3D11VideoContext1>() {
-                v1.VideoProcessorSetStreamColorSpace1(&vp, 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-                v1.VideoProcessorSetOutputColorSpace1(&vp, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+                v1.VideoProcessorSetStreamColorSpace1(&vp, 0, in_cs);
+                v1.VideoProcessorSetOutputColorSpace1(&vp, out_cs);
             }
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: out_w,
                 Height: out_h,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
+                Format: out_fmt,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
@@ -358,12 +420,17 @@ impl Nv12Converter {
                 pool: TexturePool::new(desc, false, 6),
                 in_w,
                 in_h,
+                out_fmt,
             })
         }
     }
 
     pub fn input_size(&self) -> (u32, u32) {
         (self.in_w, self.in_h)
+    }
+
+    pub fn out_format(&self) -> DXGI_FORMAT {
+        self.out_fmt
     }
 
     /// Last measured GPU time of the conversion (µs, lags a few frames).
@@ -453,7 +520,9 @@ impl Readback {
         let fmt = match src.Format {
             DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8X8_UNORM => PixelFormat::Bgra8,
             DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => PixelFormat::Rgba8,
+            DXGI_FORMAT_R10G10B10A2_UNORM => PixelFormat::Rgb10a2,
             DXGI_FORMAT_NV12 => PixelFormat::Nv12,
+            DXGI_FORMAT_P010 => PixelFormat::P010,
             f => return Err(CoreError::unsupported(format!("readback of DXGI format {}", f.0))),
         };
         let dev = device_of(tex)?;
@@ -486,12 +555,12 @@ impl Readback {
             ctx.Map(st, 0, D3D11_MAP_READ, 0, Some(&mut m)).map_err(win_err("Map"))?;
             let pitch = m.RowPitch as usize;
             let h = src.Height as usize;
-            let rows = if fmt == PixelFormat::Nv12 { h + h.div_ceil(2) } else { h };
+            let rows = if matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010) { h + h.div_ceil(2) } else { h };
             let total = pitch * rows;
             self.buf.resize(total, 0);
             std::ptr::copy_nonoverlapping(m.pData as *const u8, self.buf.as_mut_ptr(), total);
             ctx.Unmap(st, 0);
-            let planes = if fmt == PixelFormat::Nv12 {
+            let planes = if matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010) {
                 let (y, uv) = self.buf.split_at(pitch * h);
                 vec![(y, pitch), (uv, pitch)]
             } else {

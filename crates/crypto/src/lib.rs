@@ -15,6 +15,7 @@ use std::path::Path;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+pub mod auth;
 pub mod tls;
 
 /// Errors of this crate.
@@ -30,6 +31,8 @@ pub enum CryptoError {
     Tls(#[from] rustls::Error),
     #[error("invalid key: {0}")]
     BadKey(&'static str),
+    #[error("auth: {0}")]
+    Auth(String),
 }
 
 pub type Result<T, E = CryptoError> = std::result::Result<T, E>;

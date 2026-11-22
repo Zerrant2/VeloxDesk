@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use veloxdesk_core_traits::Timestamp;
 use veloxdesk_core_traits::metrics::{HudSnapshot, LatencySamples};
 use veloxdesk_core_traits::render::VideoRenderer;
+use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
 use veloxdesk_protocol::control::{SessionConfig, VideoCodec};
 use veloxdesk_render::hud::{hud_line, is_toggle_shortcut};
@@ -19,7 +20,8 @@ use veloxdesk_render::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use veloxdesk_render::{RenderBreakdown, SurfaceOptions, VideoSurface, egui};
 use veloxdesk_ui::{
-    ConnectAction, ConnectScreen, Mode, Present, SessionInfo, SessionToolbar, Settings, ToolbarAction, settings_window,
+    ConnectAction, ConnectScreen, ConnectTarget, Mode, PasswordAction, PasswordPrompt, Present, SessionInfo,
+    SessionToolbar, Settings, ToolbarAction, format_device_id, parse_rendezvous_addr, parse_target, settings_window,
 };
 
 use crate::input::{self, RelativeAccum, WheelAccum};
@@ -81,21 +83,32 @@ enum State {
     TestPattern(Box<TestPatternState>),
 }
 
+/// Viewer-side CLI overrides for M2 P2P / E2EE connections.
+#[derive(Debug, Clone, Default)]
+pub struct ViewerCliOpts {
+    pub rendezvous: Option<String>,
+    pub password: Option<String>,
+    pub relay_only: bool,
+}
+
 /// UI actions collected during the egui pass and applied afterwards.
 enum UiAction {
     Connect(ConnectAction),
     Toolbar(ToolbarAction),
+    Password(PasswordAction),
 }
 
 pub struct App {
     launch: Option<Launch>,
     proxy: EventLoopProxy<UserEvent>,
     settings: Settings,
+    viewer_opts: ViewerCliOpts,
     present_override: Option<Present>,
     surface: Option<VideoSurface>,
     state: State,
     connect: ConnectScreen,
     toolbar: SessionToolbar,
+    password_prompt: Option<PasswordPrompt>,
     settings_open: bool,
     modifiers: ModifiersState,
     pressed: HashSet<KeyCode>,
@@ -104,22 +117,31 @@ pub struct App {
     pointer_locked: bool,
     session_info: SessionInfo,
     decoder: (String, bool),
+    path_kind: PathKind,
     cursor_image: Option<CursorImage>,
     pub exit_code: i32,
 }
 
 impl App {
-    pub fn new(launch: Launch, proxy: EventLoopProxy<UserEvent>, settings: Settings, present: Option<Present>) -> Self {
+    pub fn new(
+        launch: Launch,
+        proxy: EventLoopProxy<UserEvent>,
+        settings: Settings,
+        present: Option<Present>,
+        viewer_opts: ViewerCliOpts,
+    ) -> Self {
         let mut connect = ConnectScreen::new(&settings);
         connect.device_id = crate::device_id_label();
         Self {
             launch: Some(launch),
             proxy,
+            viewer_opts,
             present_override: present,
             surface: None,
             state: State::Connect,
             connect,
             toolbar: SessionToolbar::default(),
+            password_prompt: None,
             settings_open: false,
             modifiers: ModifiersState::empty(),
             pressed: HashSet::new(),
@@ -128,6 +150,7 @@ impl App {
             pointer_locked: false,
             session_info: SessionInfo::default(),
             decoder: (String::new(), false),
+            path_kind: PathKind::Direct,
             cursor_image: None,
             settings,
             exit_code: 0,
@@ -138,7 +161,42 @@ impl App {
         self.present_override.unwrap_or(self.settings.present)
     }
 
-    fn start_connect(&mut self, address: String, addr: std::net::SocketAddr) {
+    fn resolve_rendezvous(&self) -> Result<Option<std::net::SocketAddr>, String> {
+        let raw = self
+            .viewer_opts
+            .rendezvous
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let s = self.settings.rendezvous_server.trim();
+                (!s.is_empty()).then_some(s)
+            });
+        match raw {
+            Some(s) => parse_rendezvous_addr(s).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn start_connect(&mut self, address: String, target: ConnectTarget) {
+        let rendezvous = match self.resolve_rendezvous() {
+            Ok(r) => r,
+            Err(e) => {
+                self.connect.error = Some(format!("Invalid rendezvous server: {e}"));
+                if let Some(s) = &self.surface {
+                    s.window().request_redraw();
+                }
+                return;
+            }
+        };
+        if matches!(target, ConnectTarget::DeviceId(_)) && rendezvous.is_none() {
+            self.connect.error =
+                Some("Set a Rendezvous server in Settings (or pass --rendezvous) to connect by Device ID".into());
+            if let Some(s) = &self.surface {
+                s.window().request_redraw();
+            }
+            return;
+        }
         self.settings.push_recent(&address);
         self.settings.save_default();
         let (vw, vh, hz) = self
@@ -147,18 +205,27 @@ impl App {
             .and_then(|s| s.window().current_monitor())
             .map(|m| (m.size().width, m.size().height, m.refresh_rate_millihertz().unwrap_or(60_000) / 1000))
             .unwrap_or((1920, 1080, 60));
+        let label = match &target {
+            ConnectTarget::Direct(a) => a.to_string(),
+            ConnectTarget::DeviceId(id) => format_device_id(id),
+        };
         let opts = ConnectOptions {
-            addr,
+            target,
+            rendezvous,
+            relay_only: self.viewer_opts.relay_only,
+            password: self.viewer_opts.password.clone(),
             mode: self.settings.mode.to_wire(),
             max_bitrate_kbps: self.settings.quality.bitrate_kbps(),
             prefer_hw_decode: self.settings.prefer_hw_decode,
             viewer_size: (vw, vh),
             viewer_refresh_hz: hz,
         };
+        self.password_prompt = None;
+        self.path_kind = PathKind::Unknown;
         match crate::viewer::connect(opts, self.proxy.clone()) {
             Ok(h) => {
                 self.connect.error = None;
-                self.connect.status = Some(format!("Connecting to {addr}…"));
+                self.connect.status = Some(format!("Connecting to {label}…"));
                 self.state = State::Connecting(h);
             }
             Err(e) => {
@@ -175,6 +242,7 @@ impl App {
         self.state = State::Connect;
         self.connect.status = None;
         self.connect.error = reason;
+        self.password_prompt = None;
         self.cursor_image = None;
         if let Some(s) = &mut self.surface {
             s.set_cursor(None, 0, 0, false);
@@ -350,6 +418,7 @@ impl App {
         let settings = &mut self.settings;
         let connect = &mut self.connect;
         let toolbar = &mut self.toolbar;
+        let password_prompt = &mut self.password_prompt;
         let settings_open = &mut self.settings_open;
         let info = &self.session_info;
         let state = &self.state;
@@ -391,6 +460,11 @@ impl App {
                         });
                 }
             }
+            if let Some(pw) = password_prompt.as_mut()
+                && let Some(a) = pw.show(ui.ctx())
+            {
+                actions.push(UiAction::Password(a));
+            }
             for a in settings_window(ui.ctx(), settings_open, settings) {
                 actions.push(UiAction::Toolbar(a));
             }
@@ -405,9 +479,23 @@ impl App {
         };
         for a in actions {
             match a {
-                UiAction::Connect(ConnectAction::Connect { address, addr }) => self.start_connect(address, addr),
+                UiAction::Connect(ConnectAction::Connect { address, target }) => self.start_connect(address, target),
                 UiAction::Connect(ConnectAction::OpenSettings) => self.settings_open = true,
                 UiAction::Toolbar(t) => self.apply_toolbar(t, event_loop),
+                UiAction::Password(PasswordAction::Submit(pw)) => {
+                    self.password_prompt = None;
+                    if let State::Connecting(handle) = &self.state {
+                        self.connect.status = Some("Authenticating…".into());
+                        handle.send(SessionCommand::SubmitPassword(pw));
+                    }
+                }
+                UiAction::Password(PasswordAction::Cancel) => {
+                    self.password_prompt = None;
+                    if let State::Connecting(handle) = &self.state {
+                        handle.send(SessionCommand::CancelAuth);
+                    }
+                    self.end_session(None);
+                }
             }
         }
         stats
@@ -525,7 +613,22 @@ impl App {
                     self.connect.status = Some(s);
                 }
             }
+            SessionEvent::PathKind(path) => {
+                self.path_kind = path;
+                match &self.state {
+                    State::Connecting(handle) | State::Session { handle, .. } => {
+                        handle.shared.hud.lock().snapshot.path = path;
+                    }
+                    _ => {}
+                }
+            }
+            SessionEvent::PasswordPrompt { host_device_id, host_fingerprint, methods_hint, error } => {
+                let mut p = PasswordPrompt::new(host_device_id, host_fingerprint, methods_hint);
+                p.error = error;
+                self.password_prompt = Some(p);
+            }
             SessionEvent::Config(cfg) => {
+                self.password_prompt = None;
                 self.session_info.displays = cfg.displays.clone();
                 self.session_info.active_display = cfg.active_display;
                 self.session_info.host_name = cfg.host_name.clone();
@@ -584,7 +687,7 @@ impl App {
             hud.snapshot.hw_encode = v.hw_encoder;
             hud.snapshot.resolution = (v.width, v.height);
         }
-        hud.snapshot.path = veloxdesk_core_traits::transport::PathKind::Direct;
+        hud.snapshot.path = self.path_kind;
     }
 
     fn on_keyboard(&mut self, event: &veloxdesk_render::winit::event::KeyEvent, consumed: bool) {
@@ -721,8 +824,8 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match launch {
             Launch::Gui => {}
-            Launch::Connect(addr) => match veloxdesk_ui::parse_address(&addr) {
-                Ok(a) => self.start_connect(addr, a),
+            Launch::Connect(addr) => match parse_target(&addr) {
+                Ok(target) => self.start_connect(addr, target),
                 Err(e) => self.connect.error = Some(e),
             },
             Launch::TestPattern(o) => {

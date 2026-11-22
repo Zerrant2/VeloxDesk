@@ -12,8 +12,9 @@ use veloxdesk_core_traits::video::EncodedPacket;
 use veloxdesk_core_traits::{CoreError, Result, Timestamp, TransportChannel};
 use veloxdesk_crypto::DeviceIdentity;
 use veloxdesk_protocol::control::{Nack, ReceiverReport};
-use veloxdesk_transport::{AbrController, Listener, VideoSender};
+use veloxdesk_transport::{AbrController, Listener, P2pListener, QuicChannel, VideoSender};
 
+use crate::auth::HostAuthState;
 use crate::backends::{EncoderFactory, HostBackends, RateController, RateDecision, VideoSink};
 use crate::config::HostConfig;
 use crate::session::{CLOSE_BUSY, reject, run_session_until};
@@ -66,7 +67,27 @@ impl HostBackends {
     }
 }
 
-/// Accept sessions on `listener` until `shutdown` resolves (or the listener closes).
+enum HostListener {
+    Direct(Listener),
+    P2p(P2pListener),
+}
+
+impl HostListener {
+    async fn accept(&self) -> Result<QuicChannel> {
+        match self {
+            Self::Direct(l) => l.accept().await,
+            Self::P2p(l) => l.accept().await,
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Self::P2p(l) = self {
+            l.shutdown();
+        }
+    }
+}
+
+/// Accept sessions on a direct QUIC `listener` until `shutdown` resolves (or the listener closes).
 ///
 /// Enforces `cfg.max_sessions`, rejecting excess connections with [`CLOSE_BUSY`]. When
 /// `shutdown` fires, active sessions are signalled to send `Close`, stop their threads
@@ -77,7 +98,40 @@ pub async fn serve_until(
     backends: HostBackends,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    serve_listener_until(HostListener::Direct(listener), cfg, backends, shutdown).await
+}
+
+/// Accept sessions on a multiplexed [`P2pListener`] (direct LAN + NAT hole-punched P2P +
+/// zero-knowledge relay) until `shutdown` resolves.
+pub async fn serve_p2p_until(
+    listener: P2pListener,
+    cfg: HostConfig,
+    backends: HostBackends,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
+    serve_listener_until(HostListener::P2p(listener), cfg, backends, shutdown).await
+}
+
+async fn serve_listener_until(
+    listener: HostListener,
+    mut cfg: HostConfig,
+    backends: HostBackends,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     cfg.validate().map_err(|e| CoreError::invalid(e.to_string()))?;
+    if !cfg.auth.is_open() {
+        let state = match cfg.auth.shared_state.clone() {
+            Some(s) => s,
+            None => {
+                let s = HostAuthState::from_config(&cfg.auth);
+                cfg.auth.shared_state = Some(s.clone());
+                s
+            }
+        };
+        if let Some(otp) = state.current_otp() {
+            tracing::info!(otp = %otp, "veloxdesk host one-time password active");
+        }
+    }
     let cfg = Arc::new(cfg);
     let permits = Arc::new(Semaphore::new(cfg.max_sessions));
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -139,6 +193,7 @@ pub async fn serve_until(
     }
 
     // Signal active sessions to close cleanly (stops capture/encode threads + release_all).
+    listener.shutdown();
     let _ = stop_tx.send(true);
     let drain = async {
         while sessions.join_next().await.is_some() {}
@@ -151,24 +206,44 @@ pub async fn serve_until(
 }
 
 /// Listen on `cfg.bind` with `backends` until `shutdown` resolves.
+///
+/// Uses [`P2pListener`] when `cfg.rendezvous` is set (registering the host's 9-digit Device ID
+/// and handling direct LAN, NAT hole punching, and zero-knowledge relay on one UDP socket),
+/// or a direct QUIC [`Listener`] otherwise.
 pub async fn run_host_with_backends(
-    cfg: HostConfig,
+    mut cfg: HostConfig,
     id: DeviceIdentity,
     backends: HostBackends,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     cfg.validate().map_err(|e| CoreError::invalid(e.to_string()))?;
-    let listener = veloxdesk_transport::listen(cfg.bind, &id).await?;
-    tracing::info!(
-        device_id = %id.device_id(),
-        addr = %listener.local_addr(),
-        max_fps = cfg.max_fps,
-        bitrate_kbps = cfg.bitrate_kbps,
-        codec = ?cfg.codec,
-        prefer_hw = cfg.prefer_hw,
-        "veloxdesk host listening"
-    );
-    serve_until(listener, cfg, backends, shutdown).await
+    cfg.auth.host_public_key.get_or_insert_with(|| id.public_key());
+    if let Some(rendezvous) = cfg.rendezvous {
+        let listener = P2pListener::bind(cfg.bind, Some(rendezvous), &id).await?;
+        tracing::info!(
+            device_id = %id.device_id(),
+            addr = %listener.local_addr(),
+            %rendezvous,
+            max_fps = cfg.max_fps,
+            bitrate_kbps = cfg.bitrate_kbps,
+            codec = ?cfg.codec,
+            prefer_hw = cfg.prefer_hw,
+            "veloxdesk host listening (P2P + direct + relay)"
+        );
+        serve_p2p_until(listener, cfg, backends, shutdown).await
+    } else {
+        let listener = veloxdesk_transport::listen(cfg.bind, &id).await?;
+        tracing::info!(
+            device_id = %id.device_id(),
+            addr = %listener.local_addr(),
+            max_fps = cfg.max_fps,
+            bitrate_kbps = cfg.bitrate_kbps,
+            codec = ?cfg.codec,
+            prefer_hw = cfg.prefer_hw,
+            "veloxdesk host listening"
+        );
+        serve_until(listener, cfg, backends, shutdown).await
+    }
 }
 
 /// Start the VeloxDesk host: listen for QUIC sessions and stream capture → encode → FEC

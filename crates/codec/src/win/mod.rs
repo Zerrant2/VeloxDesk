@@ -13,21 +13,34 @@ const PROBE_CODECS: [VideoCodec; 3] = [VideoCodec::H264, VideoCodec::H265, Video
 
 /// Probe available Windows Media Foundation hardware encoders grouped by vendor.
 pub fn probe_encoders() -> Vec<EncoderCaps> {
-    let mut by_vendor: BTreeMap<&'static str, Vec<VideoCodec>> = BTreeMap::new();
+    let mut by_vendor: BTreeMap<&'static str, (Vec<VideoCodec>, bool, bool)> = BTreeMap::new();
     for codec in PROBE_CODECS {
-        if let Some(vendor) = mf_enc::probe(codec) {
-            by_vendor.entry(vendor).or_default().push(codec);
+        if let Some(info) = mf_enc::probe(codec) {
+            let entry = by_vendor.entry(info.vendor).or_insert_with(|| (Vec::new(), false, false));
+            entry.0.push(codec);
+            entry.1 |= info.ten_bit;
+            entry.2 |= info.yuv444;
         }
     }
-    by_vendor.into_iter().map(|(vendor, codecs)| mf_enc::caps_for(vendor, codecs)).collect()
+    by_vendor
+        .into_iter()
+        .map(|(vendor, (codecs, ten_bit, yuv444))| mf_enc::caps_for(vendor, codecs, ten_bit, yuv444))
+        .collect()
 }
 
 /// Probe available Windows Media Foundation D3D11VA hardware decoders.
 pub fn probe_decoders() -> Vec<DecoderCaps> {
-    let codecs: Vec<VideoCodec> = PROBE_CODECS.into_iter().filter(|&c| mf_dec::probe(c)).collect();
+    let mut codecs = Vec::new();
+    let mut ten_bit = false;
+    for codec in PROBE_CODECS {
+        if let Some(info) = mf_dec::probe(codec) {
+            codecs.push(codec);
+            ten_bit |= info.ten_bit;
+        }
+    }
     if codecs.is_empty() {
         Vec::new()
     } else {
-        vec![mf_dec::caps_for(codecs)]
+        vec![mf_dec::caps_for(codecs, ten_bit)]
     }
 }

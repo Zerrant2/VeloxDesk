@@ -28,6 +28,8 @@ veloxdesk-codec = { workspace = true, optional = true }
 
 [dev-dependencies]
 veloxdesk-benches = { path = "../benches" }
+veloxdesk-server-rendezvous = { workspace = true }
+veloxdesk-server-relay = { workspace = true }
 
 [[test]]
 name = "transport_loss"
@@ -35,6 +37,10 @@ required-features = ["net"]
 
 [[test]]
 name = "session_smoke"
+required-features = ["full"]
+
+[[test]]
+name = "m2_p2p_auth"
 required-features = ["full"]
 
 [lints]

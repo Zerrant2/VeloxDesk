@@ -62,6 +62,11 @@ mod pipewire;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub use pipewire::PipeWireCapture;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::ScreenCaptureKitCapture;
+
 /// Marker dirty-rect set meaning "image unchanged, cursor-only update".
 pub const CURSOR_ONLY: Rect = Rect { x: 0, y: 0, width: 0, height: 0 };
 
@@ -93,7 +98,11 @@ pub fn create_capture(prefer_gpu: bool) -> Result<Box<dyn FrameCapture>> {
         }
         Ok(Box::new(x11::X11Capture::new(prefer_gpu)?))
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos::ScreenCaptureKitCapture::new(prefer_gpu)?))
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = prefer_gpu;
         Err(CoreError::unsupported("screen capture is not implemented on this OS"))
@@ -110,7 +119,11 @@ pub fn list_displays() -> Result<Vec<Display>> {
     {
         x11::list_displays()
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::list_displays()
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         Err(CoreError::unsupported("screen capture is not implemented on this OS"))
     }

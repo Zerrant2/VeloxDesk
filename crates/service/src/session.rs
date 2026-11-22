@@ -12,8 +12,7 @@ use veloxdesk_core_traits::video::{Display, VideoCodec};
 use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
 use veloxdesk_protocol::StreamKind;
 use veloxdesk_protocol::control::{
-    AuthResult, BitrateUpdate, Close, DisplayInfo, Envelope, Hello, Permissions, Pong, SessionConfig, SessionMode,
-    VideoConfig, envelope::Msg,
+    BitrateUpdate, Close, DisplayInfo, Envelope, Hello, Pong, SessionConfig, SessionMode, VideoConfig, envelope::Msg,
 };
 use veloxdesk_transport::{ControlReceiver, ControlSender, framed};
 
@@ -176,17 +175,16 @@ pub async fn run_session_until(
         "viewer hello");
     let mut summary = SessionSummary { session_id: sid, peer_device_id: hello.device_id.clone(), ..Default::default() };
 
-    // 2. M1: auto-accept (password / accept dialog is M2).
-    let perms = Permissions { view: true, input: cfg.allow_input, ..Default::default() };
-    writer
-        .send(&Msg::AuthResult(AuthResult { ok: true, reason: String::new(), permissions: Some(perms), session_id: sid }).into())
-        .await?;
+    // 2. Authentication & authorization (M1 open mode fast-path or M2 challenge-response).
+    let auth = crate::auth::authenticate(sid, &hello, &ch, &cfg, &mut writer, &mut reader).await?;
+    summary.peer_device_id = auth.peer_device_id;
+    let allow_input = auth.permissions.input && cfg.allow_input;
 
     // 3. start pipeline, wait until displays + encoder are known.
     let params = negotiate_params(&cfg, &hello);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let pipeline = VideoPipeline::start(params.clone(), &backends, ch.clone(), ev_tx)?;
-    let input = if cfg.allow_input { Some(InputThread::start(backends.injector.clone())?) } else { None };
+    let input = if allow_input { Some(InputThread::start(backends.injector.clone())?) } else { None };
     let mut st = State { displays: Vec::new(), active: 0, video: None, mode: hello.mode };
     let ready = timeout(HANDSHAKE_TIMEOUT, async {
         while st.video.is_none() || st.displays.is_empty() {

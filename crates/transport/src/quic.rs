@@ -45,7 +45,7 @@ pub fn low_latency_transport_config() -> quinn::TransportConfig {
     t
 }
 
-fn make_socket(bind: SocketAddr) -> Result<std::net::UdpSocket> {
+pub(crate) fn make_socket(bind: SocketAddr) -> Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))?;
     if bind.is_ipv6() {
@@ -66,7 +66,7 @@ fn new_endpoint(bind: SocketAddr, server: Option<quinn::ServerConfig>) -> Result
     quinn::Endpoint::new(quinn::EndpointConfig::default(), server, socket, runtime).map_err(CoreError::Io)
 }
 
-fn server_config(id: &DeviceIdentity, alpn: &[&[u8]], clients: PeerPolicy) -> Result<quinn::ServerConfig> {
+pub(crate) fn server_config(id: &DeviceIdentity, alpn: &[&[u8]], clients: PeerPolicy) -> Result<quinn::ServerConfig> {
     let rustls_cfg = tls::server_config(id, alpn, clients)?;
     let quic = QuicServerConfig::try_from(rustls_cfg).map_err(CoreError::other)?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
@@ -74,7 +74,7 @@ fn server_config(id: &DeviceIdentity, alpn: &[&[u8]], clients: PeerPolicy) -> Re
     Ok(cfg)
 }
 
-fn client_config(id: &DeviceIdentity, alpn: &[&[u8]], server: PeerPolicy) -> Result<quinn::ClientConfig> {
+pub(crate) fn client_config(id: &DeviceIdentity, alpn: &[&[u8]], server: PeerPolicy) -> Result<quinn::ClientConfig> {
     let rustls_cfg = tls::client_config(id, alpn, server)?;
     let quic = QuicClientConfig::try_from(rustls_cfg).map_err(CoreError::other)?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(quic));

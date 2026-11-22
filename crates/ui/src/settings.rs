@@ -117,6 +117,8 @@ pub const MAX_RECENT: usize = 10;
 #[serde(default)]
 pub struct Settings {
     pub recent: Vec<String>,
+    /// Rendezvous server `host[:port]` (default port 21116) for connecting by 9-digit Device ID.
+    pub rendezvous_server: String,
     pub mode: Mode,
     pub quality: Quality,
     pub present: Present,
@@ -131,6 +133,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             recent: Vec::new(),
+            rendezvous_server: String::new(),
             mode: Mode::Desktop,
             quality: Quality::Balanced,
             present: Present::Mailbox,

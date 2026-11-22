@@ -397,6 +397,160 @@ pub fn nv12_chroma_to_i420(
     }
 }
 
+/// BGRA8 → planar YUV 4:4:4 (8-bit, full chroma resolution for sharp desktop text).
+#[allow(clippy::too_many_arguments)]
+pub fn bgra_to_yuv444(
+    src: &[u8],
+    src_stride: usize,
+    width: u32,
+    height: u32,
+    dst_y: &mut [u8],
+    y_stride: usize,
+    dst_u: &mut [u8],
+    u_stride: usize,
+    dst_v: &mut [u8],
+    v_stride: usize,
+    m: &YuvMatrix,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    assert!(src_stride >= w * 4 && src.len() >= src_stride * (h.max(1) - 1) + w * 4, "src too small");
+    assert!(y_stride >= w && dst_y.len() >= y_stride * (h.max(1) - 1) + w, "y too small");
+    assert!(u_stride >= w && dst_u.len() >= u_stride * (h.max(1) - 1) + w, "u too small");
+    assert!(v_stride >= w && dst_v.len() >= v_stride * (h.max(1) - 1) + w, "v too small");
+    for row in 0..h {
+        let s = &src[row * src_stride..row * src_stride + w * 4];
+        let yr = &mut dst_y[row * y_stride..row * y_stride + w];
+        let ur = &mut dst_u[row * u_stride..row * u_stride + w];
+        let vr = &mut dst_v[row * v_stride..row * v_stride + w];
+        for (((p, y), u), v) in s.chunks_exact(4).zip(yr.iter_mut()).zip(ur.iter_mut()).zip(vr.iter_mut()) {
+            let (r, g, b) = (p[2] as i32, p[1] as i32, p[0] as i32);
+            *y = m.y(r, g, b);
+            let (cu, cv) = m.uv4(r * 4, g * 4, b * 4);
+            *u = cu;
+            *v = cv;
+        }
+    }
+}
+
+/// Planar YUV 4:4:4 (8-bit) → RGBA8 (alpha = 255).
+#[allow(clippy::too_many_arguments)]
+pub fn yuv444_to_rgba(
+    y: &[u8],
+    y_stride: usize,
+    u: &[u8],
+    u_stride: usize,
+    v: &[u8],
+    v_stride: usize,
+    width: u32,
+    height: u32,
+    dst: &mut [u8],
+    dst_stride: usize,
+    m: &YuvMatrix,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    assert!(dst_stride >= w * 4 && dst.len() >= dst_stride * (h.max(1) - 1) + w * 4, "dst too small");
+    for row in 0..h {
+        let yr = &y[row * y_stride..row * y_stride + w];
+        let ur = &u[row * u_stride..row * u_stride + w];
+        let vr = &v[row * v_stride..row * v_stride + w];
+        let d = &mut dst[row * dst_stride..row * dst_stride + w * 4];
+        for (((o, &yy), &uu), &vv) in d.chunks_exact_mut(4).zip(yr).zip(ur).zip(vr) {
+            let (r, g, b) = m.rgb(yy, uu, vv);
+            o[0] = r;
+            o[1] = g;
+            o[2] = b;
+            o[3] = 255;
+        }
+    }
+}
+
+/// BGRA8 → 10-bit P010 (4:2:0, MSB-aligned 10-bit samples in little-endian `u16`, matching `DXGI_FORMAT_P010`).
+/// `y_stride` and `uv_stride` are in **bytes** (must be >= `w * 2` and `cw * 4`).
+#[allow(clippy::too_many_arguments)]
+pub fn bgra_to_p010(
+    src: &[u8],
+    src_stride: usize,
+    width: u32,
+    height: u32,
+    dst_y: &mut [u8],
+    y_stride: usize,
+    dst_uv: &mut [u8],
+    uv_stride: usize,
+    m: &YuvMatrix,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    let (cw, ch) = chroma_dims(width, height);
+    assert!(src_stride >= w * 4 && src.len() >= src_stride * (h.max(1) - 1) + w * 4, "src too small");
+    assert!(y_stride >= w * 2 && dst_y.len() >= y_stride * (h.max(1) - 1) + w * 2, "p010 y too small");
+    assert!(uv_stride >= cw * 4 && dst_uv.len() >= uv_stride * (ch.max(1) - 1) + cw * 4, "p010 uv too small");
+    // Promote 8-bit sample to MSB-aligned 16-bit P010 container (`v << 8`).
+    for cy in 0..ch {
+        let r0 = cy * 2;
+        let r1 = (r0 + 1).min(h - 1);
+        let s0 = &src[r0 * src_stride..r0 * src_stride + w * 4];
+        let s1 = &src[r1 * src_stride..r1 * src_stride + w * 4];
+        for (d, p) in dst_y[r0 * y_stride..r0 * y_stride + w * 2].chunks_exact_mut(2).zip(s0.chunks_exact(4)) {
+            let v16 = (m.y(p[2] as i32, p[1] as i32, p[0] as i32) as u16) << 8;
+            d.copy_from_slice(&v16.to_le_bytes());
+        }
+        if r1 != r0 {
+            for (d, p) in dst_y[r1 * y_stride..r1 * y_stride + w * 2].chunks_exact_mut(2).zip(s1.chunks_exact(4)) {
+                let v16 = (m.y(p[2] as i32, p[1] as i32, p[0] as i32) as u16) << 8;
+                d.copy_from_slice(&v16.to_le_bytes());
+            }
+        }
+        let uv_row = &mut dst_uv[cy * uv_stride..cy * uv_stride + cw * 4];
+        for (cx, o) in uv_row.chunks_exact_mut(4).enumerate() {
+            let x0 = cx * 2;
+            let x1 = (x0 + 1).min(w - 1);
+            let (a, b, c, d) = (&s0[x0 * 4..], &s0[x1 * 4..], &s1[x0 * 4..], &s1[x1 * 4..]);
+            let bs = a[0] as i32 + b[0] as i32 + c[0] as i32 + d[0] as i32;
+            let gs = a[1] as i32 + b[1] as i32 + c[1] as i32 + d[1] as i32;
+            let rs = a[2] as i32 + b[2] as i32 + c[2] as i32 + d[2] as i32;
+            let (u8v, v8v) = m.uv4(rs, gs, bs);
+            o[0..2].copy_from_slice(&((u8v as u16) << 8).to_le_bytes());
+            o[2..4].copy_from_slice(&((v8v as u16) << 8).to_le_bytes());
+        }
+    }
+}
+
+/// 10-bit P010 → RGBA8 (alpha = 255). `y_stride` and `uv_stride` are in bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn p010_to_rgba(
+    y: &[u8],
+    y_stride: usize,
+    uv: &[u8],
+    uv_stride: usize,
+    width: u32,
+    height: u32,
+    dst: &mut [u8],
+    dst_stride: usize,
+    m: &YuvMatrix,
+) {
+    let w = width as usize;
+    let h = height as usize;
+    assert!(dst_stride >= w * 4 && dst.len() >= dst_stride * (h.max(1) - 1) + w * 4, "dst too small");
+    for row in 0..h {
+        let yr = &y[row * y_stride..row * y_stride + w * 2];
+        let uvr = &uv[(row / 2) * uv_stride..];
+        let d = &mut dst[row * dst_stride..row * dst_stride + w * 4];
+        for (x, (o, yp)) in d.chunks_exact_mut(4).zip(yr.chunks_exact(2)).enumerate() {
+            let yy = (u16::from_le_bytes([yp[0], yp[1]]) >> 8) as u8;
+            let ci = (x / 2) * 4;
+            let uu = (u16::from_le_bytes([uvr[ci], uvr[ci + 1]]) >> 8) as u8;
+            let vv = (u16::from_le_bytes([uvr[ci + 2], uvr[ci + 3]]) >> 8) as u8;
+            let (r, g, b) = m.rgb(yy, uu, vv);
+            o[0] = r;
+            o[1] = g;
+            o[2] = b;
+            o[3] = 255;
+        }
+    }
+}
+
 /// Copy `rows` rows of `row_bytes` between buffers with different strides.
 pub fn copy_plane(src: &[u8], src_stride: usize, dst: &mut [u8], dst_stride: usize, row_bytes: usize, rows: usize) {
     if src_stride == row_bytes && dst_stride == row_bytes {
@@ -520,5 +674,35 @@ mod tests {
         let mut rgba = vec![0u8; 48 * h];
         nv12_to_rgba(&y, 16, &uv, 16, w as u32, h as u32, &mut rgba, 48, &m);
         assert_eq!(rgba[3], 255);
+    }
+
+    #[test]
+    fn roundtrip_yuv444_and_p010() {
+        let (w, h) = (64usize, 48usize);
+        let src = gradient(w, h);
+        let m = YuvMatrix::new(ColorSpace::Bt709, ColorRange::Limited);
+
+        // YUV 4:4:4 roundtrip (higher PSNR than 4:2:0 because chroma is unsubsampled).
+        let (mut y, mut u, mut v) = (vec![0u8; w * h], vec![0u8; w * h], vec![0u8; w * h]);
+        bgra_to_yuv444(&src, w * 4, w as u32, h as u32, &mut y, w, &mut u, w, &mut v, w, &m);
+        let mut rgba = vec![0u8; w * h * 4];
+        yuv444_to_rgba(&y, w, &u, w, &v, w, w as u32, h as u32, &mut rgba, w * 4, &m);
+        let mut back = vec![0u8; w * h * 4];
+        for (o, p) in back.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+            o.copy_from_slice(&[p[2], p[1], p[0], p[3]]);
+        }
+        assert!(psnr(&src, &back) > 42.0);
+
+        // 10-bit P010 roundtrip.
+        let (cw, ch) = chroma_dims(w as u32, h as u32);
+        let mut py = vec![0u8; w * 2 * h];
+        let mut puv = vec![0u8; cw * 4 * ch];
+        bgra_to_p010(&src, w * 4, w as u32, h as u32, &mut py, w * 2, &mut puv, cw * 4, &m);
+        let mut prgba = vec![0u8; w * h * 4];
+        p010_to_rgba(&py, w * 2, &puv, cw * 4, w as u32, h as u32, &mut prgba, w * 4, &m);
+        for (o, p) in back.chunks_exact_mut(4).zip(prgba.chunks_exact(4)) {
+            o.copy_from_slice(&[p[2], p[1], p[0], p[3]]);
+        }
+        assert!(psnr(&src, &back) > 35.0);
     }
 }

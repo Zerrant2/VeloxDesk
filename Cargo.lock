@@ -189,6 +189,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -348,6 +360,15 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "block-buffer"
@@ -878,6 +899,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1471,6 +1493,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "icu_collections"
@@ -2531,6 +2562,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3179,6 +3221,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rusty-opus"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e0955c164ddbc021a96621f850ea0cf893d78aaf61e76c19a5a27f063f9ce24"
 
 [[package]]
 name = "safe_arch"
@@ -4112,8 +4160,12 @@ dependencies = [
 name = "veloxdesk-audio"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "rusty-opus",
+ "tracing",
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
+ "windows",
 ]
 
 [[package]]
@@ -4189,11 +4241,15 @@ dependencies = [
 name = "veloxdesk-crypto"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "ed25519-dalek",
+ "hmac",
  "rand_core 0.6.4",
  "rcgen",
  "rustls",
+ "serde",
  "sha2",
+ "subtle",
  "thiserror 2.0.21",
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
@@ -4248,14 +4304,24 @@ dependencies = [
 name = "veloxdesk-server"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
+ "veloxdesk-server-relay",
+ "veloxdesk-server-rendezvous",
 ]
 
 [[package]]
 name = "veloxdesk-server-relay"
 version = "0.1.0"
 dependencies = [
+ "socket2",
+ "tokio",
+ "tracing",
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
 ]
@@ -4264,7 +4330,13 @@ dependencies = [
 name = "veloxdesk-server-rendezvous"
 version = "0.1.0"
 dependencies = [
+ "prost",
+ "rand_core 0.6.4",
+ "socket2",
+ "tokio",
+ "tracing",
  "veloxdesk-core-traits",
+ "veloxdesk-crypto",
  "veloxdesk-protocol",
 ]
 
@@ -4313,6 +4385,8 @@ dependencies = [
  "veloxdesk-core-traits",
  "veloxdesk-crypto",
  "veloxdesk-protocol",
+ "veloxdesk-server-relay",
+ "veloxdesk-server-rendezvous",
  "veloxdesk-service",
  "veloxdesk-transport",
 ]
@@ -4336,6 +4410,8 @@ dependencies = [
  "veloxdesk-core-traits",
  "veloxdesk-crypto",
  "veloxdesk-protocol",
+ "veloxdesk-server-relay",
+ "veloxdesk-server-rendezvous",
 ]
 
 [[package]]

@@ -7,8 +7,10 @@ use std::sync::atomic::AtomicU32;
 use parking_lot::Mutex;
 use veloxdesk_core_traits::Timestamp;
 use veloxdesk_core_traits::time::ClockSync;
+use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
 use veloxdesk_protocol::control::{InputEvent, SessionConfig, SessionMode};
+use veloxdesk_ui::ConnectTarget;
 
 use crate::latest::Latest;
 use crate::stats::HudAggregator;
@@ -26,6 +28,13 @@ pub struct DecodedMsg {
 #[cfg_attr(not(feature = "net"), allow(dead_code))]
 pub enum SessionEvent {
     Status(String),
+    PathKind(PathKind),
+    PasswordPrompt {
+        host_device_id: String,
+        host_fingerprint: String,
+        methods_hint: String,
+        error: Option<String>,
+    },
     Config(Box<SessionConfig>),
     CursorShape(CursorImage),
     CursorPos { x: i32, y: i32, visible: bool },
@@ -38,6 +47,8 @@ pub enum SessionEvent {
 #[derive(Debug)]
 #[cfg_attr(not(feature = "net"), allow(dead_code))]
 pub enum SessionCommand {
+    SubmitPassword(String),
+    CancelAuth,
     Input(InputEvent),
     SwitchDisplay(u32),
     SetMaxBitrate(u32),
@@ -59,7 +70,10 @@ pub struct SessionShared {
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "net"), allow(dead_code))]
 pub struct ConnectOptions {
-    pub addr: SocketAddr,
+    pub target: ConnectTarget,
+    pub rendezvous: Option<SocketAddr>,
+    pub relay_only: bool,
+    pub password: Option<String>,
     pub mode: SessionMode,
     pub max_bitrate_kbps: u32,
     pub prefer_hw_decode: bool,

@@ -182,9 +182,17 @@ pub fn settings_window(ctx: &egui::Context, open: &mut bool, settings: &mut Sett
             ui.label("Gaming mouse");
             ui.checkbox(&mut settings.relative_mouse_in_gaming, "Lock pointer, relative motion");
             ui.end_row();
+
+            ui.label("Rendezvous server");
+            ui.add(
+                egui::TextEdit::singleline(&mut settings.rendezvous_server)
+                    .hint_text("127.0.0.1:21116")
+                    .desired_width(200.0),
+            );
+            ui.end_row();
         });
         ui.add_space(6.0);
-        ui.weak("Audio, clipboard, file transfer and relay settings arrive in later milestones.");
+        ui.weak("Audio, clipboard and file transfer settings arrive in later milestones.");
     });
     if *settings != before {
         if settings.present != before.present {

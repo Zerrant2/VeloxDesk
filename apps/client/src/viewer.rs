@@ -31,19 +31,23 @@ mod net {
     use veloxdesk_core_traits::video::{CursorImage, DecoderConfig, VideoCodec, VideoDecoder};
     use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
     use veloxdesk_crypto::DeviceIdentity;
+    use veloxdesk_crypto::auth::{Argon2Params, derive_password_key, password_proof, sign_pubkey_challenge};
     use veloxdesk_protocol::control::{
-        BitrateUpdate, Close, Envelope, Hello, InputEvent, Ping, SessionConfig, SwitchDisplay, VideoCodecCap,
-        VideoConfig, envelope::Msg,
+        AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, Close, Envelope, Hello, InputEvent, Ping,
+        SessionConfig, SwitchDisplay, VideoCodecCap, VideoConfig, envelope::Msg,
     };
     use veloxdesk_protocol::{PROTOCOL_VERSION, StreamKind};
     use veloxdesk_render::winit::event_loop::EventLoopProxy;
     use veloxdesk_transport::{ControlSender, ReceivedFrame, VideoReceiver, framed};
+    use veloxdesk_ui::{ConnectTarget, format_device_id};
 
     use crate::app::UserEvent;
     use crate::session::{ConnectOptions, DecodedMsg, SessionCommand, SessionEvent, SessionHandle, SessionShared};
 
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Generous wait for an interactive host Accept dialog after `AuthResponse`.
+    const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
     const FEEDBACK_TICK: Duration = Duration::from_millis(5);
     const PING_TICK: Duration = Duration::from_millis(500);
     const DECODER_QUEUE_DEPTH: usize = 4;
@@ -383,24 +387,52 @@ mod net {
             Err(e) => return Some(format!("identity error: {e:#}")),
         };
 
+        let target_label = match &opts.target {
+            ConnectTarget::Direct(addr) => addr.to_string(),
+            ConnectTarget::DeviceId(target_id) => format_device_id(target_id),
+        };
         let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status(format!(
-            "Connecting to {}…",
-            opts.addr
+            "Connecting to {target_label}…"
         ))));
 
-        // 1. QUIC connect (cancellable if user closes/cancels).
-        let ch = tokio::select! {
-            res = timeout(CONNECT_TIMEOUT, veloxdesk_transport::connect(opts.addr, &id, None)) => {
-                match res {
-                    Ok(Ok(ch)) => Arc::new(ch),
-                    Ok(Err(e)) => return Some(format!("connect failed: {e}")),
-                    Err(_) => return Some(format!("timed out connecting to {}", opts.addr)),
+        // 1. QUIC connect (direct IP or P2P/relay by 9-digit Device ID; cancellable).
+        let ch = match &opts.target {
+            ConnectTarget::Direct(addr) => tokio::select! {
+                res = timeout(CONNECT_TIMEOUT, veloxdesk_transport::connect(*addr, &id, None)) => {
+                    match res {
+                        Ok(Ok(ch)) => Arc::new(ch),
+                        Ok(Err(e)) => return Some(format!("connect failed: {e}")),
+                        Err(_) => return Some(format!("timed out connecting to {addr}")),
+                    }
+                }
+                () = recv_disconnect(&mut cmd_rx) => {
+                    return None;
+                }
+            },
+            ConnectTarget::DeviceId(target_id) => {
+                let Some(rendezvous) = opts.rendezvous else {
+                    return Some("no rendezvous server configured".into());
+                };
+                let mut p2p_opts = veloxdesk_transport::P2pConnectOptions::new(rendezvous, target_id.clone());
+                p2p_opts.relay_only = opts.relay_only;
+                tokio::select! {
+                    res = timeout(CONNECT_TIMEOUT, veloxdesk_transport::connect_p2p(p2p_opts, &id)) => {
+                        match res {
+                            Ok(Ok(ch)) => Arc::new(ch),
+                            Ok(Err(e)) => return Some(format!("P2P connect failed: {e}")),
+                            Err(_) => return Some(format!("timed out connecting to {target_label}")),
+                        }
+                    }
+                    () = recv_disconnect(&mut cmd_rx) => {
+                        return None;
+                    }
                 }
             }
-            () = recv_disconnect(&mut cmd_rx) => {
-                return None;
-            }
         };
+
+        let path = ch.stats().path;
+        shared.hud.lock().snapshot.path = path;
+        let _ = proxy.send_event(UserEvent::Session(SessionEvent::PathKind(path)));
 
         // 2. Open control stream and send Hello.
         let (send, recv) = match timeout(HANDSHAKE_TIMEOUT, ch.open_bi(StreamKind::Control)).await {
@@ -423,8 +455,18 @@ mod net {
 
         let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status("Waiting for host…".into())));
 
-        // 3. Handshake: AuthResult → SessionConfig.
-        let initial_cfg = match handshake(&mut ctrl_rx, &mut cmd_rx).await {
+        // 3. Handshake: optional AuthChallenge -> AuthResponse -> AuthResult -> SessionConfig.
+        let initial_cfg = match handshake(
+            &mut ctrl_tx,
+            &mut ctrl_rx,
+            &mut cmd_rx,
+            &id,
+            ch.peer_public_key(),
+            opts.password.clone(),
+            &proxy,
+        )
+        .await
+        {
             Ok(HandshakeOutcome::Config(cfg)) => cfg,
             Ok(HandshakeOutcome::Cancelled) => {
                 ch.close(0, "cancelled");
@@ -607,6 +649,7 @@ mod net {
                                 .into(),
                             );
                         }
+                        Some(SessionCommand::SubmitPassword(_)) | Some(SessionCommand::CancelAuth) => {}
                         Some(SessionCommand::Disconnect) | None => {
                             let _ = ctrl_out_tx.send(
                                 Msg::Close(Close { code: 0, reason: "viewer disconnected".into() }).into(),
@@ -663,51 +706,195 @@ mod net {
 
     async fn recv_disconnect(cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>) {
         while let Some(cmd) = cmd_rx.recv().await {
-            if matches!(cmd, SessionCommand::Disconnect) {
+            if matches!(cmd, SessionCommand::Disconnect | SessionCommand::CancelAuth) {
                 return;
             }
         }
     }
 
+    async fn wait_for_password(cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>) -> Option<String> {
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                SessionCommand::SubmitPassword(pw) => return Some(pw),
+                SessionCommand::CancelAuth | SessionCommand::Disconnect => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    async fn respond_to_challenge(
+        challenge: &AuthChallenge,
+        id: &DeviceIdentity,
+        tls_peer_pk: Option<[u8; 32]>,
+        cli_password: &mut Option<String>,
+        cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
+        proxy: &EventLoopProxy<UserEvent>,
+    ) -> anyhow::Result<Option<AuthResponse>> {
+        let host_pk: [u8; 32] = if challenge.host_public_key.is_empty() {
+            tls_peer_pk.unwrap_or([0u8; 32])
+        } else {
+            challenge
+                .host_public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("AuthChallenge host_public_key must be 32 bytes"))?
+        };
+        if let Some(tls_pk) = tls_peer_pk
+            && !challenge.host_public_key.is_empty()
+            && tls_pk != host_pk
+        {
+            bail!("host public key in AuthChallenge does not match TLS certificate");
+        }
+        if !challenge.host_device_id.is_empty() {
+            let derived = veloxdesk_crypto::device_id_from_public_key(&host_pk);
+            if derived != challenge.host_device_id {
+                bail!("host device_id does not match host public key");
+            }
+        }
+
+        let has = |m: AuthMethod| challenge.methods.contains(&(m as i32));
+
+        // 1. Trusted Ed25519 public key (passwordless).
+        if has(AuthMethod::PublicKey) {
+            let sig = sign_pubkey_challenge(id, &challenge.nonce, &host_pk);
+            return Ok(Some(AuthResponse {
+                method: AuthMethod::PublicKey as i32,
+                proof: sig.to_vec(),
+            }));
+        }
+
+        // 2. Password / OTP challenge (Argon2id + HMAC-SHA256; never sent in clear).
+        let allow_perm = has(AuthMethod::PermanentPassword);
+        let allow_otp = has(AuthMethod::OneTimePassword);
+        if allow_perm || allow_otp {
+            let password = match cli_password.take() {
+                Some(pw) => pw,
+                None => {
+                    let methods_hint = match (allow_perm, allow_otp) {
+                        (true, true) => "Enter permanent or one-time password".into(),
+                        (true, false) => "Enter permanent password".into(),
+                        (false, true) => "Enter one-time password".into(),
+                        (false, false) => unreachable!(),
+                    };
+                    let host_id = if challenge.host_device_id.is_empty() {
+                        veloxdesk_crypto::device_id_from_public_key(&host_pk)
+                    } else {
+                        challenge.host_device_id.clone()
+                    };
+                    let _ = proxy.send_event(UserEvent::Session(SessionEvent::PasswordPrompt {
+                        host_device_id: host_id,
+                        host_fingerprint: veloxdesk_crypto::fingerprint(&host_pk),
+                        methods_hint,
+                        error: None,
+                    }));
+                    let Some(pw) = wait_for_password(cmd_rx).await else {
+                        return Ok(None);
+                    };
+                    pw
+                }
+            };
+
+            let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status("Authenticating…".into())));
+            let method = if allow_perm && !challenge.salt.is_empty() {
+                AuthMethod::PermanentPassword
+            } else if allow_otp {
+                AuthMethod::OneTimePassword
+            } else {
+                AuthMethod::PermanentPassword
+            };
+
+            let params = if challenge.argon2_m_cost_kib > 0 && challenge.argon2_t_cost > 0 && challenge.argon2_p_cost > 0 {
+                Argon2Params {
+                    m_cost_kib: challenge.argon2_m_cost_kib,
+                    t_cost: challenge.argon2_t_cost,
+                    p_cost: challenge.argon2_p_cost,
+                }
+            } else {
+                Argon2Params::default()
+            };
+            let salt = challenge.salt.clone();
+            let nonce = challenge.nonce.clone();
+            let proof = tokio::task::spawn_blocking(move || -> anyhow::Result<[u8; 32]> {
+                let key = derive_password_key(&password, &salt, params)
+                    .map_err(|e| anyhow::anyhow!("password key derivation failed: {e}"))?;
+                Ok(password_proof(&key, &nonce))
+            })
+            .await
+            .context("password derivation task panicked")??;
+
+            return Ok(Some(AuthResponse { method: method as i32, proof: proof.to_vec() }));
+        }
+
+        // 3. Interactive approval only (no password required).
+        if has(AuthMethod::None) || challenge.methods.is_empty() {
+            let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status(
+                "Waiting for host to accept…".into(),
+            )));
+            return Ok(Some(AuthResponse { method: AuthMethod::None as i32, proof: Vec::new() }));
+        }
+
+        bail!("host offered no supported authentication methods ({:?})", challenge.methods);
+    }
+
     async fn handshake(
+        ctrl_tx: &mut ControlSender,
         ctrl_rx: &mut veloxdesk_transport::ControlReceiver,
         cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
+        id: &DeviceIdentity,
+        tls_peer_pk: Option<[u8; 32]>,
+        mut cli_password: Option<String>,
+        proxy: &EventLoopProxy<UserEvent>,
     ) -> anyhow::Result<HandshakeOutcome> {
-        let fut = async {
-            loop {
-                tokio::select! {
-                    msg = ctrl_rx.recv() => {
-                        let env = msg.context("reading handshake message")?;
-                        match env.msg {
-                            Some(Msg::AuthResult(r)) => {
-                                if !r.ok {
-                                    bail!("authentication rejected: {}", r.reason);
-                                }
-                                tracing::info!(session_id = r.session_id, "authenticated with host");
-                            }
-                            Some(Msg::AuthChallenge(_)) => {
-                                bail!("host requires authentication (M2)");
-                            }
-                            Some(Msg::SessionConfig(cfg)) => {
-                                return Ok(HandshakeOutcome::Config(cfg));
-                            }
-                            Some(Msg::Close(c)) => {
-                                let reason = if c.reason.is_empty() {
-                                    format!("host rejected session (code {})", c.code)
-                                } else {
-                                    c.reason
-                                };
-                                bail!("{reason}");
-                            }
-                            Some(other) => tracing::debug!(?other, "message during handshake ignored"),
-                            None => {}
-                        }
-                    }
-                    () = recv_disconnect(cmd_rx) => return Ok(HandshakeOutcome::Cancelled),
+        let mut step_timeout = HANDSHAKE_TIMEOUT;
+        loop {
+            let env = tokio::select! {
+                res = timeout(step_timeout, ctrl_rx.recv()) => {
+                    res.context("handshake timed out")?.context("reading handshake message")?
                 }
+                () = recv_disconnect(cmd_rx) => return Ok(HandshakeOutcome::Cancelled),
+            };
+            match env.msg {
+                Some(Msg::AuthChallenge(challenge)) => {
+                    let Some(resp) = respond_to_challenge(
+                        &challenge,
+                        id,
+                        tls_peer_pk,
+                        &mut cli_password,
+                        cmd_rx,
+                        proxy,
+                    )
+                    .await?
+                    else {
+                        return Ok(HandshakeOutcome::Cancelled);
+                    };
+                    ctrl_tx.send(&Msg::AuthResponse(resp).into()).await.context("sending AuthResponse")?;
+                    // After responding, host may present an interactive Accept dialog.
+                    step_timeout = APPROVAL_TIMEOUT;
+                }
+                Some(Msg::AuthResult(r)) => {
+                    if !r.ok {
+                        let reason = if r.reason.is_empty() { "authentication rejected".into() } else { r.reason };
+                        bail!("{reason}");
+                    }
+                    tracing::info!(session_id = r.session_id, "authenticated with host");
+                    step_timeout = HANDSHAKE_TIMEOUT;
+                }
+                Some(Msg::SessionConfig(cfg)) => {
+                    return Ok(HandshakeOutcome::Config(cfg));
+                }
+                Some(Msg::Close(c)) => {
+                    let reason = if c.reason.is_empty() {
+                        format!("host rejected session (code {})", c.code)
+                    } else {
+                        c.reason
+                    };
+                    bail!("{reason}");
+                }
+                Some(other) => tracing::debug!(?other, "message during handshake ignored"),
+                None => {}
             }
-        };
-        timeout(HANDSHAKE_TIMEOUT, fut).await.context("handshake timed out")?
+        }
     }
 
     fn send_feedback(

@@ -14,12 +14,14 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutput6,
@@ -276,34 +278,40 @@ fn create_device(adapter: &IDXGIAdapter1, luid: u64) -> Result<Device> {
         [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0];
     let mut device = None;
     let mut ctx = None;
+    // Prefer VIDEO_SUPPORT so zero-copy MF encoders/VideoProcessor can reuse this device directly.
+    let attempts = [
+        (D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &LEVELS[..]),
+        (D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &LEVELS[1..]),
+        (D3D11_CREATE_DEVICE_BGRA_SUPPORT, &LEVELS[..]),
+        (D3D11_CREATE_DEVICE_BGRA_SUPPORT, &LEVELS[1..]),
+    ];
     // SAFETY: valid adapter; out-pointers to Option<Interface>.
     unsafe {
-        let mut r = D3D11CreateDevice(
-            adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            Some(&LEVELS),
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            Some(&mut ctx),
-        );
-        if r.is_err() {
-            // Pre-11.1 runtimes reject the 11_1 level with E_INVALIDARG.
-            r = D3D11CreateDevice(
+        let mut last_err = None;
+        for (flags, lvls) in attempts {
+            device = None;
+            ctx = None;
+            match D3D11CreateDevice(
                 adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&LEVELS[1..]),
+                flags,
+                Some(lvls),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
                 None,
                 Some(&mut ctx),
-            );
+            ) {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
         }
-        r.map_err(|e| map_err(e, "D3D11CreateDevice"))?;
+        if let Some(e) = last_err {
+            return Err(map_err(e, "D3D11CreateDevice"));
+        }
         let (Some(device), Some(ctx)) = (device, ctx) else {
             return Err(CoreError::platform("D3D11CreateDevice returned no device"));
         };
@@ -314,12 +322,17 @@ fn create_device(adapter: &IDXGIAdapter1, luid: u64) -> Result<Device> {
 }
 
 /// SAFETY: valid output and device.
-unsafe fn duplicate(output: &IDXGIOutput, device: &ID3D11Device) -> Result<IDXGIOutputDuplication> {
+unsafe fn duplicate(output: &IDXGIOutput, device: &ID3D11Device, want_hdr: bool) -> Result<IDXGIOutputDuplication> {
     // DuplicateOutput1 (Win10 1703+, per-monitor-DPI-aware processes) lets us request
-    // BGRA explicitly (HDR desktops are tone-mapped by DWM); fall back to DuplicateOutput.
+    // 10-bit RGB10A2 (HDR10) or BGRA explicitly; fall back to DuplicateOutput.
     if let Ok(o5) = output.cast::<IDXGIOutput5>() {
+        let fmts: &[DXGI_FORMAT] = if want_hdr {
+            &[DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM]
+        } else {
+            &[DXGI_FORMAT_B8G8R8A8_UNORM]
+        };
         // SAFETY: valid objects.
-        match unsafe { o5.DuplicateOutput1(device, 0, &[DXGI_FORMAT_B8G8R8A8_UNORM]) } {
+        match unsafe { o5.DuplicateOutput1(device, 0, fmts) } {
             Ok(d) => return Ok(d),
             Err(e) if e.code() == E_ACCESSDENIED || e.code() == DXGI_ERROR_ACCESS_DENIED => {
                 return Err(map_err(e, "DuplicateOutput1"))
@@ -330,6 +343,22 @@ unsafe fn duplicate(output: &IDXGIOutput, device: &ID3D11Device) -> Result<IDXGI
     let o1: IDXGIOutput1 = output.cast().map_err(|e| map_err(e, "IDXGIOutput1"))?;
     // SAFETY: valid objects.
     unsafe { o1.DuplicateOutput(device) }.map_err(|e| map_err(e, "DuplicateOutput"))
+}
+
+/// High-precision wait used for 120/144/240 FPS pacing without Windows' 15.6 ms sleep jitter.
+fn pace_until(target: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= target {
+            return;
+        }
+        let left = target - now;
+        if left > Duration::from_millis(2) {
+            std::thread::sleep(left - Duration::from_millis(2));
+        } else {
+            std::thread::yield_now();
+        }
+    }
 }
 
 struct Session {
@@ -408,14 +437,14 @@ impl DxgiCapture {
         }
     }
 
-    fn new_texture(&mut self, w: u32, h: u32) -> Result<Arc<D3D11TextureHolder>> {
+    fn new_texture(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<Arc<D3D11TextureHolder>> {
         let dev = &self.device.as_ref().ok_or_else(|| CoreError::reinit("no device"))?.device;
         let mut desc = D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
@@ -450,11 +479,20 @@ impl DxgiCapture {
         }
     }
 
-    fn pooled_texture(&mut self, w: u32, h: u32) -> Result<Arc<D3D11TextureHolder>> {
-        if let Some(t) = self.pool.iter().find(|t| Arc::strong_count(t) == 1) {
+    fn pooled_texture(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<Arc<D3D11TextureHolder>> {
+        let matching = |t: &Arc<D3D11TextureHolder>| {
+            if Arc::strong_count(t) != 1 {
+                return false;
+            }
+            let mut d = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: valid texture.
+            unsafe { t.texture.GetDesc(&mut d) };
+            d.Width == w && d.Height == h && d.Format == format
+        };
+        if let Some(t) = self.pool.iter().find(|t| matching(t)) {
             return Ok(t.clone());
         }
-        let t = self.new_texture(w, h)?;
+        let t = self.new_texture(w, h, format)?;
         if self.pool.len() < MAX_POOL {
             self.pool.push(t.clone());
         } else {
@@ -463,9 +501,15 @@ impl DxgiCapture {
         Ok(t)
     }
 
-    fn ensure_staging(&mut self, w: u32, h: u32) -> Result<ID3D11Texture2D> {
+    fn ensure_staging(&mut self, w: u32, h: u32, format: DXGI_FORMAT) -> Result<ID3D11Texture2D> {
         if let Some(s) = &self.staging {
-            return Ok(s.clone());
+            let mut d = D3D11_TEXTURE2D_DESC::default();
+            // SAFETY: valid texture.
+            unsafe { s.GetDesc(&mut d) };
+            if d.Width == w && d.Height == h && d.Format == format {
+                return Ok(s.clone());
+            }
+            self.staging = None;
         }
         let dev = &self.device.as_ref().ok_or_else(|| CoreError::reinit("no device"))?.device;
         let desc = D3D11_TEXTURE2D_DESC {
@@ -473,7 +517,7 @@ impl DxgiCapture {
             Height: h,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
@@ -511,10 +555,13 @@ impl DxgiCapture {
         Ok(self.device.as_ref().ok_or_else(|| CoreError::reinit("no device"))?.ctx.clone())
     }
 
-    /// GPU path: copy `src` (same device, BGRA, `w x h`) into a free pool texture.
+    /// GPU path: copy `src` (same device, `w x h`) into a free pool texture.
     fn copy_to_pool(&mut self, src: &ID3D11Texture2D, w: u32, h: u32) -> Result<Arc<D3D11TextureHolder>> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: valid texture.
+        unsafe { src.GetDesc(&mut desc) };
         let ctx = self.ctx()?;
-        let holder = self.pooled_texture(w, h)?;
+        let holder = self.pooled_texture(w, h, desc.Format)?;
         // SAFETY: same device, same size/format. Flush so other devices (shared handle)
         // observe the copy promptly; same-device users are ordered by the context.
         unsafe {
@@ -526,8 +573,11 @@ impl DxgiCapture {
 
     /// CPU path, step 1 (frame still acquired): queue the copy into the staging texture.
     fn copy_to_staging(&mut self, src: &ID3D11Texture2D, w: u32, h: u32) -> Result<ID3D11Texture2D> {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: valid texture.
+        unsafe { src.GetDesc(&mut desc) };
         let ctx = self.ctx()?;
-        let staging = self.ensure_staging(w, h)?;
+        let staging = self.ensure_staging(w, h, desc.Format)?;
         // SAFETY: same device, same size/format.
         unsafe { ctx.CopyResource(&staging, src) };
         Ok(staging)
@@ -671,17 +721,17 @@ impl DxgiCapture {
         let dupl = sess.dupl.clone();
         let (exp_w, exp_h, gpu, min_interval) = (sess.width, sess.height, sess.gpu, sess.min_interval);
 
-        // Rate limit (max_fps): wait out the remaining interval, DD accumulates meanwhile.
+        // Rate limit (max_fps): wait out the remaining interval with sub-ms precision (120/144/240 FPS).
         let deadline = Instant::now() + timeout;
         if let Some(last) = self.last_delivery {
             let next = last + min_interval;
             let now = Instant::now();
             if next > now {
                 if next >= deadline {
-                    std::thread::sleep(deadline - now);
+                    pace_until(deadline);
                     return Ok(None);
                 }
-                std::thread::sleep(next - now);
+                pace_until(next);
             }
         }
         let wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u32::MAX as u128) as u32;
@@ -697,11 +747,28 @@ impl DxgiCapture {
         let t0 = Instant::now();
 
         // Everything that needs the acquired frame; ReleaseFrame right after.
-        let acquired = (|| -> Result<Option<(u32, u32, Pending)>> {
+        struct Acquired {
+            w: u32,
+            h: u32,
+            fmt: PixelFormat,
+            cs: ColorSpace,
+            pending: Pending,
+        }
+        let acquired = (|| -> Result<Option<Acquired>> {
             // SAFETY: frame acquired above.
             let cursor_changed = unsafe { self.read_cursor(&dupl, &info) };
             if info.LastPresentTime == 0 {
-                return Ok(if cursor_changed { Some((exp_w, exp_h, Pending::CursorOnly)) } else { None });
+                return Ok(if cursor_changed {
+                    Some(Acquired {
+                        w: exp_w,
+                        h: exp_h,
+                        fmt: PixelFormat::Bgra8,
+                        cs: ColorSpace::Srgb,
+                        pending: Pending::CursorOnly,
+                    })
+                } else {
+                    None
+                });
             }
             let res = resource.as_ref().ok_or_else(|| CoreError::platform("AcquireNextFrame returned no resource"))?;
             let src: ID3D11Texture2D = res.cast().map_err(|e| map_err(e, "IDXGIResource→ID3D11Texture2D"))?;
@@ -714,16 +781,19 @@ impl DxgiCapture {
                     desc.Width, desc.Height
                 )));
             }
-            if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-                return Err(CoreError::unsupported(format!("unexpected desktop format {:?}", desc.Format)));
-            }
+            let (fmt, cs) = match desc.Format {
+                DXGI_FORMAT_B8G8R8A8_UNORM => (PixelFormat::Bgra8, ColorSpace::Srgb),
+                DXGI_FORMAT_R10G10B10A2_UNORM => (PixelFormat::Rgb10a2, ColorSpace::Bt2020Pq),
+                other => return Err(CoreError::unsupported(format!("unexpected desktop format {other:?}"))),
+            };
             // SAFETY: frame acquired.
             unsafe { self.read_dirty_rects(&dupl, &info, exp_w, exp_h) };
-            if gpu {
-                Ok(Some((exp_w, exp_h, Pending::Gpu(self.copy_to_pool(&src, exp_w, exp_h)?))))
+            let pending = if gpu {
+                Pending::Gpu(self.copy_to_pool(&src, exp_w, exp_h)?)
             } else {
-                Ok(Some((exp_w, exp_h, Pending::Cpu(self.copy_to_staging(&src, exp_w, exp_h)?))))
-            }
+                Pending::Cpu(self.copy_to_staging(&src, exp_w, exp_h)?)
+            };
+            Ok(Some(Acquired { w: exp_w, h: exp_h, fmt, cs, pending }))
         })();
         drop(resource);
         // SAFETY: a frame is acquired.
@@ -734,16 +804,16 @@ impl DxgiCapture {
                 return Err(map_err(e, "ReleaseFrame"));
             }
         }
-        let Some((w, h, pending)) = acquired else { return Ok(None) };
+        let Some(Acquired { w, h, fmt: pix_fmt, cs: color_space, pending }) = acquired else { return Ok(None) };
 
         let capture_ts = if matches!(pending, Pending::CursorOnly) {
             Timestamp::now()
         } else {
             qpc_to_timestamp(info.LastPresentTime)
         };
-        let (data, dirty_rects) = match pending {
+        let (data, dirty_rects, final_fmt, final_cs) = match pending {
             Pending::CursorOnly => match &self.last_frame {
-                Some(f) => (f.data.clone(), vec![crate::CURSOR_ONLY]),
+                Some(f) => (f.data.clone(), vec![crate::CURSOR_ONLY], f.format, f.color_space),
                 None => return Ok(None),
             },
             Pending::Gpu(holder) => {
@@ -755,11 +825,21 @@ impl DxgiCapture {
                     shared_handle: holder.shared_handle(),
                 };
                 let keepalive: Arc<dyn Any + Send + Sync> = holder;
-                (FrameData::Gpu(GpuFrame { handle, keepalive: Some(keepalive) }), std::mem::take(&mut self.rects))
+                (
+                    FrameData::Gpu(GpuFrame { handle, keepalive: Some(keepalive) }),
+                    std::mem::take(&mut self.rects),
+                    pix_fmt,
+                    color_space,
+                )
             }
             Pending::Cpu(staging) => {
                 let bytes = self.read_staging(&staging, w, h)?;
-                (FrameData::Cpu(vec![Plane { data: bytes, stride: w as usize * 4 }]), std::mem::take(&mut self.rects))
+                (
+                    FrameData::Cpu(vec![Plane { data: bytes, stride: w as usize * 4 }]),
+                    std::mem::take(&mut self.rects),
+                    pix_fmt,
+                    color_space,
+                )
             }
         };
         let capture_us = t0.elapsed().as_micros().min(u32::MAX as u128) as u32;
@@ -767,8 +847,8 @@ impl DxgiCapture {
         let frame = Frame {
             width: w,
             height: h,
-            format: PixelFormat::Bgra8,
-            color_space: ColorSpace::Srgb,
+            format: final_fmt,
+            color_space: final_cs,
             color_range: ColorRange::Full,
             data,
             capture_ts,
@@ -794,8 +874,8 @@ impl FrameCapture for DxgiCapture {
             gpu_frames: true,
             dirty_rects: true,
             separate_cursor: true,
-            hdr: false,
-            formats: vec![PixelFormat::Bgra8],
+            hdr: true,
+            formats: vec![PixelFormat::Bgra8, PixelFormat::Rgb10a2],
         }
     }
 
@@ -825,7 +905,7 @@ impl FrameCapture for DxgiCapture {
         }
         let device = self.device.as_ref().map(|d| d.device.clone()).ok_or_else(|| CoreError::reinit("no device"))?;
         // SAFETY: valid output and device.
-        let dupl = unsafe { duplicate(&out.output, &device) }?;
+        let dupl = unsafe { duplicate(&out.output, &device, cfg.hdr && out.display.hdr) }?;
         // SAFETY: valid duplication.
         let dd = unsafe { dupl.GetDesc() };
         let (width, height) = (dd.ModeDesc.Width, dd.ModeDesc.Height);

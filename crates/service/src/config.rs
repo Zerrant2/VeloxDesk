@@ -8,8 +8,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use veloxdesk_crypto::auth::PasswordHash;
 use veloxdesk_protocol::DEFAULT_DIRECT_PORT;
 use veloxdesk_protocol::control::VideoCodec;
+
+use crate::auth::{HostAuthConfig, TrustedPeer, encode_hex_pubkey, parse_hex_pubkey};
 
 /// Everything the host pipeline needs. Construct with [`HostConfig::default`],
 /// [`HostConfig::from_toml_file`] or [`HostArgs::resolve`].
@@ -43,6 +46,11 @@ pub struct HostConfig {
     pub allow_input: bool,
     /// Path of the device identity key file (`None` = platform default chosen by the app).
     pub identity_path: Option<PathBuf>,
+    /// Optional rendezvous server address for 9-digit Device ID registration, NAT hole punching,
+    /// and automatic zero-knowledge relay fallback (M2).
+    pub rendezvous: Option<SocketAddr>,
+    /// Authentication and authorization policy (defaults to M1 open mode; enabled via CLI/TOML or struct).
+    pub auth: HostAuthConfig,
 }
 
 impl Default for HostConfig {
@@ -61,8 +69,20 @@ impl Default for HostConfig {
             max_sessions: 1,
             allow_input: true,
             identity_path: None,
+            rendezvous: None,
+            auth: HostAuthConfig::open(),
         }
     }
+}
+
+/// Serializable trusted-peer entry in `HostConfigFile` (TOML).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedPeerFile {
+    /// 64-character hex Ed25519 public key.
+    pub public_key: String,
+    #[serde(default)]
+    pub name: String,
 }
 
 /// TOML file layout (every key optional). Example:
@@ -90,6 +110,12 @@ pub struct HostConfigFile {
     pub max_sessions: Option<usize>,
     pub allow_input: Option<bool>,
     pub identity_path: Option<PathBuf>,
+    pub rendezvous: Option<SocketAddr>,
+    pub permanent_password_hash: Option<String>,
+    pub auto_otp: Option<bool>,
+    pub require_accept: Option<bool>,
+    pub allow_no_auth: Option<bool>,
+    pub trusted_peers: Option<Vec<TrustedPeerFile>>,
 }
 
 /// Parse a codec name: `h264`/`avc`, `h265`/`hevc`, `av1`, `vp9` (case-insensitive).
@@ -131,6 +157,36 @@ impl HostConfig {
         if let Some(c) = &file.codec {
             self.codec = parse_codec(c)?;
         }
+        if let Some(r) = file.rendezvous {
+            self.rendezvous = Some(r);
+        }
+        if let Some(phc) = &file.permanent_password_hash {
+            self.auth.permanent_password_hash = Some(
+                PasswordHash::from_phc_string(phc).map_err(|e| anyhow::anyhow!("permanent_password_hash: {e}"))?,
+            );
+            self.auth.allow_no_auth = false;
+        }
+        if let Some(v) = file.auto_otp {
+            self.auth.auto_otp = v;
+            if v {
+                self.auth.allow_no_auth = false;
+            }
+        }
+        if let Some(v) = file.require_accept {
+            self.auth.require_accept = v;
+            if v {
+                self.auth.allow_no_auth = false;
+            }
+        }
+        if let Some(peers) = &file.trusted_peers {
+            self.auth.trusted_peers = peers
+                .iter()
+                .map(|p| Ok(TrustedPeer::new(parse_hex_pubkey(&p.public_key)?, p.name.clone())))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+        }
+        if let Some(v) = file.allow_no_auth {
+            self.auth.allow_no_auth = v;
+        }
         Ok(())
     }
 
@@ -151,6 +207,17 @@ impl HostConfig {
 
     /// Serialize to the TOML file format (useful for `--print-config`).
     pub fn to_toml(&self) -> String {
+        let trusted_peers = if self.auth.trusted_peers.is_empty() {
+            None
+        } else {
+            Some(
+                self.auth
+                    .trusted_peers
+                    .iter()
+                    .map(|p| TrustedPeerFile { public_key: encode_hex_pubkey(&p.public_key), name: p.name.clone() })
+                    .collect(),
+            )
+        };
         let f = HostConfigFile {
             bind: Some(self.bind),
             max_fps: Some(self.max_fps),
@@ -165,6 +232,12 @@ impl HostConfig {
             max_sessions: Some(self.max_sessions),
             allow_input: Some(self.allow_input),
             identity_path: self.identity_path.clone(),
+            rendezvous: self.rendezvous,
+            permanent_password_hash: self.auth.permanent_password_hash.as_ref().map(PasswordHash::to_phc_string),
+            auto_otp: Some(self.auth.auto_otp),
+            require_accept: Some(self.auth.require_accept),
+            allow_no_auth: Some(self.auth.allow_no_auth),
+            trusted_peers,
         };
         toml::to_string(&f).unwrap_or_default()
     }
@@ -188,6 +261,11 @@ impl HostConfig {
         if self.codec == VideoCodec::Unspecified {
             bail!("codec must be specified");
         }
+        if let Some(otp) = &self.auth.one_time_password
+            && otp.is_empty()
+        {
+            bail!("one_time_password must not be empty");
+        }
         Ok(())
     }
 }
@@ -201,6 +279,12 @@ pub struct HostArgs {
     /// UDP bind address for incoming sessions.
     #[arg(long, value_name = "ADDR")]
     pub bind: Option<SocketAddr>,
+    /// Rendezvous server address (`host:port`) for 9-digit Device ID / P2P / relay.
+    ///
+    /// Skipped by clap when flattened into `veloxdesk` (which declares a shared top-level
+    /// `--rendezvous` flag for both `--host` and `--connect`); populate from the top-level CLI.
+    #[arg(skip)]
+    pub rendezvous: Option<SocketAddr>,
     /// Maximum frame rate.
     #[arg(long, value_name = "FPS")]
     pub max_fps: Option<u32>,
@@ -222,6 +306,23 @@ pub struct HostArgs {
     /// Refuse remote keyboard/mouse (view only).
     #[arg(long)]
     pub view_only: bool,
+    /// Permanent password (hashed with Argon2id in memory; never sent in clear).
+    ///
+    /// Skipped by clap when flattened into `veloxdesk` (shared top-level `--password` flag).
+    #[arg(skip)]
+    pub password: Option<String>,
+    /// Pre-hashed Argon2id PHC string for the permanent password.
+    #[arg(long, value_name = "PHC")]
+    pub password_hash: Option<String>,
+    /// One-time password (`auto` generates a fresh random code; rotates after every login).
+    #[arg(long, value_name = "CODE")]
+    pub otp: Option<String>,
+    /// Require interactive host approval before granting a session.
+    #[arg(long)]
+    pub require_accept: bool,
+    /// Explicitly allow unauthenticated connections (useful on trusted LANs).
+    #[arg(long)]
+    pub allow_no_auth: bool,
 }
 
 impl HostArgs {
@@ -233,6 +334,9 @@ impl HostArgs {
         };
         if let Some(v) = self.bind {
             cfg.bind = v;
+        }
+        if let Some(v) = self.rendezvous {
+            cfg.rendezvous = Some(v);
         }
         if let Some(v) = self.max_fps {
             cfg.max_fps = v;
@@ -255,6 +359,47 @@ impl HostArgs {
         }
         if self.view_only {
             cfg.allow_input = false;
+        }
+        if let Some(phc) = &self.password_hash {
+            cfg.auth.permanent_password_hash = Some(
+                PasswordHash::from_phc_string(phc).map_err(|e| anyhow::anyhow!("invalid --password-hash: {e}"))?,
+            );
+            cfg.auth.allow_no_auth = false;
+        }
+        if let Some(pw) = &self.password {
+            if pw.is_empty() {
+                bail!("--password must not be empty");
+            }
+            cfg.auth.permanent_password_hash =
+                Some(PasswordHash::hash(pw).map_err(|e| anyhow::anyhow!("hashing --password: {e}"))?);
+            cfg.auth.allow_no_auth = false;
+        }
+        if let Some(otp) = &self.otp {
+            if otp.eq_ignore_ascii_case("auto") {
+                cfg.auth.auto_otp = true;
+                cfg.auth.one_time_password = None;
+            } else {
+                cfg.auth.one_time_password = Some(otp.clone());
+            }
+            cfg.auth.allow_no_auth = false;
+        }
+        if self.require_accept {
+            cfg.auth.require_accept = true;
+            cfg.auth.allow_no_auth = false;
+        }
+        if self.allow_no_auth {
+            cfg.auth.allow_no_auth = true;
+        } else if cfg.rendezvous.is_some()
+            && cfg.auth.permanent_password_hash.is_none()
+            && cfg.auth.one_time_password.is_none()
+            && !cfg.auth.auto_otp
+            && !cfg.auth.require_accept
+            && cfg.auth.trusted_peers.is_empty()
+        {
+            // When exposing the host on a rendezvous server via CLI with no explicit auth,
+            // default to an auto-generated rotating OTP rather than open unauthenticated access.
+            cfg.auth.auto_otp = true;
+            cfg.auth.allow_no_auth = false;
         }
         cfg.validate()?;
         Ok(cfg)
@@ -326,5 +471,46 @@ mod tests {
         assert!(!c.prefer_hw);
         assert_eq!(c.bind.port(), 7000);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn toml_and_cli_auth_roundtrip() {
+        let ph = PasswordHash::hash_with("s3cr3t", veloxdesk_crypto::auth::Argon2Params {
+            m_cost_kib: 1024,
+            t_cost: 1,
+            p_cost: 1,
+        })
+        .unwrap();
+        let pk = [0x42u8; 32];
+        let mut cfg = HostConfig {
+            rendezvous: Some("127.0.0.1:21116".parse().unwrap()),
+            auth: HostAuthConfig {
+                permanent_password_hash: Some(ph),
+                auto_otp: true,
+                require_accept: true,
+                allow_no_auth: false,
+                trusted_peers: vec![TrustedPeer::new(pk, "laptop")],
+                ..HostAuthConfig::open()
+            },
+            ..Default::default()
+        };
+        let toml = cfg.to_toml();
+        let parsed = HostConfig::from_toml_str(&toml).unwrap();
+        // `TrustedPeerFile` restores default full permissions; verify equality.
+        cfg.auth.trusted_peers[0].permissions = veloxdesk_protocol::control::Permissions::all();
+        assert_eq!(parsed, cfg);
+
+        let mut args = HostArgs {
+            rendezvous: Some("127.0.0.1:21116".parse().unwrap()),
+            ..Default::default()
+        };
+        let resolved = args.resolve().unwrap();
+        assert!(resolved.auth.auto_otp);
+        assert!(!resolved.auth.allow_no_auth);
+
+        args.otp = Some("ABCDEFGH".into());
+        let resolved = args.resolve().unwrap();
+        assert_eq!(resolved.auth.one_time_password.as_deref(), Some("ABCDEFGH"));
+        assert!(!resolved.auth.allow_no_auth);
     }
 }

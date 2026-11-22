@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use veloxdesk_core_traits::video::{
-    ChromaFormat, EncodeOptions, EncodedPacket, EncoderCaps, EncoderConfig, EncoderUpdate, Frame, FrameData,
-    PixelFormat, RateControl, VideoCodec,
+    ChromaFormat, ColorSpace, EncodeOptions, EncodedPacket, EncoderCaps, EncoderConfig, EncoderUpdate, Frame,
+    FrameData, PixelFormat, RateControl, VideoCodec,
 };
 use veloxdesk_core_traits::{CoreError, Result, Timestamp, VideoEncoder};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -91,21 +91,42 @@ fn codec_set(api: &Option<ICodecAPI>, key: &windows::core::GUID, v: VARIANT) -> 
     }
 }
 
+fn mf_input_subtype(cfg: &EncoderConfig) -> Result<(windows::core::GUID, DXGI_FORMAT)> {
+    match (cfg.chroma, cfg.bit_depth) {
+        (ChromaFormat::Yuv420, 8) => Ok((MFVideoFormat_NV12, DXGI_FORMAT_NV12)),
+        (ChromaFormat::Yuv420, 10) => {
+            if !matches!(cfg.codec, VideoCodec::H265 | VideoCodec::Av1) {
+                return Err(CoreError::unsupported("10-bit MF hardware encode requires HEVC or AV1"));
+            }
+            Ok((MFVideoFormat_P010, DXGI_FORMAT_P010))
+        }
+        (ChromaFormat::Yuv444, 8) => Ok((MFVideoFormat_AYUV, DXGI_FORMAT_AYUV)),
+        _ => Err(CoreError::unsupported(format!(
+            "MF encoder unsupported chroma/depth: {:?} {}-bit",
+            cfg.chroma, cfg.bit_depth
+        ))),
+    }
+}
+
 impl Session {
     fn new(cfg: &EncoderConfig, dev: &ID3D11Device) -> Result<Self> {
         ensure_mf()?;
         d3d::enable_multithread(dev);
         let luid = d3d::device_luid(dev);
         let sub = mf::subtype(cfg.codec)?;
+        let (in_sub, _) = mf_input_subtype(cfg)?;
         let mfts = mf::enum_mfts(
             MFT_CATEGORY_VIDEO_ENCODER,
             MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-            MFVideoFormat_NV12,
+            in_sub,
             sub,
             Some(luid),
         );
         if mfts.is_empty() {
-            return Err(CoreError::unsupported(format!("no hardware {:?} MFT encoder", cfg.codec)));
+            return Err(CoreError::unsupported(format!(
+                "no hardware {:?} ({:?} {}-bit) MFT encoder",
+                cfg.codec, cfg.chroma, cfg.bit_depth
+            )));
         }
         let mut last = CoreError::unsupported("no usable hardware MFT");
         for m in mfts {
@@ -179,30 +200,55 @@ impl Session {
                     codec_set(&api, &CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bps));
                 }
             }
-            // VBV ≈ one frame.
-            codec_set(&api, &CODECAPI_AVEncCommonBufferSize, VARIANT::from(bps / fps));
+            // VBV ≈ one frame (clamped so high-FPS 120/144/240 Hz doesn't underflow driver limits).
+            codec_set(&api, &CODECAPI_AVEncCommonBufferSize, VARIANT::from((bps / fps).max(16_384)));
             codec_set(&api, &CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
             codec_set(&api, &CODECAPI_AVEncMPVGOPSize, VARIANT::from(cfg.gop.unwrap_or(0x7FFF_FFFF)));
             codec_set(&api, &CODECAPI_AVEncNumWorkerThreads, VARIANT::from(0u32));
 
             let sub = mf::subtype(cfg.codec)?;
+            let (in_sub, _) = mf_input_subtype(cfg)?;
             let out = mf::video_type(&sub, cfg.width, cfg.height, fps)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, bps.max(1)).map_err(mf_err("bitrate"))?;
-            let profile = match cfg.codec {
-                VideoCodec::H264 => eAVEncH264VProfile_Main.0 as u32,
-                VideoCodec::H265 => eAVEncH265VProfile_Main_420_8.0 as u32,
+            let profile = match (cfg.codec, cfg.chroma, cfg.bit_depth) {
+                (VideoCodec::H264, ChromaFormat::Yuv420, 8) => eAVEncH264VProfile_Main.0 as u32,
+                (VideoCodec::H264, ChromaFormat::Yuv444, 8) => eAVEncH264VProfile_444.0 as u32,
+                (VideoCodec::H265, ChromaFormat::Yuv420, 8) => eAVEncH265VProfile_Main_420_8.0 as u32,
+                (VideoCodec::H265, ChromaFormat::Yuv420, 10) => eAVEncH265VProfile_Main_420_10.0 as u32,
+                (VideoCodec::H265, ChromaFormat::Yuv444, 8) => eAVEncH265VProfile_Main_444_8.0 as u32,
                 _ => 0,
             };
             if profile != 0 {
                 let _ = out.SetUINT32(&MF_MT_MPEG2_PROFILE, profile);
             }
+            let (yuv_matrix, primaries, transfer) = match cfg.color_space {
+                ColorSpace::Bt2020Pq => (
+                    MFVideoTransferMatrix_BT2020_10.0 as u32,
+                    MFVideoPrimaries_BT2020.0 as u32,
+                    MFVideoTransFunc_2084.0 as u32,
+                ),
+                ColorSpace::Bt601 => (
+                    MFVideoTransferMatrix_BT601.0 as u32,
+                    MFVideoPrimaries_SMPTE170M.0 as u32,
+                    MFVideoTransFunc_709.0 as u32,
+                ),
+                _ => (
+                    MFVideoTransferMatrix_BT709.0 as u32,
+                    MFVideoPrimaries_BT709.0 as u32,
+                    MFVideoTransFunc_709.0 as u32,
+                ),
+            };
             let _ = out.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
-            let _ = out.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
+            let _ = out.SetUINT32(&MF_MT_YUV_MATRIX, yuv_matrix);
+            let _ = out.SetUINT32(&MF_MT_VIDEO_PRIMARIES, primaries);
+            let _ = out.SetUINT32(&MF_MT_TRANSFER_FUNCTION, transfer);
             transform.SetOutputType(0, &out, 0).map_err(mf_err("SetOutputType"))?;
 
-            let inp = mf::video_type(&MFVideoFormat_NV12, cfg.width, cfg.height, fps)?;
+            let inp = mf::video_type(&in_sub, cfg.width, cfg.height, fps)?;
             let _ = inp.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32);
-            let _ = inp.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
+            let _ = inp.SetUINT32(&MF_MT_YUV_MATRIX, yuv_matrix);
+            let _ = inp.SetUINT32(&MF_MT_VIDEO_PRIMARIES, primaries);
+            let _ = inp.SetUINT32(&MF_MT_TRANSFER_FUNCTION, transfer);
             transform.SetInputType(0, &inp, 0).map_err(mf_err("SetInputType"))?;
 
             // Some drivers only honour these after the types are set.
@@ -387,15 +433,20 @@ pub struct MfEncoder {
 // thread at a time (VideoEncoder contract) and the device is multithread-protected.
 unsafe impl Send for MfEncoder {}
 
-pub fn caps_for(vendor: &'static str, codecs: Vec<VideoCodec>) -> EncoderCaps {
+pub fn caps_for(vendor: &'static str, codecs: Vec<VideoCodec>, ten_bit: bool, yuv444: bool) -> EncoderCaps {
+    let mut gpu_input_formats = vec![PixelFormat::Bgra8, PixelFormat::Nv12];
+    if ten_bit {
+        gpu_input_formats.push(PixelFormat::Rgb10a2);
+        gpu_input_formats.push(PixelFormat::P010);
+    }
     EncoderCaps {
         name: vendor,
         codecs,
         hardware: true,
-        gpu_input_formats: vec![PixelFormat::Bgra8, PixelFormat::Nv12],
+        gpu_input_formats,
         cpu_input_formats: vec![PixelFormat::Bgra8],
-        yuv444: false,
-        ten_bit: false,
+        yuv444,
+        ten_bit,
         intra_refresh: false,
         max_width: 4096,
         max_height: 4096,
@@ -406,9 +457,7 @@ impl MfEncoder {
     /// Creates the encoder and validates that a hardware MFT accepts `cfg` on the default
     /// adapter. The real session is (re)built lazily on the device of the first GPU frame.
     pub fn new(cfg: &EncoderConfig) -> Result<Self> {
-        if cfg.chroma != ChromaFormat::Yuv420 || cfg.bit_depth > 8 {
-            return Err(CoreError::unsupported("MF encoder: 8-bit 4:2:0 only"));
-        }
+        let _ = mf_input_subtype(cfg)?;
         if cfg.width % 2 != 0 || cfg.height % 2 != 0 {
             return Err(CoreError::invalid("MF encoder needs even dimensions"));
         }
@@ -473,13 +522,35 @@ impl MfEncoder {
             _ => unreachable!(),
         };
         let td = d3d::tex_desc(&tex);
-        let nv12_direct = td.Format == DXGI_FORMAT_NV12 && td.Width == w && td.Height == h && td.ArraySize == 1;
-        let (input_tex, holder, convert_us) = if nv12_direct {
+        let (_, target_dxgi) = mf_input_subtype(&self.cfg)?;
+        let direct = td.Format == target_dxgi && td.Width == w && td.Height == h && td.ArraySize == 1;
+        let (input_tex, holder, convert_us) = if direct {
             (tex, None, 0)
         } else {
-            let need_new = s.conv.as_ref().map(|c| c.input_size() != (td.Width, td.Height)).unwrap_or(true);
+            let need_new = s
+                .conv
+                .as_ref()
+                .map(|c| c.input_size() != (td.Width, td.Height) || c.out_format() != target_dxgi)
+                .unwrap_or(true);
             if need_new {
-                s.conv = Some(Nv12Converter::new(&s.dev, td.Width, td.Height, w, h)?);
+                let in_cs = match frame.color_space {
+                    ColorSpace::Bt2020Pq => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+                    _ => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                };
+                let out_cs = match self.cfg.color_space {
+                    ColorSpace::Bt2020Pq => DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+                    _ => DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
+                };
+                s.conv = Some(Nv12Converter::new_for_format(
+                    &s.dev,
+                    td.Width,
+                    td.Height,
+                    w,
+                    h,
+                    target_dxgi,
+                    in_cs,
+                    out_cs,
+                )?);
             }
             let tc = Instant::now();
             let conv = s.conv.as_mut().expect("converter");
@@ -581,7 +652,12 @@ impl MfEncoder {
 
 impl VideoEncoder for MfEncoder {
     fn caps(&self) -> EncoderCaps {
-        caps_for(self.vendor, vec![self.cfg.codec])
+        caps_for(
+            self.vendor,
+            vec![self.cfg.codec],
+            self.cfg.bit_depth == 10,
+            self.cfg.chroma == ChromaFormat::Yuv444,
+        )
     }
 
     fn config(&self) -> &EncoderConfig {
@@ -626,13 +702,25 @@ impl Drop for MfEncoder {
     }
 }
 
-/// Which hardware encoder (vendor) is available for `codec`, without creating it.
-pub fn probe(codec: VideoCodec) -> Option<&'static str> {
+/// Hardware encoder probe result for one codec.
+pub struct ProbeInfo {
+    pub vendor: &'static str,
+    pub ten_bit: bool,
+    pub yuv444: bool,
+}
+
+/// Which hardware encoder (vendor + 10-bit/4:4:4 support) is available for `codec`, without creating it.
+pub fn probe(codec: VideoCodec) -> Option<ProbeInfo> {
     ensure_mf().ok()?;
     let sub = mf::subtype(codec).ok()?;
-    mf::enum_mfts(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, MFVideoFormat_NV12, sub, None)
+    let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
+    let vendor = mf::enum_mfts(MFT_CATEGORY_VIDEO_ENCODER, flags, MFVideoFormat_NV12, sub, None)
         .first()
-        .map(|m| m.vendor)
+        .map(|m| m.vendor)?;
+    let ten_bit = matches!(codec, VideoCodec::H265 | VideoCodec::Av1)
+        && !mf::enum_mfts(MFT_CATEGORY_VIDEO_ENCODER, flags, MFVideoFormat_P010, sub, None).is_empty();
+    let yuv444 = !mf::enum_mfts(MFT_CATEGORY_VIDEO_ENCODER, flags, MFVideoFormat_AYUV, sub, None).is_empty();
+    Some(ProbeInfo { vendor, ten_bit, yuv444 })
 }
 
 #[allow(dead_code)]

@@ -15,6 +15,10 @@ mod input;
 pub mod sw;
 #[cfg(windows)]
 pub mod win;
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 use veloxdesk_core_traits::video::{DecoderCaps, DecoderConfig, EncoderCaps, EncoderConfig, VideoDecoder, VideoEncoder};
 use veloxdesk_core_traits::Result;
@@ -27,6 +31,14 @@ pub fn probe_encoders() -> Vec<EncoderCaps> {
     {
         out.extend(win::probe_encoders());
     }
+    #[cfg(target_os = "linux")]
+    {
+        out.extend(linux::probe_encoders());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        out.extend(macos::probe_encoders());
+    }
     out.push(sw::encoder_caps());
     out
 }
@@ -38,6 +50,14 @@ pub fn probe_decoders() -> Vec<DecoderCaps> {
     #[cfg(windows)]
     {
         out.extend(win::probe_decoders());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        out.extend(linux::probe_decoders());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        out.extend(macos::probe_decoders());
     }
     out.push(sw::decoder_caps());
     out
@@ -54,6 +74,20 @@ pub fn create_encoder(cfg: &EncoderConfig, prefer_hw: bool) -> Result<Box<dyn Vi
                 tracing::warn!(codec = ?cfg.codec, "hardware encoder unavailable ({e}); falling back to software");
             }
         }
+        #[cfg(target_os = "linux")]
+        match linux::create_encoder(cfg) {
+            Ok(enc) => return Ok(Box::new(enc)),
+            Err(e) => {
+                tracing::debug!(codec = ?cfg.codec, "Linux hardware encoder unavailable ({e}); falling back to software");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        match macos::create_encoder(cfg) {
+            Ok(enc) => return Ok(Box::new(enc)),
+            Err(e) => {
+                tracing::debug!(codec = ?cfg.codec, "macOS hardware encoder unavailable ({e}); falling back to software");
+            }
+        }
     }
     Ok(Box::new(sw::OpenH264Encoder::new(cfg)?))
 }
@@ -67,6 +101,20 @@ pub fn create_decoder(cfg: &DecoderConfig, prefer_hw: bool) -> Result<Box<dyn Vi
             Ok(dec) => return Ok(Box::new(dec)),
             Err(e) => {
                 tracing::warn!(codec = ?cfg.codec, "hardware decoder unavailable ({e}); falling back to software");
+            }
+        }
+        #[cfg(target_os = "linux")]
+        match linux::create_decoder(cfg) {
+            Ok(dec) => return Ok(Box::new(dec)),
+            Err(e) => {
+                tracing::debug!(codec = ?cfg.codec, "Linux hardware decoder unavailable ({e}); falling back to software");
+            }
+        }
+        #[cfg(target_os = "macos")]
+        match macos::create_decoder(cfg) {
+            Ok(dec) => return Ok(Box::new(dec)),
+            Err(e) => {
+                tracing::debug!(codec = ?cfg.codec, "macOS hardware decoder unavailable ({e}); falling back to software");
             }
         }
     }
@@ -395,5 +443,174 @@ mod tests {
             }
         }
         assert!(decoded >= 4, "sw->hw decoded only {decoded}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hw_zero_copy_shared_nt_handle_cross_device() {
+        use std::ffi::c_void;
+        use veloxdesk_core_traits::video::GpuHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::Interface;
+
+        let enc_caps = probe_encoders();
+        let dec_caps = probe_decoders();
+        if !enc_caps.iter().any(|c| c.hardware && c.codecs.contains(&VideoCodec::H264))
+            || !dec_caps.iter().any(|c| c.hardware && c.gpu_output && c.codecs.contains(&VideoCodec::H264))
+        {
+            eprintln!("skipping cross-device NT handle test: no HW H.264 enc/dec");
+            return;
+        }
+
+        let (w, h) = (1920u32, 1080u32);
+        let mut enc = create_encoder(&enc_cfg(w, h, VideoCodec::H264), true).expect("hw enc");
+        let mut dec = create_decoder(&dec_cfg(w, h, VideoCodec::H264, true), true).expect("hw dec gpu");
+
+        let src = make_bgra_frame(w, h, 3);
+        let pkt = enc.encode(&src, EncodeOptions { force_keyframe: true }).expect("enc").expect("pkt");
+        let df = dec.decode(&pkt).expect("dec").expect("decoded gpu frame");
+
+        let FrameData::Gpu(ref gf) = df.frame.data else {
+            panic!("expected GPU output frame from HW decoder");
+        };
+        let GpuHandle::D3D11Texture { subresource, adapter_luid, shared_handle, .. } = gf.handle else {
+            panic!("expected D3D11Texture handle");
+        };
+        assert_eq!(subresource, 0, "shared texture must be single-slice (non-array)");
+        assert_ne!(adapter_luid, 0, "adapter_luid must be populated");
+        let raw_h = shared_handle.expect("expected shared NT handle for DX12/wgpu zero-copy");
+        assert_ne!(raw_h, 0);
+
+        // Open the NT handle on an INDEPENDENT second D3D11 device on the same adapter (simulates DX12/wgpu OpenSharedHandle).
+        let dev_b = win::d3d::create_device(Some(adapter_luid)).expect("second device");
+        let dev_b1: ID3D11Device1 = dev_b.cast().expect("ID3D11Device1");
+        let imported: ID3D11Texture2D = unsafe { dev_b1.OpenSharedResource1(HANDLE(raw_h as *mut c_void)) }
+            .expect("OpenSharedResource1 on second device");
+        let idesc = win::d3d::tex_desc(&imported);
+        assert_eq!((idesc.Width, idesc.Height), (w, h));
+        assert_eq!(idesc.ArraySize, 1);
+        assert_eq!(idesc.Format, DXGI_FORMAT_NV12);
+
+        let mut rb = win::d3d::Readback::default();
+        let (fmt, planes) = rb.read_texture(&imported, 0).expect("readback imported texture");
+        assert_eq!(fmt, PixelFormat::Nv12);
+        let cpu_imported = Frame {
+            width: w,
+            height: h,
+            format: PixelFormat::Nv12,
+            color_space: ColorSpace::Bt709,
+            color_range: ColorRange::Limited,
+            data: FrameData::Cpu(vec![
+                Plane { data: Bytes::copy_from_slice(planes[0].0), stride: planes[0].1 },
+                Plane { data: Bytes::copy_from_slice(planes[1].0), stride: planes[1].1 },
+            ]),
+            capture_ts: df.frame.capture_ts,
+        };
+        let psnr = frame_psnr_against_bgra(&src, &cpu_imported);
+        eprintln!(
+            "1080p cross-device NT handle import: luid={adapter_luid:#x} handle={raw_h:#x} decode_us={} psnr={psnr:.1}dB",
+            df.decode_us
+        );
+        assert!(psnr > 26.0, "cross-device imported frame psnr too low: {psnr:.2} dB");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hw_high_fps_and_10bit_probe() {
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let enc_caps = probe_encoders();
+        let Some(hw) = enc_caps.iter().find(|c| c.hardware) else {
+            eprintln!("skipping high-FPS/10-bit HW test: no HW encoder");
+            return;
+        };
+        let (w, h) = (1920u32, 1080u32);
+        let dev = win::d3d::create_device(None).expect("d3d11");
+        let luid = win::d3d::device_luid(&dev);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut pool = win::d3d::TexturePool::new(desc, false, 2);
+        let holder = pool.get(&dev).expect("tex");
+
+        for &fps in &[120u32, 240] {
+            let mut cfg = enc_cfg(w, h, VideoCodec::H264);
+            cfg.fps = fps;
+            cfg.bitrate_kbps = 35_000;
+            cfg.gpu_input = true;
+            let mut enc = create_encoder(&cfg, true).expect("high-fps enc");
+            let mut times = Vec::new();
+            for i in 0..8u32 {
+                let gf = Frame {
+                    width: w,
+                    height: h,
+                    format: PixelFormat::Bgra8,
+                    color_space: ColorSpace::Srgb,
+                    color_range: ColorRange::Full,
+                    data: FrameData::Gpu(win::d3d::gpu_frame(&holder, luid)),
+                    capture_ts: Timestamp(i as u64 * (1_000_000 / fps as u64)),
+                };
+                if let Some(pkt) = enc.encode(&gf, EncodeOptions { force_keyframe: i == 0 }).expect("encode")
+                    && i >= 2
+                {
+                    times.push((pkt.convert_us, pkt.encode_us));
+                }
+            }
+            assert!(!times.is_empty());
+            let avg_c = (times.iter().map(|t| t.0 as u64).sum::<u64>() / times.len() as u64) as u32;
+            let avg_e = (times.iter().map(|t| t.1 as u64).sum::<u64>() / times.len() as u64) as u32;
+            eprintln!("1080p @{fps}fps GPU zero-copy ({}): avg_convert={avg_c}us avg_encode={avg_e}us", hw.name);
+        }
+
+        // Test 10-bit P010 HDR encode if hardware supports it.
+        if hw.ten_bit {
+            let codec = if hw.codecs.contains(&VideoCodec::H265) { VideoCodec::H265 } else { VideoCodec::Av1 };
+            let mut cfg = enc_cfg(w, h, codec);
+            cfg.bit_depth = 10;
+            cfg.color_space = ColorSpace::Bt2020Pq;
+            cfg.gpu_input = true;
+            match win::mf_enc::MfEncoder::new(&cfg) {
+                Ok(mut enc10) => {
+                    let gf = Frame {
+                        width: w,
+                        height: h,
+                        format: PixelFormat::Bgra8,
+                        color_space: ColorSpace::Srgb,
+                        color_range: ColorRange::Full,
+                        data: FrameData::Gpu(win::d3d::gpu_frame(&holder, luid)),
+                        capture_ts: Timestamp(0),
+                    };
+                    let pkt = enc10.encode(&gf, EncodeOptions { force_keyframe: true }).expect("10-bit encode").expect("pkt");
+                    eprintln!(
+                        "1080p 10-bit P010 ({codec:?} {}): bytes={} convert={}us encode={}us",
+                        hw.name,
+                        pkt.data.len(),
+                        pkt.convert_us,
+                        pkt.encode_us
+                    );
+                }
+                Err(e) => {
+                    eprintln!("10-bit MFT probe reported true, session rejected ({e})");
+                }
+            }
+        }
+        // YUV 4:4:4 fallback check when unsupported.
+        if !hw.yuv444 {
+            let mut cfg = enc_cfg(640, 360, VideoCodec::H264);
+            cfg.chroma = ChromaFormat::Yuv444;
+            assert!(create_encoder(&cfg, true).is_err());
+        }
     }
 }

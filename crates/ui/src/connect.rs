@@ -2,12 +2,31 @@
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use veloxdesk_protocol::DEFAULT_DIRECT_PORT;
+use veloxdesk_protocol::{DEFAULT_DIRECT_PORT, DEFAULT_RENDEZVOUS_PORT};
 
 use crate::settings::Settings;
 
-/// Parse `ip`, `ip:port`, `[v6]:port`, `host[:port]` (default port 21118).
-pub fn parse_address(input: &str) -> Result<SocketAddr, String> {
+/// Parse a 9-digit VeloxDesk Device ID (ignores spaces and dashes, e.g. `"123 456 789"`).
+pub fn parse_device_id(input: &str) -> Option<String> {
+    let cleaned: String = input.chars().filter(|c| !c.is_ascii_whitespace() && *c != '-').collect();
+    if cleaned.len() == 9 && cleaned.bytes().all(|b| b.is_ascii_digit()) {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
+/// Format a 9-digit Device ID as `123 456 789` for display; other strings pass through unchanged.
+pub fn format_device_id(id: &str) -> String {
+    if id.len() == 9 && id.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{} {} {}", &id[0..3], &id[3..6], &id[6..9])
+    } else {
+        id.to_string()
+    }
+}
+
+/// Parse `ip`, `ip:port`, `[v6]:port`, `host[:port]` with `default_port`.
+pub fn parse_host_port(input: &str, default_port: u16) -> Result<SocketAddr, String> {
     let s = input.trim();
     if s.is_empty() {
         return Err("enter an address".into());
@@ -16,12 +35,12 @@ pub fn parse_address(input: &str) -> Result<SocketAddr, String> {
         return Ok(a);
     }
     if let Ok(ip) = s.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, DEFAULT_DIRECT_PORT));
+        return Ok(SocketAddr::new(ip, default_port));
     }
     let with_port = if s.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
         s.to_string()
     } else {
-        format!("{s}:{DEFAULT_DIRECT_PORT}")
+        format!("{s}:{default_port}")
     };
     with_port
         .to_socket_addrs()
@@ -30,10 +49,39 @@ pub fn parse_address(input: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("no address for {s}"))
 }
 
+/// Parse `ip`, `ip:port`, `[v6]:port`, `host[:port]` (default port 21118).
+pub fn parse_address(input: &str) -> Result<SocketAddr, String> {
+    parse_host_port(input, DEFAULT_DIRECT_PORT)
+}
+
+/// Parse a rendezvous server address (default port 21116).
+pub fn parse_rendezvous_addr(input: &str) -> Result<SocketAddr, String> {
+    parse_host_port(input, DEFAULT_RENDEZVOUS_PORT)
+}
+
+/// Target selected by the user: either a 9-digit Device ID (P2P / relay) or a direct socket address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectTarget {
+    Direct(SocketAddr),
+    DeviceId(String),
+}
+
+/// Parse either a 9-digit Device ID (with optional spaces/dashes) OR a direct `ip[:port]` / `host[:port]`.
+pub fn parse_target(input: &str) -> Result<ConnectTarget, String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err("enter a 9-digit Device ID or address".into());
+    }
+    if let Some(id) = parse_device_id(s) {
+        return Ok(ConnectTarget::DeviceId(id));
+    }
+    parse_address(s).map(ConnectTarget::Direct)
+}
+
 /// What the connect screen asks the app to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectAction {
-    Connect { address: String, addr: SocketAddr },
+    Connect { address: String, target: ConnectTarget },
     OpenSettings,
 }
 
@@ -61,14 +109,19 @@ impl ConnectScreen {
                 ui.heading(egui::RichText::new("VeloxDesk").size(32.0).strong());
                 ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
                 if !self.device_id.is_empty() {
-                    ui.label(format!("This device: {}", self.device_id));
+                    ui.label(format!("This device: {}", format_device_id(&self.device_id)));
+                }
+                if !settings.rendezvous_server.trim().is_empty() {
+                    ui.weak(format!("Rendezvous: {}", settings.rendezvous_server.trim()));
                 }
                 ui.add_space(16.0);
-                ui.label("Remote address (ip:port)");
+                ui.label("Remote Device ID or address (ip:port)");
                 let busy = self.status.is_some();
                 let edit = ui.add_enabled(
                     !busy,
-                    egui::TextEdit::singleline(&mut self.address).hint_text("192.168.1.20:21118").desired_width(280.0),
+                    egui::TextEdit::singleline(&mut self.address)
+                        .hint_text("123 456 789 or 192.168.1.20:21118")
+                        .desired_width(280.0),
                 );
                 let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {
@@ -124,10 +177,14 @@ impl ConnectScreen {
     }
 
     fn try_connect(&mut self) -> Option<ConnectAction> {
-        match parse_address(&self.address) {
-            Ok(addr) => {
+        match parse_target(&self.address) {
+            Ok(target) => {
                 self.error = None;
-                Some(ConnectAction::Connect { address: self.address.trim().to_string(), addr })
+                let address = match &target {
+                    ConnectTarget::DeviceId(id) => format_device_id(id),
+                    ConnectTarget::Direct(_) => self.address.trim().to_string(),
+                };
+                Some(ConnectAction::Connect { address, target })
             }
             Err(e) => {
                 self.error = Some(e);
@@ -148,7 +205,25 @@ mod tests {
         assert_eq!(parse_address("[::1]:5").unwrap(), "[::1]:5".parse().unwrap());
         assert_eq!(parse_address("::1").unwrap(), "[::1]:21118".parse().unwrap());
         assert_eq!(parse_address("localhost:7").unwrap().port(), 7);
+        assert_eq!(parse_rendezvous_addr("10.0.0.5").unwrap(), "10.0.0.5:21116".parse().unwrap());
         assert!(parse_address("").is_err());
         assert!(parse_address("no such host .invalid").is_err());
+    }
+
+    #[test]
+    fn device_ids_and_targets() {
+        assert_eq!(parse_device_id("123456789").as_deref(), Some("123456789"));
+        assert_eq!(parse_device_id(" 123 456 789 ").as_deref(), Some("123456789"));
+        assert_eq!(parse_device_id("123-456-789").as_deref(), Some("123456789"));
+        assert_eq!(parse_device_id("12345678"), None);
+        assert_eq!(parse_device_id("12345678a"), None);
+        assert_eq!(format_device_id("123456789"), "123 456 789");
+
+        assert_eq!(parse_target("123 456 789").unwrap(), ConnectTarget::DeviceId("123456789".into()));
+        assert_eq!(
+            parse_target("10.0.0.5:21118").unwrap(),
+            ConnectTarget::Direct("10.0.0.5:21118".parse().unwrap())
+        );
+        assert!(parse_target("   ").is_err());
     }
 }

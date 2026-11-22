@@ -21,10 +21,12 @@ quinn = { workspace = true, default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 reed-solomon-simd = "3"
 socket2 = "0.6"
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 rand = "0.9"
-parking_lot = { workspace = true }
+veloxdesk-server-rendezvous = { workspace = true }
+veloxdesk-server-relay = { workspace = true }
 
 [lints]
 workspace = true

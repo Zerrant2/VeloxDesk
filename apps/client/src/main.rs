@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use veloxdesk_render::winit::event_loop::EventLoop;
 use veloxdesk_ui::{Mode, Present, Settings};
 
-use crate::app::{App, Launch, TestPatternOpts, UserEvent};
+use crate::app::{App, Launch, TestPatternOpts, UserEvent, ViewerCliOpts};
 
 pub(crate) fn device_id_label() -> String {
     viewer::device_id_label()
@@ -44,9 +44,21 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["connect", "test_pattern"])]
     host: bool,
 
-    /// Connect directly to a host (`ip[:port]`).
-    #[arg(long, value_name = "ADDR", conflicts_with_all = ["host", "test_pattern"])]
+    /// Connect to a host by 9-digit Device ID or direct address (`ip[:port]`).
+    #[arg(long, value_name = "ID_OR_ADDR", conflicts_with_all = ["host", "test_pattern"])]
     connect: Option<String>,
+
+    /// Rendezvous server address (`host[:port]`, default port 21116) for Device ID connections.
+    #[arg(long, value_name = "ADDR")]
+    rendezvous: Option<String>,
+
+    /// Password or one-time password for viewer authentication.
+    #[arg(long, value_name = "PASSWORD")]
+    password: Option<String>,
+
+    /// Force zero-knowledge relay fallback when connecting by Device ID.
+    #[arg(long)]
+    relay_only: bool,
 
     /// Present a synthetic NV12 test pattern to benchmark the renderer.
     #[arg(long, conflicts_with_all = ["host", "connect"])]
@@ -96,15 +108,28 @@ fn init_logging() {
 }
 
 #[cfg(feature = "net")]
-fn run_host_cli(args: &veloxdesk_service::HostArgs) -> anyhow::Result<()> {
+fn run_host_cli(
+    mut args: veloxdesk_service::HostArgs,
+    rendezvous: Option<String>,
+    password: Option<String>,
+) -> anyhow::Result<()> {
+    if let Some(rdv) = rendezvous {
+        args.rendezvous = Some(veloxdesk_ui::parse_rendezvous_addr(&rdv).map_err(anyhow::Error::msg)?);
+    }
+    if password.is_some() {
+        args.password = password;
+    }
     let cfg = args.resolve()?;
     let id = viewer::load_identity(cfg.identity_path.as_deref())?;
     println!(
         "VeloxDesk host {} listening on {} (device ID: {})",
         env!("CARGO_PKG_VERSION"),
         cfg.bind,
-        id.device_id()
+        veloxdesk_ui::format_device_id(&id.device_id()),
     );
+    if let Some(rdv) = cfg.rendezvous {
+        println!("  rendezvous: {rdv}");
+    }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(veloxdesk_service::run_host(cfg, id))?;
     Ok(())
@@ -121,7 +146,7 @@ fn main() -> ExitCode {
 
     if cli.host {
         #[cfg(feature = "net")]
-        let res = run_host_cli(&cli.host_args);
+        let res = run_host_cli(cli.host_args, cli.rendezvous, cli.password);
         #[cfg(not(feature = "net"))]
         let res = run_host_cli();
         return match res {
@@ -164,8 +189,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let viewer_opts = ViewerCliOpts {
+        rendezvous: cli.rendezvous,
+        password: cli.password,
+        relay_only: cli.relay_only,
+    };
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(launch, proxy, settings, cli.present.map(PresentArg::to_ui));
+    let mut app = App::new(launch, proxy, settings, cli.present.map(PresentArg::to_ui), viewer_opts);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("event loop error: {e}");
         return ExitCode::FAILURE;
@@ -209,17 +239,40 @@ mod tests {
         assert_eq!((tp.width, tp.height, tp.fps, tp.frames), (1280, 720, 0, Some(60)));
         assert!(matches!(tp.present, Some(PresentArg::Immediate)));
 
+        let p2p = Cli::try_parse_from([
+            "veloxdesk",
+            "--connect",
+            "123 456 789",
+            "--rendezvous",
+            "127.0.0.1:21116",
+            "--password",
+            "s3cr3t",
+            "--relay-only",
+        ])
+        .unwrap();
+        assert_eq!(p2p.connect.as_deref(), Some("123 456 789"));
+        assert_eq!(p2p.rendezvous.as_deref(), Some("127.0.0.1:21116"));
+        assert_eq!(p2p.password.as_deref(), Some("s3cr3t"));
+        assert!(p2p.relay_only);
+
         assert!(Cli::try_parse_from(["veloxdesk", "--host", "--connect", "127.0.0.1"]).is_err());
     }
 
     #[cfg(feature = "net")]
     #[test]
     fn cli_parses_host_flags() {
-        let host = Cli::try_parse_from([
+        let mut host = Cli::try_parse_from([
             "veloxdesk",
             "--host",
             "--bind",
             "127.0.0.1:21118",
+            "--rendezvous",
+            "127.0.0.1:21116",
+            "--password",
+            "hunter2",
+            "--otp",
+            "auto",
+            "--require-accept",
             "--max-fps",
             "120",
             "--bitrate",
@@ -230,8 +283,14 @@ mod tests {
         ])
         .unwrap();
         assert!(host.host);
+        host.host_args.rendezvous = host.rendezvous.as_deref().map(|s| veloxdesk_ui::parse_rendezvous_addr(s).unwrap());
+        host.host_args.password = host.password.clone();
         let cfg = host.host_args.resolve().unwrap();
         assert_eq!(cfg.bind, "127.0.0.1:21118".parse().unwrap());
+        assert_eq!(cfg.rendezvous, Some("127.0.0.1:21116".parse().unwrap()));
+        assert!(cfg.auth.permanent_password_hash.is_some());
+        assert!(cfg.auth.auto_otp);
+        assert!(cfg.auth.require_accept);
         assert_eq!(cfg.max_fps, 120);
         assert_eq!(cfg.bitrate_kbps, 30000);
         assert!(!cfg.prefer_hw);

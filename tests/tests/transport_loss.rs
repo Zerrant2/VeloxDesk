@@ -36,7 +36,12 @@ struct Outcome {
     p99_us: u32,
 }
 
+/// Serialize heavy 120 fps / 200 KB keyframe loopback bursts so parallel test cases do
+/// not overflow the OS default 64 KB UDP receive buffer on CI runners.
+static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
 async fn run(loss: LossModel, parity: u8, frames: u32) -> Outcome {
+    let _guard = SERIAL.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
     let host = DeviceIdentity::generate();
     let viewer = DeviceIdentity::generate();
     let listener = veloxdesk_transport::listen("127.0.0.1:0".parse().unwrap(), &host).await.expect("listen");

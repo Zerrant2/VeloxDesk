@@ -12,11 +12,16 @@ use veloxdesk_core_traits::input::{DisplayGeometry, InputCaps, InputEvent, Input
 use veloxdesk_core_traits::video::*;
 use veloxdesk_core_traits::{FrameCapture, InputInjector, Result, Timestamp, TransportChannel, VideoEncoder};
 use veloxdesk_crypto::DeviceIdentity;
+use veloxdesk_crypto::auth::{Argon2Params, PasswordHash, derive_password_key, password_proof};
 use veloxdesk_protocol::StreamKind;
-use veloxdesk_protocol::control::{Envelope, Hello, KeyEvent, Ping, envelope::Msg};
+use veloxdesk_protocol::control::{AuthMethod, AuthResponse, Envelope, Hello, KeyEvent, Ping, envelope::Msg};
 use veloxdesk_service::session::CLOSE_BUSY;
-use veloxdesk_service::{HostBackends, HostConfig, TransportAbr, TransportVideoSink, serve_until};
-use veloxdesk_transport::{AbrController, ControlReceiver, VideoReceiver, VideoSender, connect, framed, listen};
+use veloxdesk_service::{
+    HostAuthConfig, HostBackends, HostConfig, TransportAbr, TransportVideoSink, serve_p2p_until, serve_until,
+};
+use veloxdesk_transport::{
+    AbrController, ControlReceiver, P2pListener, VideoReceiver, VideoSender, connect, framed, listen,
+};
 
 struct StaticCapture {
     sent: bool,
@@ -338,6 +343,78 @@ async fn host_quic_loopback_with_system_codec() {
     .await
     .expect("timed out decoding real H.264 frames over QUIC");
     assert!(decoded >= 3);
+
+    let _ = stop_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_p2p_listener_direct_with_password_auth() {
+    let host_id = DeviceIdentity::generate();
+    let viewer_id = DeviceIdentity::generate();
+    let listener = P2pListener::bind("127.0.0.1:0".parse().unwrap(), None, &host_id)
+        .await
+        .expect("p2p bind");
+    let addr = listener.local_addr();
+
+    let ph = PasswordHash::hash_with("m2-quic-pw", Argon2Params { m_cost_kib: 1024, t_cost: 1, p_cost: 1 }).unwrap();
+    let mut auth = HostAuthConfig::with_permanent_password(ph);
+    auth.host_public_key = Some(host_id.public_key());
+
+    let inj_log = Arc::new(Mutex::new(InjLog::default()));
+    let backends = HostBackends {
+        capture: Arc::new(|_| Ok(Box::new(StaticCapture { sent: false }) as Box<dyn FrameCapture>)),
+        encoder: Arc::new(|cfg, _| Ok(Box::new(FakeEncoder { cfg: cfg.clone(), next_id: 0 }) as Box<dyn VideoEncoder>)),
+        injector: Arc::new(move || Ok(Box::new(RecInjector(inj_log.clone())) as Box<dyn InputInjector>)),
+        video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
+        rate: Arc::new(|s, mn, mx| Box::new(TransportAbr(AbrController::new(s, mn, mx)))),
+    };
+    let cfg = HostConfig { bind: addr, max_fps: 60, idle_fps: 20, auth, ..Default::default() };
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let host_task = tokio::spawn(serve_p2p_until(listener, cfg, backends, async {
+        let _ = stop_rx.await;
+    }));
+
+    // Real mutual-TLS QUIC connect directly to the multiplexed P2pListener socket.
+    let ch = connect(addr, &viewer_id, Some(host_id.public_key())).await.expect("connect");
+    let (send, recv) = ch.open_bi(StreamKind::Control).await.expect("open control");
+    let (mut w, mut r) = framed(send, recv);
+
+    w.send(
+        &Msg::Hello(Hello {
+            device_id: viewer_id.device_id(),
+            public_key: viewer_id.public_key().to_vec(),
+            protocol_version: 1,
+            ..Default::default()
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+
+    let Msg::AuthChallenge(challenge) = recv_until(&mut r, |_| true).await else { panic!("expected AuthChallenge") };
+    assert_eq!(challenge.host_public_key, host_id.public_key());
+    let params = Argon2Params {
+        m_cost_kib: challenge.argon2_m_cost_kib,
+        t_cost: challenge.argon2_t_cost,
+        p_cost: challenge.argon2_p_cost,
+    };
+    let key = derive_password_key("m2-quic-pw", &challenge.salt, params).unwrap();
+    let proof = password_proof(&key, &challenge.nonce);
+    w.send(
+        &Msg::AuthResponse(AuthResponse {
+            method: AuthMethod::PermanentPassword as i32,
+            proof: proof.to_vec(),
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+
+    let Msg::AuthResult(a) = recv_until(&mut r, |_| true).await else { panic!("expected AuthResult") };
+    assert!(a.ok, "auth failed: {}", a.reason);
+    let Msg::SessionConfig(sc) = recv_until(&mut r, |_| true).await else { panic!("expected SessionConfig") };
+    assert_eq!(sc.video.unwrap().width, 320);
 
     let _ = stop_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();

@@ -19,7 +19,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::Interface;
 
-use super::d3d::{self, Readback, TexturePool, win_err};
+use super::d3d::{self, GpuSync, Readback, TexturePool, win_err};
 use super::mf::{self, ensure_mf, mf_err};
 use crate::convert;
 
@@ -33,7 +33,10 @@ fn codec_set(api: &Option<ICodecAPI>, key: &windows::core::GUID, v: VARIANT) -> 
     }
 }
 
-fn select_nv12_output(transform: &IMFTransform) -> Result<IMFMediaType> {
+/// Select the decoder's native YUV 4:2:0 output format (`NV12` for 8-bit, `P010` for 10-bit).
+/// Because `MFT_DECODER_EXPOSE_OUTPUT_TYPES_IN_NATIVE_ORDER` is set, the first matching
+/// NV12/P010 format matches the bitstream bit depth.
+fn select_yuv_output(transform: &IMFTransform) -> Result<(IMFMediaType, PixelFormat)> {
     // SAFETY: GetOutputAvailableType / SetOutputType on a valid MFT.
     unsafe {
         let mut idx = 0u32;
@@ -41,13 +44,20 @@ fn select_nv12_output(transform: &IMFTransform) -> Result<IMFMediaType> {
             let t = match transform.GetOutputAvailableType(0, idx) {
                 Ok(t) => t,
                 Err(e) if e.code() == MF_E_NO_MORE_TYPES => {
-                    return Err(CoreError::unsupported("MF decoder does not offer NV12 output"));
+                    return Err(CoreError::unsupported("MF decoder does not offer NV12 or P010 output"));
                 }
                 Err(e) => return Err(mf_err("GetOutputAvailableType")(e)),
             };
-            if t.GetGUID(&MF_MT_SUBTYPE).ok() == Some(MFVideoFormat_NV12) {
-                transform.SetOutputType(0, &t, 0).map_err(mf_err("SetOutputType(NV12)"))?;
-                return Ok(t);
+            match t.GetGUID(&MF_MT_SUBTYPE).ok() {
+                Some(g) if g == MFVideoFormat_NV12 => {
+                    transform.SetOutputType(0, &t, 0).map_err(mf_err("SetOutputType(NV12)"))?;
+                    return Ok((t, PixelFormat::Nv12));
+                }
+                Some(g) if g == MFVideoFormat_P010 => {
+                    transform.SetOutputType(0, &t, 0).map_err(mf_err("SetOutputType(P010)"))?;
+                    return Ok((t, PixelFormat::P010));
+                }
+                _ => {}
             }
             idx += 1;
         }
@@ -86,14 +96,14 @@ fn resolve_device(shared_device: Option<usize>) -> Result<ID3D11Device> {
     d3d::create_device(None)
 }
 
-pub fn caps_for(codecs: Vec<VideoCodec>) -> DecoderCaps {
+pub fn caps_for(codecs: Vec<VideoCodec>, ten_bit: bool) -> DecoderCaps {
     DecoderCaps {
         name: NAME,
         codecs,
         hardware: true,
         gpu_output: true,
         yuv444: false,
-        ten_bit: false,
+        ten_bit,
     }
 }
 
@@ -102,6 +112,7 @@ pub struct MfDecoder {
     codec: VideoCodec,
     width: u32,
     height: u32,
+    output_format: PixelFormat,
     prefer_gpu_output: bool,
     dev: ID3D11Device,
     ctx: ID3D11DeviceContext,
@@ -111,6 +122,7 @@ pub struct MfDecoder {
     provides_samples: bool,
     out_size: u32,
     pool: Option<TexturePool>,
+    gpu_sync: Option<GpuSync>,
     readback: Readback,
     last_ts_hns: i64,
 }
@@ -193,7 +205,7 @@ impl MfDecoder {
             let sub = mf::subtype(cfg.codec)?;
             let inp = mf::video_type(&sub, w, h, 60)?;
             transform.SetInputType(0, &inp, 0).map_err(mf_err("SetInputType"))?;
-            let out_type = select_nv12_output(&transform)?;
+            let (out_type, output_format) = select_yuv_output(&transform)?;
             let (out_w, out_h) = output_dimensions(&out_type, w, h);
 
             let info = transform.GetOutputStreamInfo(0).map_err(mf_err("GetOutputStreamInfo"))?;
@@ -207,6 +219,7 @@ impl MfDecoder {
                 codec: cfg.codec,
                 width: out_w,
                 height: out_h,
+                output_format,
                 prefer_gpu_output: cfg.prefer_gpu_output,
                 dev: dev.clone(),
                 ctx: dev.GetImmediateContext().map_err(win_err("GetImmediateContext"))?,
@@ -214,8 +227,9 @@ impl MfDecoder {
                 _manager: manager,
                 transform,
                 provides_samples: provides,
-                out_size: info.cbSize.max(w * h * 3 / 2),
+                out_size: info.cbSize.max(w * h * 3),
                 pool: None,
+                gpu_sync: GpuSync::new(dev),
                 readback: Readback::default(),
                 last_ts_hns: -1,
             })
@@ -225,14 +239,15 @@ impl MfDecoder {
     fn refresh_output_info(&mut self) -> Result<()> {
         // SAFETY: valid MFT.
         unsafe {
-            let t = select_nv12_output(&self.transform)?;
+            let (t, fmt) = select_yuv_output(&self.transform)?;
             let (w, h) = output_dimensions(&t, self.width, self.height);
             self.width = w;
             self.height = h;
+            self.output_format = fmt;
             let info = self.transform.GetOutputStreamInfo(0).map_err(mf_err("GetOutputStreamInfo"))?;
             self.provides_samples =
                 info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32 != 0;
-            self.out_size = info.cbSize.max(w * h * 3 / 2);
+            self.out_size = info.cbSize.max(w * h * 3);
         }
         Ok(())
     }
@@ -288,12 +303,13 @@ impl MfDecoder {
                     return self.export_gpu(&src_tex, sub, capture_ts);
                 }
                 let (fmt, planes) = self.readback.read_texture(&src_tex, sub)?;
-                if fmt != PixelFormat::Nv12 || planes.len() < 2 {
+                if !matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010) || planes.len() < 2 {
                     return Err(CoreError::platform(format!("unexpected MF decoder texture format {fmt:?}")));
                 }
-                return Ok(Self::pack_nv12(w, h, planes[0].0, planes[0].1, planes[1].0, planes[1].1, capture_ts));
+                return Ok(Self::pack_yuv420(fmt, w, h, planes[0].0, planes[0].1, planes[1].0, planes[1].1, capture_ts));
             }
             // Fallback: CPU buffer emitted by decoder.
+            let fmt = self.output_format;
             if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
                 let mut p = std::ptr::null_mut();
                 let mut pitch = 0i32;
@@ -303,7 +319,7 @@ impl MfDecoder {
                     let total_rows = h as usize + (h as usize).div_ceil(2);
                     let slice = std::slice::from_raw_parts(p, stride * total_rows);
                     let (y, uv) = slice.split_at(stride * h as usize);
-                    Ok(Self::pack_nv12(w, h, y, stride, uv, stride, capture_ts))
+                    Ok(Self::pack_yuv420(fmt, w, h, y, stride, uv, stride, capture_ts))
                 } else {
                     Err(CoreError::platform("MF decoder returned negative stride"))
                 };
@@ -312,13 +328,15 @@ impl MfDecoder {
             }
             let mut bytes = Vec::new();
             mf::sample_bytes(sample, &mut bytes)?;
-            let stride = w as usize;
+            let bps = if fmt == PixelFormat::P010 { 2 } else { 1 };
+            let stride = w as usize * bps;
             let y_len = stride * h as usize;
             let (cw, ch) = convert::chroma_dims(w, h);
-            if bytes.len() < y_len + cw * 2 * ch {
+            let uv_stride = cw * 2 * bps;
+            if bytes.len() < y_len + uv_stride * ch {
                 return Err(CoreError::platform("MF decoder CPU buffer too small"));
             }
-            Ok(Self::pack_nv12(w, h, &bytes[..y_len], stride, &bytes[y_len..], cw * 2, capture_ts))
+            Ok(Self::pack_yuv420(fmt, w, h, &bytes[..y_len], stride, &bytes[y_len..], uv_stride, capture_ts))
         }
     }
 
@@ -326,8 +344,13 @@ impl MfDecoder {
         let src_desc = d3d::tex_desc(src);
         let w = (self.width.min(src_desc.Width)) & !1;
         let h = (self.height.min(src_desc.Height)) & !1;
+        let (dxgi_fmt, pix_fmt, color_space) = if src_desc.Format == DXGI_FORMAT_P010 {
+            (DXGI_FORMAT_P010, PixelFormat::P010, ColorSpace::Bt2020Pq)
+        } else {
+            (DXGI_FORMAT_NV12, PixelFormat::Nv12, ColorSpace::Bt709)
+        };
         let need_pool = match &self.pool {
-            Some(p) => p.desc().Width != w || p.desc().Height != h,
+            Some(p) => p.desc().Width != w || p.desc().Height != h || p.desc().Format != dxgi_fmt,
             None => true,
         };
         if need_pool {
@@ -336,7 +359,7 @@ impl MfDecoder {
                 Height: h,
                 MipLevels: 1,
                 ArraySize: 1,
-                Format: DXGI_FORMAT_NV12,
+                Format: dxgi_fmt,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
@@ -351,20 +374,29 @@ impl MfDecoder {
         // SAFETY: both textures belong to `self.dev`, region is even-aligned and within bounds.
         unsafe {
             self.ctx.CopySubresourceRegion(&dst.tex, 0, 0, 0, 0, src, sub, Some(&region));
-            self.ctx.Flush();
+            if let Some(sync) = &self.gpu_sync
+                && dst.shared.is_some()
+            {
+                // Retire copy before handing the shared NT handle to another device (DX12/wgpu).
+                sync.flush_and_wait(&self.ctx);
+            } else {
+                self.ctx.Flush();
+            }
         }
         Ok(Frame {
             width: w,
             height: h,
-            format: PixelFormat::Nv12,
-            color_space: ColorSpace::Bt709,
+            format: pix_fmt,
+            color_space,
             color_range: ColorRange::Limited,
             data: FrameData::Gpu(d3d::gpu_frame(&dst, self.luid)),
             capture_ts,
         })
     }
 
-    fn pack_nv12(
+    #[allow(clippy::too_many_arguments)]
+    fn pack_yuv420(
+        fmt: PixelFormat,
         w: u32,
         h: u32,
         y: &[u8],
@@ -373,22 +405,24 @@ impl MfDecoder {
         uv_stride: usize,
         capture_ts: veloxdesk_core_traits::Timestamp,
     ) -> Frame {
-        let wu = w as usize;
+        let bps = if fmt == PixelFormat::P010 { 2 } else { 1 };
+        let wu = w as usize * bps;
         let hu = h as usize;
         let (cw, ch) = convert::chroma_dims(w, h);
+        let uv_row = cw * 2 * bps;
         let mut yb = vec![0u8; wu * hu];
         convert::copy_plane(y, y_stride, &mut yb, wu, wu, hu);
-        let mut uvb = vec![0u8; cw * 2 * ch];
-        convert::copy_plane(uv, uv_stride, &mut uvb, cw * 2, cw * 2, ch);
+        let mut uvb = vec![0u8; uv_row * ch];
+        convert::copy_plane(uv, uv_stride, &mut uvb, uv_row, uv_row, ch);
         Frame {
             width: w,
             height: h,
-            format: PixelFormat::Nv12,
-            color_space: ColorSpace::Bt709,
+            format: fmt,
+            color_space: if fmt == PixelFormat::P010 { ColorSpace::Bt2020Pq } else { ColorSpace::Bt709 },
             color_range: ColorRange::Limited,
             data: FrameData::Cpu(vec![
                 Plane { data: Bytes::from(yb), stride: wu },
-                Plane { data: Bytes::from(uvb), stride: cw * 2 },
+                Plane { data: Bytes::from(uvb), stride: uv_row },
             ]),
             capture_ts,
         }
@@ -397,7 +431,7 @@ impl MfDecoder {
 
 impl VideoDecoder for MfDecoder {
     fn caps(&self) -> DecoderCaps {
-        caps_for(vec![self.codec])
+        caps_for(vec![self.codec], self.output_format == PixelFormat::P010 || matches!(self.codec, VideoCodec::H265 | VideoCodec::Av1))
     }
 
     fn decode(&mut self, packet: &EncodedPacket) -> Result<Option<DecodedFrame>> {
@@ -466,16 +500,18 @@ impl Drop for MfDecoder {
     }
 }
 
-/// True if a D3D11VA hardware decoder MFT is registered for `codec`.
-pub fn probe(codec: VideoCodec) -> bool {
-    if ensure_mf().is_err() {
-        return false;
-    }
-    let Ok(sub) = mf::subtype(codec) else {
-        return false;
-    };
+/// Probe result for a D3D11VA hardware decoder MFT.
+pub struct ProbeInfo {
+    pub ten_bit: bool,
+}
+
+/// Probe whether a D3D11VA hardware decoder MFT is registered for `codec` (and whether it supports P010 10-bit).
+pub fn probe(codec: VideoCodec) -> Option<ProbeInfo> {
+    ensure_mf().ok()?;
+    let sub = mf::subtype(codec).ok()?;
     let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
     let mfts = mf::enum_mfts(MFT_CATEGORY_VIDEO_DECODER, flags, sub, MFVideoFormat_NV12, None);
+    let mut found = false;
     for m in mfts {
         // SAFETY: activate briefly to inspect MF_SA_D3D11_AWARE, then shut down.
         let ok = unsafe {
@@ -490,8 +526,14 @@ pub fn probe(codec: VideoCodec) -> bool {
             r
         };
         if ok {
-            return true;
+            found = true;
+            break;
         }
     }
-    false
+    if !found {
+        return None;
+    }
+    let ten_bit = matches!(codec, VideoCodec::H265 | VideoCodec::Av1)
+        && !mf::enum_mfts(MFT_CATEGORY_VIDEO_DECODER, flags, sub, MFVideoFormat_P010, None).is_empty();
+    Some(ProbeInfo { ten_bit })
 }

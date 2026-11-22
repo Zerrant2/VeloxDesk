@@ -11,9 +11,13 @@ publish = false
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 ed25519-dalek = { version = "2.2", features = ["rand_core", "pkcs8", "zeroize"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
+argon2 = "0.5"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 x509-parser = "0.18"
