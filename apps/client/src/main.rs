@@ -1,5 +1,239 @@
-//! VeloxDesk client and host application.
+//! VeloxDesk client and host application (`veloxdesk`).
 
-fn main() {
-    println!("veloxdesk {} (protocol v{})", env!("CARGO_PKG_VERSION"), veloxdesk_protocol::PROTOCOL_VERSION);
+mod app;
+mod input;
+mod latest;
+mod session;
+mod stats;
+mod viewer;
+
+use std::process::ExitCode;
+
+use clap::{Parser, ValueEnum};
+use tracing_subscriber::EnvFilter;
+use veloxdesk_render::winit::event_loop::EventLoop;
+use veloxdesk_ui::{Mode, Present, Settings};
+
+use crate::app::{App, Launch, TestPatternOpts, UserEvent};
+
+pub(crate) fn device_id_label() -> String {
+    viewer::device_id_label()
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PresentArg {
+    Mailbox,
+    Immediate,
+    Fifo,
+}
+
+impl PresentArg {
+    fn to_ui(self) -> Present {
+        match self {
+            Self::Mailbox => Present::Mailbox,
+            Self::Immediate => Present::Immediate,
+            Self::Fifo => Present::Fifo,
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "veloxdesk", version, about = "VeloxDesk low-latency remote desktop")]
+struct Cli {
+    /// Run as host (stream this desktop to connecting viewers).
+    #[arg(long, conflicts_with_all = ["connect", "test_pattern"])]
+    host: bool,
+
+    /// Connect directly to a host (`ip[:port]`).
+    #[arg(long, value_name = "ADDR", conflicts_with_all = ["host", "test_pattern"])]
+    connect: Option<String>,
+
+    /// Present a synthetic NV12 test pattern to benchmark the renderer.
+    #[arg(long, conflicts_with_all = ["host", "connect"])]
+    test_pattern: bool,
+
+    /// Test-pattern width in pixels.
+    #[arg(long, default_value_t = 1920)]
+    width: u32,
+
+    /// Test-pattern height in pixels.
+    #[arg(long, default_value_t = 1080)]
+    height: u32,
+
+    /// Test-pattern target FPS (0 = uncapped).
+    #[arg(long, default_value_t = 120)]
+    fps: u32,
+
+    /// Exit test-pattern mode after presenting N frames and print stats.
+    #[arg(long)]
+    frames: Option<u32>,
+
+    /// Override presentation mode (`mailbox`, `immediate`, `fifo`).
+    #[arg(long, value_enum)]
+    present: Option<PresentArg>,
+
+    /// Start with the Performance HUD visible.
+    #[arg(long)]
+    hud: bool,
+
+    /// Start in Gaming mode (relative mouse, separate cursor).
+    #[arg(long)]
+    gaming: bool,
+
+    /// Force software video decoding on the viewer.
+    #[arg(long)]
+    sw_decode: bool,
+
+    /// Host options (used with `--host`).
+    #[cfg(feature = "net")]
+    #[command(flatten)]
+    host_args: veloxdesk_service::HostArgs,
+}
+
+fn init_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,wgpu=warn,naga=warn"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).try_init();
+}
+
+#[cfg(feature = "net")]
+fn run_host_cli(args: &veloxdesk_service::HostArgs) -> anyhow::Result<()> {
+    let cfg = args.resolve()?;
+    let id = viewer::load_identity(cfg.identity_path.as_deref())?;
+    println!(
+        "VeloxDesk host {} listening on {} (device ID: {})",
+        env!("CARGO_PKG_VERSION"),
+        cfg.bind,
+        id.device_id()
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(veloxdesk_service::run_host(cfg, id))?;
+    Ok(())
+}
+
+#[cfg(not(feature = "net"))]
+fn run_host_cli() -> anyhow::Result<()> {
+    anyhow::bail!("--host requires the `net` feature (rebuild with `--features net`)")
+}
+
+fn main() -> ExitCode {
+    init_logging();
+    let cli = Cli::parse();
+
+    if cli.host {
+        #[cfg(feature = "net")]
+        let res = run_host_cli(&cli.host_args);
+        #[cfg(not(feature = "net"))]
+        let res = run_host_cli();
+        return match res {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("host error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let mut settings = Settings::load_or_default();
+    if cli.hud {
+        settings.show_hud = true;
+    }
+    if cli.gaming {
+        settings.mode = Mode::Gaming;
+    }
+    if cli.sw_decode {
+        settings.prefer_hw_decode = false;
+    }
+
+    let launch = if cli.test_pattern {
+        Launch::TestPattern(TestPatternOpts {
+            width: cli.width,
+            height: cli.height,
+            fps: cli.fps,
+            frames: cli.frames,
+        })
+    } else if let Some(addr) = cli.connect {
+        Launch::Connect(addr)
+    } else {
+        Launch::Gui
+    };
+
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("cannot create window event loop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(launch, proxy, settings, cli.present.map(PresentArg::to_ui));
+    if let Err(e) = event_loop.run_app(&mut app) {
+        eprintln!("event loop error: {e}");
+        return ExitCode::FAILURE;
+    }
+    if app.exit_code == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(app.exit_code as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_modes() {
+        let gui = Cli::try_parse_from(["veloxdesk"]).unwrap();
+        assert!(!gui.host && gui.connect.is_none() && !gui.test_pattern);
+
+        let conn = Cli::try_parse_from(["veloxdesk", "--connect", "127.0.0.1:21118", "--hud", "--gaming"]).unwrap();
+        assert_eq!(conn.connect.as_deref(), Some("127.0.0.1:21118"));
+        assert!(conn.hud && conn.gaming);
+
+        let tp = Cli::try_parse_from([
+            "veloxdesk",
+            "--test-pattern",
+            "--width",
+            "1280",
+            "--height",
+            "720",
+            "--fps",
+            "0",
+            "--frames",
+            "60",
+            "--present",
+            "immediate",
+        ])
+        .unwrap();
+        assert!(tp.test_pattern);
+        assert_eq!((tp.width, tp.height, tp.fps, tp.frames), (1280, 720, 0, Some(60)));
+        assert!(matches!(tp.present, Some(PresentArg::Immediate)));
+
+        assert!(Cli::try_parse_from(["veloxdesk", "--host", "--connect", "127.0.0.1"]).is_err());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn cli_parses_host_flags() {
+        let host = Cli::try_parse_from([
+            "veloxdesk",
+            "--host",
+            "--bind",
+            "127.0.0.1:21118",
+            "--max-fps",
+            "120",
+            "--bitrate",
+            "30000",
+            "--codec",
+            "h264",
+            "--no-hw",
+        ])
+        .unwrap();
+        assert!(host.host);
+        let cfg = host.host_args.resolve().unwrap();
+        assert_eq!(cfg.bind, "127.0.0.1:21118".parse().unwrap());
+        assert_eq!(cfg.max_fps, 120);
+        assert_eq!(cfg.bitrate_kbps, 30000);
+        assert!(!cfg.prefer_hw);
+    }
 }

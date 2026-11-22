@@ -8,8 +8,27 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+clap.workspace = true
+crossbeam-channel.workspace = true
+prost.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+toml = "0.9"
+tracing.workspace = true
+veloxdesk-capture = { workspace = true }
+veloxdesk-codec = { workspace = true }
 veloxdesk-core-traits = { workspace = true }
+veloxdesk-crypto = { workspace = true }
+veloxdesk-input = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+veloxdesk-transport = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

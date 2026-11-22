@@ -7,9 +7,48 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = ["pipeline"]
+codec = ["dep:veloxdesk-codec"]
+net = ["dep:veloxdesk-transport", "dep:veloxdesk-crypto"]
+# Full capture>encode>QUIC>decode(+headless render) pipeline (needs transport/codec/capture/crypto/render M1 APIs).
+pipeline = ["codec", "net", "dep:veloxdesk-capture", "dep:veloxdesk-render", "dep:crossbeam-channel"]
+
 [dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "time", "sync", "macros"] }
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+veloxdesk-transport = { workspace = true, optional = true }
+veloxdesk-codec = { workspace = true, optional = true }
+veloxdesk-capture = { workspace = true, optional = true }
+veloxdesk-crypto = { workspace = true, optional = true }
+veloxdesk-render = { workspace = true, optional = true }
+crossbeam-channel = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
+prost.workspace = true
+
+[[bin]]
+name = "pipeline"
+required-features = ["pipeline"]
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "convert"
+harness = false
+required-features = ["codec"]
+
+[[bench]]
+name = "fec"
+harness = false
+required-features = ["net"]
 
 [lints]
 workspace = true

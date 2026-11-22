@@ -10,6 +10,14 @@ publish = false
 [dependencies]
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+wgpu = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = "0.37"
+winit = "0.30.13"
+bytes = { workspace = true }
+tracing = { workspace = true }
+pollster = "0.4"
 
 [lints]
 workspace = true

@@ -7,9 +7,35 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = ["full"]
+# Tests needing the M1 transport (QUIC + FEC) API.
+net = ["dep:veloxdesk-transport", "dep:veloxdesk-crypto"]
+# Host↔viewer session smoke test (needs transport + service + codec).
+full = ["net", "dep:veloxdesk-service", "dep:veloxdesk-codec"]
+
 [dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+prost.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "time", "sync", "macros"] }
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+veloxdesk-transport = { workspace = true, optional = true }
+veloxdesk-crypto = { workspace = true, optional = true }
+veloxdesk-service = { workspace = true, optional = true }
+veloxdesk-codec = { workspace = true, optional = true }
+
+[dev-dependencies]
+veloxdesk-benches = { path = "../benches" }
+
+[[test]]
+name = "transport_loss"
+required-features = ["net"]
+
+[[test]]
+name = "session_smoke"
+required-features = ["full"]
 
 [lints]
 workspace = true

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang libclang-dev nasm \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev \
+            libxcb-xfixes0-dev libxcb-shape0-dev libxrandr-dev libxfixes-dev libxtst-dev \
+            libxi-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libva-dev libdrm-dev libvulkan-dev mesa-vulkan-drivers \
+            libasound2-dev libpulse-dev libopus-dev \
+            libudev-dev libevdev-dev libdbus-1-dev libgtk-3-dev libxdo-dev
+
+      - name: Install NASM (Windows, openh264 asm)
+        if: runner.os == 'Windows'
+        run: choco install nasm -y --no-progress
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: pipeline smoke bench (synthetic, loopback, 3% loss)
+        run: cargo run -p veloxdesk-benches --release --locked --bin pipeline -- --synthetic --frames 300 --loss 0.03
+        continue-on-error: true

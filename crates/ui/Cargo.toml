@@ -10,6 +10,10 @@ publish = false
 [dependencies]
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+egui = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+tracing = { workspace = true }
 
 [lints]
 workspace = true

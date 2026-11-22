@@ -10,6 +10,21 @@ publish = false
 [dependencies]
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+veloxdesk-crypto = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+quinn = { workspace = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+reed-solomon-simd = "3"
+socket2 = "0.6"
+
+[dev-dependencies]
+rand = "0.9"
+parking_lot = { workspace = true }
 
 [lints]
 workspace = true

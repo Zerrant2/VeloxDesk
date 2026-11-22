@@ -11,9 +11,38 @@ publish = false
 name = "veloxdesk"
 path = "src/main.rs"
 
+[features]
+# Viewer network pipeline + `--host`. Needs transport/codec/crypto/service (M1 crates of
+# net-worker, media-worker and sys-worker).
+default = ["net"]
+net = [
+    "dep:veloxdesk-transport",
+    "dep:veloxdesk-codec",
+    "dep:veloxdesk-crypto",
+    "dep:veloxdesk-service",
+    "dep:crossbeam-channel",
+]
+
 [dependencies]
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
+veloxdesk-render = { workspace = true }
+veloxdesk-ui = { workspace = true }
+veloxdesk-transport = { workspace = true, optional = true }
+veloxdesk-codec = { workspace = true, optional = true }
+veloxdesk-crypto = { workspace = true, optional = true }
+veloxdesk-service = { workspace = true, optional = true }
+winit = "0.30.13"
+egui = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true, optional = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
 
 [lints]
 workspace = true

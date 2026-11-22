@@ -8,8 +8,15 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+tracing.workspace = true
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
 
 [lints]
 workspace = true
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(target_os="linux")'.dependencies]
+libc = "0.2"
