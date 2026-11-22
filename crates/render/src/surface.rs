@@ -157,7 +157,9 @@ impl VideoSurface {
         let present_mode = choose_present_mode(opts.present_mode, &caps.present_modes);
         config.format = format;
         config.present_mode = to_wgpu(present_mode);
-        config.desired_maximum_frame_latency = 1;
+        // Latency 2 keeps DXGI FLIP_DISCARD non-blocking during Windows DWM window drag/resize
+        // while preserving single-frame pacing for incoming video frames.
+        config.desired_maximum_frame_latency = 2;
         config.alpha_mode = wgpu::CompositeAlphaMode::Auto;
         config.view_formats = vec![];
         surface.configure(&device, &config);

@@ -1317,8 +1317,11 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(surface) = self.surface.as_mut() else { return };
+        // Moving the window on Windows/macOS/Wayland is composited by the OS DWM without
+        // invalidating pixels; requesting a GPU redraw on every `Moved` event stalls drag loops.
+        let is_move = matches!(event, WindowEvent::Moved(_));
         let response = surface.on_window_event(&event);
-        if response.repaint {
+        if response.repaint && !is_move {
             surface.window().request_redraw();
         }
         let egui_wants_pointer = surface.egui_ctx().egui_wants_pointer_input();
