@@ -20,15 +20,18 @@ use veloxdesk_render::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use veloxdesk_render::{RenderBreakdown, SurfaceOptions, VideoSurface, egui};
 use veloxdesk_ui::{
-    ConnectAction, ConnectScreen, ConnectTarget, FileAction, FileManagerWindow, Mode, PasswordAction, PasswordPrompt,
-    Present, SessionInfo, SessionToolbar, Settings, TerminalAction, TerminalWindow, ToolbarAction, TunnelAction,
-    TunnelSpec, TunnelsWindow, format_device_id, parse_rendezvous_addr, parse_target, settings_window,
+    AcceptDecision, AcceptPrompt, ConnectAction, ConnectScreen, ConnectTarget, FileAction, FileManagerWindow, Mode,
+    PasswordAction, PasswordPrompt, Present, SessionInfo, SessionToolbar, Settings, TerminalAction, TerminalWindow,
+    ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, format_device_id, parse_rendezvous_addr, parse_target,
+    settings_window,
 };
 
+use crate::embedded_host::{EmbeddedHostEvent, EmbeddedHostHandle};
 use crate::input::{self, RelativeAccum, WheelAccum};
 use crate::latest::Latest;
 use crate::session::{ConnectOptions, SessionCommand, SessionEvent, SessionHandle};
 use crate::stats::PresentedFrame;
+use crate::tray::{TrayAction, TrayHandle};
 
 /// Events delivered to the winit loop from other threads.
 #[derive(Debug)]
@@ -37,6 +40,10 @@ pub enum UserEvent {
     Frame,
     #[cfg_attr(not(feature = "net"), allow(dead_code))]
     Session(SessionEvent),
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    Host(EmbeddedHostEvent),
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Tray(TrayAction),
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +106,7 @@ enum UiAction {
     Connect(ConnectAction),
     Toolbar(ToolbarAction),
     Password(PasswordAction),
+    Accept(AcceptDecision),
     File(FileAction),
     Terminal(TerminalAction),
     Tunnel(TunnelAction),
@@ -115,6 +123,10 @@ pub struct App {
     connect: ConnectScreen,
     toolbar: SessionToolbar,
     password_prompt: Option<PasswordPrompt>,
+    accept_prompt: Option<(AcceptPrompt, tokio::sync::oneshot::Sender<AcceptDecision>)>,
+    embedded_host: Option<EmbeddedHostHandle>,
+    host_bind_label: String,
+    tray: Option<TrayHandle>,
     files: FileManagerWindow,
     terminal: TerminalWindow,
     tunnels: TunnelsWindow,
@@ -151,6 +163,10 @@ impl App {
             connect,
             toolbar: SessionToolbar::default(),
             password_prompt: None,
+            accept_prompt: None,
+            embedded_host: None,
+            host_bind_label: String::new(),
+            tray: None,
             files: FileManagerWindow::default(),
             terminal: TerminalWindow::default(),
             tunnels: TunnelsWindow::default(),
@@ -167,6 +183,56 @@ impl App {
             settings,
             exit_code: 0,
         }
+    }
+
+    fn copy_to_clipboard(&self, text: &str) {
+        if let Some(s) = &self.surface {
+            s.egui_ctx().copy_text(text.to_string());
+        }
+        #[cfg(feature = "net")]
+        {
+            if let Ok(mut cb) = veloxdesk_clipboard::create_system_clipboard()
+                && let Err(e) = cb.write(&veloxdesk_clipboard::ClipboardItem::Text(text.to_string()))
+            {
+                tracing::debug!("system clipboard write failed: {e}");
+            }
+        }
+    }
+
+    fn start_embedded_host(&mut self) {
+        if self.embedded_host.is_some() {
+            return;
+        }
+        let rendezvous = match self.resolve_rendezvous() {
+            Ok(r) => r,
+            Err(e) => {
+                self.connect.host_error = Some(format!("Invalid rendezvous server: {e}"));
+                return;
+            }
+        };
+        self.connect.host_error = None;
+        self.connect.host_status = "Starting…".into();
+        match EmbeddedHostHandle::start(rendezvous, self.settings.require_accept, self.proxy.clone()) {
+            Ok(h) => {
+                self.embedded_host = Some(h);
+            }
+            Err(e) => {
+                self.connect.host_running = false;
+                self.connect.host_status = "Stopped".into();
+                self.connect.host_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    fn stop_embedded_host(&mut self) {
+        if let Some(h) = self.embedded_host.take() {
+            h.stop();
+        }
+        self.accept_prompt = None;
+        self.connect.host_running = false;
+        self.connect.active_sessions = 0;
+        self.connect.host_otp.clear();
+        self.connect.host_status = "Stopped".into();
     }
 
     fn save_settings(&self) {
@@ -517,6 +583,7 @@ impl App {
         let connect = &mut self.connect;
         let toolbar = &mut self.toolbar;
         let password_prompt = &mut self.password_prompt;
+        let accept_prompt = &mut self.accept_prompt;
         let files = &mut self.files;
         let terminal = &mut self.terminal;
         let tunnels = &mut self.tunnels;
@@ -584,6 +651,11 @@ impl App {
             {
                 actions.push(UiAction::Password(a));
             }
+            if let Some((ap, _)) = accept_prompt.as_mut()
+                && let Some(dec) = ap.show(ui.ctx())
+            {
+                actions.push(UiAction::Accept(dec));
+            }
             for a in settings_window(ui.ctx(), settings_open, settings) {
                 actions.push(UiAction::Toolbar(a));
             }
@@ -600,6 +672,31 @@ impl App {
             match a {
                 UiAction::Connect(ConnectAction::Connect { address, target }) => self.start_connect(address, target),
                 UiAction::Connect(ConnectAction::OpenSettings) => self.settings_open = true,
+                UiAction::Connect(ConnectAction::ToggleHost(enable)) => {
+                    if enable {
+                        self.start_embedded_host();
+                    } else {
+                        self.stop_embedded_host();
+                    }
+                    if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
+                }
+                UiAction::Connect(ConnectAction::RotateOtp) => {
+                    if let Some(h) = &self.embedded_host {
+                        h.rotate_otp();
+                    }
+                }
+                UiAction::Connect(ConnectAction::CopyText(text)) => {
+                    self.copy_to_clipboard(&text);
+                }
+                UiAction::Connect(ConnectAction::SetRequireAccept(req)) => {
+                    self.settings.require_accept = req;
+                    self.save_settings();
+                    if let Some(h) = &self.embedded_host {
+                        h.set_require_accept(req);
+                    }
+                }
                 UiAction::Toolbar(t) => self.apply_toolbar(t, event_loop),
                 UiAction::Password(PasswordAction::Submit(pw)) => {
                     self.password_prompt = None;
@@ -614,6 +711,14 @@ impl App {
                         handle.send(SessionCommand::CancelAuth);
                     }
                     self.end_session(None);
+                }
+                UiAction::Accept(dec) => {
+                    if let Some((_, reply)) = self.accept_prompt.take() {
+                        let _ = reply.send(dec);
+                    }
+                    if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
                 }
                 UiAction::File(fa) => {
                     if let State::Session { handle, .. } = &self.state {
@@ -879,6 +984,109 @@ impl App {
         }
     }
 
+    fn handle_host_event(&mut self, ev: EmbeddedHostEvent) {
+        match ev {
+            EmbeddedHostEvent::Listening { bind, device_id, otp, rendezvous } => {
+                self.connect.host_running = true;
+                self.connect.host_error = None;
+                if !device_id.is_empty() {
+                    self.connect.device_id = device_id;
+                }
+                if let Some(o) = otp {
+                    self.connect.host_otp = o;
+                }
+                let label = match rendezvous {
+                    Some(rdv) => format!("Listening on :{} · Rendezvous {}", bind.port(), rdv),
+                    None => format!("Listening on :{}", bind.port()),
+                };
+                self.host_bind_label = label.clone();
+                if self.connect.active_sessions == 0 {
+                    self.connect.host_status = label;
+                }
+            }
+            EmbeddedHostEvent::SessionStarted { peer_device_id } => {
+                self.connect.active_sessions += 1;
+                let peer = if peer_device_id.is_empty() {
+                    "viewer".to_string()
+                } else {
+                    format_device_id(&peer_device_id)
+                };
+                self.connect.host_status = format!("Connected: {peer}");
+            }
+            EmbeddedHostEvent::SessionEnded { peer_device_id, reason } => {
+                tracing::info!(peer = %peer_device_id, %reason, "embedded host session ended");
+                self.connect.active_sessions = self.connect.active_sessions.saturating_sub(1);
+                if self.connect.active_sessions == 0 && self.connect.host_running {
+                    self.connect.host_status = if self.host_bind_label.is_empty() {
+                        "Listening".into()
+                    } else {
+                        self.host_bind_label.clone()
+                    };
+                }
+            }
+            EmbeddedHostEvent::OtpRotated { otp } => {
+                self.connect.host_otp = otp;
+            }
+            EmbeddedHostEvent::ApprovalRequested { info, default_permissions, reply } => {
+                self.accept_prompt = Some((AcceptPrompt::new(info, default_permissions), reply));
+                if let Some(s) = &self.surface {
+                    let w = s.window();
+                    w.set_minimized(false);
+                    w.focus_window();
+                }
+            }
+            EmbeddedHostEvent::Stopped => {
+                self.connect.host_running = false;
+                self.connect.active_sessions = 0;
+                self.connect.host_otp.clear();
+                self.connect.host_status = "Stopped".into();
+                self.accept_prompt = None;
+            }
+            EmbeddedHostEvent::Error(e) => {
+                tracing::warn!("embedded host error: {e}");
+                self.connect.host_running = false;
+                self.connect.host_status = "Stopped".into();
+                self.connect.host_error = Some(e);
+                self.embedded_host = None;
+            }
+        }
+        if let Some(s) = &self.surface {
+            s.window().request_redraw();
+        }
+    }
+
+    fn handle_tray_action(&mut self, action: TrayAction, event_loop: &ActiveEventLoop) {
+        match action {
+            TrayAction::ShowWindow => {
+                if let Some(s) = &self.surface {
+                    let w = s.window();
+                    w.set_minimized(false);
+                    w.set_visible(true);
+                    w.focus_window();
+                    w.request_redraw();
+                }
+            }
+            TrayAction::CopyDeviceId => {
+                if !self.connect.device_id.is_empty() {
+                    let formatted = format_device_id(&self.connect.device_id);
+                    self.copy_to_clipboard(&formatted);
+                    self.connect.copied_notice = Some("Device ID copied".into());
+                    if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
+                }
+            }
+            TrayAction::RotateOtp => {
+                if let Some(h) = &self.embedded_host {
+                    h.rotate_otp();
+                }
+            }
+            TrayAction::Quit => {
+                event_loop.exit();
+            }
+        }
+    }
+
     fn on_session_started(&mut self, handle: &SessionHandle, cfg: &SessionConfig) {
         let mut hud = handle.shared.hud.lock();
         if let Some(v) = &cfg.video {
@@ -1030,7 +1238,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         match launch {
-            Launch::Gui => {}
+            Launch::Gui => {
+                let tooltip = if self.connect.device_id.is_empty() {
+                    "VeloxDesk".to_string()
+                } else {
+                    format!("VeloxDesk — ID {}", format_device_id(&self.connect.device_id))
+                };
+                self.tray = TrayHandle::spawn(tooltip, self.proxy.clone());
+                #[cfg(feature = "net")]
+                self.start_embedded_host();
+            }
             Launch::Connect(addr) => match parse_target(&addr) {
                 Ok(target) => self.start_connect(addr, target),
                 Err(e) => self.connect.error = Some(e),
@@ -1048,6 +1265,8 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Frame => self.on_frame_event(event_loop),
             UserEvent::Session(ev) => self.handle_session_event(ev),
+            UserEvent::Host(ev) => self.handle_host_event(ev),
+            UserEvent::Tray(action) => self.handle_tray_action(action, event_loop),
         }
     }
 
@@ -1142,6 +1361,9 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.release_all_keys();
+        self.accept_prompt = None;
+        self.stop_embedded_host();
+        self.tray = None;
         if let State::Session { handle, .. } = &self.state {
             let hud = handle.shared.hud.lock();
             let (r, t) = (&hud.render_samples, &hud.total_samples);

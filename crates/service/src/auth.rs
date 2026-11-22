@@ -211,14 +211,18 @@ impl HostAuthConfig {
             && !self.auto_otp
             && !self.require_accept
             && self.trusted_peers.is_empty()
-            && self.shared_state.is_none()
+            && self.shared_state.as_ref().is_none_or(|s| s.is_open())
     }
 }
+
+type OtpRotatedCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 struct AuthInner {
     current_otp: Option<String>,
     trusted_peers: Vec<TrustedPeer>,
     permanent_password_hash: Option<PasswordHash>,
+    require_accept_override: Option<bool>,
+    on_otp_rotated: Option<OtpRotatedCallback>,
 }
 
 /// Shared mutable authentication state across sessions on a host (rotating OTP and runtime
@@ -238,12 +242,38 @@ impl HostAuthState {
                 current_otp,
                 trusted_peers: cfg.trusted_peers.clone(),
                 permanent_password_hash: cfg.permanent_password_hash.clone(),
+                require_accept_override: None,
+                on_otp_rotated: None,
             }),
         })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AuthInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// True when no dynamic OTP, permanent password, trusted peer, or accept requirement is set.
+    pub fn is_open(&self) -> bool {
+        let g = self.lock();
+        g.current_otp.is_none()
+            && g.trusted_peers.is_empty()
+            && g.permanent_password_hash.is_none()
+            && g.require_accept_override != Some(true)
+    }
+
+    /// Dynamically override whether interactive approval is required for new connections.
+    pub fn set_require_accept(&self, require: bool) {
+        self.lock().require_accept_override = Some(require);
+    }
+
+    /// Effective `require_accept` flag, honoring any runtime override set via [`Self::set_require_accept`].
+    pub fn effective_require_accept(&self, default: bool) -> bool {
+        self.lock().require_accept_override.unwrap_or(default)
+    }
+
+    /// Install an optional callback invoked whenever the OTP rotates (manually or after login).
+    pub(crate) fn set_on_otp_rotated(&self, cb: Option<OtpRotatedCallback>) {
+        self.lock().on_otp_rotated = cb;
     }
 
     /// Currently active one-time password, if OTP login is enabled.
@@ -253,9 +283,15 @@ impl HostAuthState {
 
     /// Generate and install a fresh OTP guaranteed to differ from the previous one.
     pub fn rotate_otp(&self) -> String {
-        let mut g = self.lock();
-        let next = fresh_otp(g.current_otp.as_deref());
-        g.current_otp = Some(next.clone());
+        let (next, cb) = {
+            let mut g = self.lock();
+            let next = fresh_otp(g.current_otp.as_deref());
+            g.current_otp = Some(next.clone());
+            (next, g.on_otp_rotated.clone())
+        };
+        if let Some(cb) = cb {
+            cb(next.clone());
+        }
         next
     }
 
@@ -263,12 +299,18 @@ impl HostAuthState {
     /// fresh OTP to prevent replay. Returns `Some(new_otp)` on success, or `None` if `matched`
     /// was already consumed/rotated by another session.
     pub fn consume_and_rotate_otp(&self, matched: &str) -> Option<String> {
-        let mut g = self.lock();
-        if g.current_otp.as_deref() != Some(matched) {
-            return None;
+        let (next, cb) = {
+            let mut g = self.lock();
+            if g.current_otp.as_deref() != Some(matched) {
+                return None;
+            }
+            let next = fresh_otp(Some(matched));
+            g.current_otp = Some(next.clone());
+            (next, g.on_otp_rotated.clone())
+        };
+        if let Some(cb) = cb {
+            cb(next.clone());
         }
-        let next = fresh_otp(Some(matched));
-        g.current_otp = Some(next.clone());
         Some(next)
     }
 
@@ -411,8 +453,9 @@ pub(crate) async fn authenticate(
     if active_otp.is_some() {
         methods.push(AuthMethod::OneTimePassword as i32);
     }
+    let require_accept = state.effective_require_accept(cfg.auth.require_accept);
     let allow_method_none =
-        cfg.auth.allow_no_auth || (cfg.auth.require_accept && perm_hash.is_none() && active_otp.is_none());
+        cfg.auth.allow_no_auth || (require_accept && perm_hash.is_none() && active_otp.is_none());
     if allow_method_none {
         methods.push(AuthMethod::None as i32);
     }
@@ -538,7 +581,7 @@ pub(crate) async fn authenticate(
         p
     } else {
         let default_permissions = default_session_permissions(cfg);
-        if cfg.auth.require_accept {
+        if require_accept {
             let Some(handler) = &cfg.auth.approval_handler else {
                 return Err(
                     reject_auth(writer, ch, "host requires approval but no approval handler is configured").await,

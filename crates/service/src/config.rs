@@ -14,6 +14,7 @@ use veloxdesk_protocol::control::{ChromaFormat, VideoCodec};
 
 use crate::audio::frame_ms_to_us;
 use crate::auth::{HostAuthConfig, TrustedPeer, encode_hex_pubkey, parse_hex_pubkey};
+use crate::ipc::DEFAULT_IPC_PORT;
 
 /// Everything the host pipeline needs. Construct with [`HostConfig::default`],
 /// [`HostConfig::from_toml_file`] or [`HostArgs::resolve`].
@@ -66,6 +67,9 @@ pub struct HostConfig {
     pub allow_mic: bool,
     /// Portable mode: store config and device identity next to the executable instead of AppData.
     pub portable: bool,
+    /// Local loopback TCP port for daemon/GUI IPC (`Some(DEFAULT_IPC_PORT)` by default,
+    /// `Some(0)` for an ephemeral port, `None` to disable IPC).
+    pub ipc_port: Option<u16>,
 }
 
 /// File paths resolved next to the VeloxDesk executable in `--portable` mode.
@@ -116,6 +120,7 @@ impl Default for HostConfig {
             audio_frame_ms: 5.0,
             allow_mic: false,
             portable: false,
+            ipc_port: Some(DEFAULT_IPC_PORT),
         }
     }
 }
@@ -167,6 +172,7 @@ pub struct HostConfigFile {
     pub audio_bitrate_kbps: Option<u32>,
     pub audio_frame_ms: Option<f32>,
     pub allow_mic: Option<bool>,
+    pub ipc_port: Option<u16>,
 }
 
 /// Parse a chroma format name: `yuv420`/`420` or `yuv444`/`444`.
@@ -230,6 +236,9 @@ impl HostConfig {
         }
         if let Some(r) = file.rendezvous {
             self.rendezvous = Some(r);
+        }
+        if let Some(p) = file.ipc_port {
+            self.ipc_port = Some(p);
         }
         if let Some(phc) = &file.permanent_password_hash {
             self.auth.permanent_password_hash = Some(
@@ -315,6 +324,7 @@ impl HostConfig {
             audio_bitrate_kbps: Some(self.audio_bitrate_kbps),
             audio_frame_ms: Some(self.audio_frame_ms),
             allow_mic: Some(self.allow_mic),
+            ipc_port: self.ipc_port,
         };
         toml::to_string(&f).unwrap_or_default()
     }
@@ -429,6 +439,12 @@ pub struct HostArgs {
     /// Portable mode: read/write config and identity next to the executable instead of AppData.
     #[arg(long)]
     pub portable: bool,
+    /// Local loopback TCP port for daemon IPC (default: 21119).
+    #[arg(long, value_name = "PORT")]
+    pub ipc_port: Option<u16>,
+    /// Disable the local loopback IPC server.
+    #[arg(long)]
+    pub no_ipc: bool,
 }
 
 impl HostArgs {
@@ -498,6 +514,12 @@ impl HostArgs {
         }
         if self.allow_mic {
             cfg.allow_mic = true;
+        }
+        if let Some(port) = self.ipc_port {
+            cfg.ipc_port = Some(port);
+        }
+        if self.no_ipc {
+            cfg.ipc_port = None;
         }
         if let Some(phc) = &self.password_hash {
             cfg.auth.permanent_password_hash = Some(

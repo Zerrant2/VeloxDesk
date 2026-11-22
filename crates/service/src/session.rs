@@ -1,7 +1,7 @@
 //! One viewer session on the host: control handshake, video pipeline, input, feedback.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
@@ -27,6 +27,7 @@ use crate::audio::{AudioParams, AudioPipeline, MicHandle, MicPlayback, frame_ms_
 use crate::auth::CLOSE_AUTH_FAILED;
 use crate::backends::{HostBackends, RateController, RateDecision};
 use crate::config::HostConfig;
+use crate::host::HostStatusEvent;
 use crate::inject::{InputHandle, InputThread};
 use crate::video::{VideoEvent, VideoParams, VideoPipeline};
 
@@ -165,12 +166,63 @@ pub async fn run_session(
     run_session_until(ch, cfg, backends, rx).await
 }
 
+/// Internal lifecycle hooks supplied by [`crate::host::RunningHost`] / `serve_listener`.
+#[derive(Clone, Default)]
+pub(crate) struct SessionHooks {
+    pub active_sessions: Option<Arc<AtomicUsize>>,
+    pub on_event: Option<Arc<dyn Fn(HostStatusEvent) + Send + Sync>>,
+}
+
+struct ActiveSessionGuard {
+    hooks: SessionHooks,
+    peer_device_id: String,
+    reason: Option<String>,
+}
+
+impl ActiveSessionGuard {
+    fn enter(hooks: SessionHooks, peer_device_id: String) -> Self {
+        if let Some(counter) = &hooks.active_sessions {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(cb) = &hooks.on_event {
+            cb(HostStatusEvent::SessionStarted { peer_device_id: peer_device_id.clone() });
+        }
+        Self { hooks, peer_device_id, reason: None }
+    }
+
+    fn set_reason(&mut self, reason: String) {
+        self.reason = Some(reason);
+    }
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.hooks.active_sessions {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+        if let Some(cb) = &self.hooks.on_event {
+            let reason = self.reason.take().unwrap_or_else(|| "session ended".to_string());
+            cb(HostStatusEvent::SessionEnded { peer_device_id: self.peer_device_id.clone(), reason });
+        }
+    }
+}
+
 /// Like [`run_session`], plus a shutdown signal that triggers a clean `Close` and teardown.
 pub async fn run_session_until(
     ch: Arc<dyn TransportChannel>,
     cfg: Arc<HostConfig>,
     backends: HostBackends,
+    stop: watch::Receiver<bool>,
+) -> veloxdesk_core_traits::Result<SessionSummary> {
+    run_session_with_hooks(ch, cfg, backends, stop, SessionHooks::default()).await
+}
+
+pub(crate) async fn run_session_with_hooks(
+    ch: Arc<dyn TransportChannel>,
+    cfg: Arc<HostConfig>,
+    backends: HostBackends,
     mut stop: watch::Receiver<bool>,
+    hooks: SessionHooks,
 ) -> veloxdesk_core_traits::Result<SessionSummary> {
     let sid = session_id();
     // 1. control stream + Hello
@@ -198,6 +250,7 @@ pub async fn run_session_until(
     // 2. Authentication & authorization (M1 open mode fast-path or M2 challenge-response).
     let auth = crate::auth::authenticate(sid, &hello, &ch, &cfg, &mut writer, &mut reader).await?;
     summary.peer_device_id = auth.peer_device_id;
+    let mut active_guard = ActiveSessionGuard::enter(hooks, summary.peer_device_id.clone());
     let allow_input = auth.permissions.input && cfg.allow_input;
     let viewer_accepts_opus =
         hello.audio_codecs.is_empty() || hello.audio_codecs.contains(&(AudioCodecId::Opus as i32));
@@ -405,6 +458,7 @@ pub async fn run_session_until(
     tracing::info!(session = sid, frames = summary.frames_sent, dropped = pipeline.dropped_frames(), "session end: {reason}");
     summary.frames_dropped = pipeline.dropped_frames();
     summary.close_reason = reason;
+    active_guard.set_reason(summary.close_reason.clone());
 
     // 7. teardown: restore privacy mode, signal M4 streams, stop input readers, flush control.
     drop(privacy_guard);
@@ -417,6 +471,7 @@ pub async fn run_session_until(
     let input_stats = shutdown(pipeline, input, audio, mic).await;
     summary.input_events = input_stats;
     ch.close(CLOSE_NORMAL, "session ended");
+    drop(active_guard);
     Ok(summary)
 }
 

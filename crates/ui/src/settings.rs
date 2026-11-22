@@ -167,6 +167,8 @@ pub struct Settings {
     pub mic_enabled: bool,
     /// Synchronize clipboard (text, images, file lists) with the remote host.
     pub clipboard_sync: bool,
+    /// Require interactive Accept/Reject approval dialog for incoming connections to this desk.
+    pub require_accept: bool,
 }
 
 impl Default for Settings {
@@ -187,6 +189,7 @@ impl Default for Settings {
             audio_enabled: true,
             mic_enabled: false,
             clipboard_sync: true,
+            require_accept: true,
         }
     }
 }

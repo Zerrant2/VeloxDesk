@@ -4159,6 +4159,7 @@ dependencies = [
  "veloxdesk-tunnel",
  "veloxdesk-ui",
  "windows",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

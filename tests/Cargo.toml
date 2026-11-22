@@ -61,5 +61,9 @@ required-features = ["full"]
 name = "m4_rustdesk_parity"
 required-features = ["full"]
 
+[[test]]
+name = "m5_unified_host"
+required-features = ["full"]
+
 [lints]
 workspace = true

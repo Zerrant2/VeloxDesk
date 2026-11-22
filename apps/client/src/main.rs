@@ -1,11 +1,13 @@
 //! VeloxDesk client and host application (`veloxdesk`).
 
 mod app;
+mod embedded_host;
 mod gamepad;
 mod input;
 mod latest;
 mod session;
 mod stats;
+mod tray;
 mod viewer;
 
 use std::path::PathBuf;
@@ -258,6 +260,7 @@ fn run_host_cli(
     mut args: veloxdesk_service::HostArgs,
     rendezvous: Option<String>,
     password: Option<String>,
+    service_run: bool,
 ) -> anyhow::Result<()> {
     if let Some(rdv) = rendezvous {
         args.rendezvous = Some(veloxdesk_ui::parse_rendezvous_addr(&rdv).map_err(anyhow::Error::msg)?);
@@ -278,6 +281,29 @@ fn run_host_cli(
     }
     if let Some(rdv) = cfg.rendezvous {
         println!("  rendezvous: {rdv}");
+    }
+    if service_run {
+        veloxdesk_service::daemon::run_service_or_console(move |stop_rx| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(veloxdesk_core_traits::CoreError::Io)?;
+            rt.block_on(async move {
+                let running = veloxdesk_service::RunningHost::start(
+                    cfg,
+                    id,
+                    veloxdesk_service::HostBackends::system(),
+                    None,
+                )
+                .await?;
+                veloxdesk_service::daemon::wait_for_shutdown(stop_rx).await;
+                running.stop();
+                running.join().await?;
+                Ok(())
+            })
+        })
+        .map_err(anyhow::Error::from)?;
+        return Ok(());
     }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(veloxdesk_service::run_host(cfg, id))?;
@@ -327,7 +353,7 @@ fn main() -> ExitCode {
 
     if cli.host || cli.service_run {
         #[cfg(feature = "net")]
-        let res = run_host_cli(cli.host_args, cli.rendezvous, cli.password);
+        let res = run_host_cli(cli.host_args, cli.rendezvous, cli.password, cli.service_run);
         #[cfg(not(feature = "net"))]
         let res = run_host_cli();
         return exit_from_result("host error", res);

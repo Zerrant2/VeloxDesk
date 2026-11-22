@@ -1,13 +1,15 @@
 //! Host server: QUIC listener, session admission (`max_sessions`), graceful shutdown,
-//! and wiring to the real `veloxdesk-transport` / `veloxdesk-capture` / `veloxdesk-codec` /
-//! `veloxdesk-input` crates.
+//! embeddable [`RunningHost`] handle, local IPC integration, and wiring to the real
+//! `veloxdesk-transport` / `veloxdesk-capture` / `veloxdesk-codec` / `veloxdesk-input` crates.
 
 use std::future::Future;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, watch};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use veloxdesk_core_traits::video::EncodedPacket;
 use veloxdesk_core_traits::{CoreError, Result, Timestamp, TransportChannel};
 use veloxdesk_crypto::DeviceIdentity;
@@ -17,7 +19,34 @@ use veloxdesk_transport::{AbrController, Listener, P2pListener, QuicChannel, Vid
 use crate::auth::HostAuthState;
 use crate::backends::{EncoderFactory, HostBackends, RateController, RateDecision, VideoSink};
 use crate::config::HostConfig;
-use crate::session::{CLOSE_BUSY, reject, run_session_until};
+use crate::daemon::detect_desktop;
+use crate::ipc::{IpcRequest, IpcResponse, IpcServer};
+use crate::session::{CLOSE_BUSY, SessionHooks, reject, run_session_with_hooks};
+
+/// Lifecycle events emitted by [`RunningHost`] (consumed by GUI, tray, or daemon observers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostStatusEvent {
+    Listening {
+        bind: SocketAddr,
+        device_id: String,
+        otp: Option<String>,
+        rendezvous: Option<SocketAddr>,
+    },
+    SessionStarted {
+        peer_device_id: String,
+    },
+    SessionEnded {
+        peer_device_id: String,
+        reason: String,
+    },
+    OtpRotated {
+        otp: String,
+    },
+    Error(String),
+}
+
+/// Optional status callback passed to [`RunningHost::start`].
+pub type HostEventCallback = Arc<dyn Fn(HostStatusEvent) + Send + Sync>;
 
 /// Adapts [`veloxdesk_transport::VideoSender`] to [`VideoSink`].
 pub struct TransportVideoSink(pub VideoSender);
@@ -80,6 +109,13 @@ enum HostListener {
 }
 
 impl HostListener {
+    fn local_addr(&self) -> SocketAddr {
+        match self {
+            Self::Direct(l) => l.local_addr(),
+            Self::P2p(l) => l.local_addr(),
+        }
+    }
+
     async fn accept(&self) -> Result<QuicChannel> {
         match self {
             Self::Direct(l) => l.accept().await,
@@ -90,6 +126,238 @@ impl HostListener {
     fn shutdown(&self) {
         if let Self::P2p(l) = self {
             l.shutdown();
+        }
+    }
+}
+
+/// Handle to a running background VeloxDesk host (embedded in the GUI or owned by `--host`).
+///
+/// Dropping `RunningHost` automatically signals graceful shutdown.
+pub struct RunningHost {
+    local_addr: SocketAddr,
+    ipc_addr: Option<SocketAddr>,
+    device_id: String,
+    auth_state: Arc<HostAuthState>,
+    active_sessions: Arc<AtomicUsize>,
+    stop_tx: watch::Sender<bool>,
+    task: Option<JoinHandle<Result<()>>>,
+}
+
+impl RunningHost {
+    /// Start listening for incoming QUIC (or P2P/rendezvous) sessions and an optional local
+    /// loopback [`IpcServer`] in background Tokio tasks.
+    ///
+    /// Both the QUIC listener and (if configured and available) local IPC socket are bound
+    /// before this future resolves, so [`Self::local_addr`] and [`Self::ipc_addr`] are valid
+    /// immediately. If the configured `cfg.ipc_port` is busy, a warning is logged and the host
+    /// continues serving QUIC with `ipc_addr() == None`.
+    pub async fn start(
+        mut cfg: HostConfig,
+        id: DeviceIdentity,
+        backends: HostBackends,
+        on_event: Option<HostEventCallback>,
+    ) -> Result<Self> {
+        cfg.validate().map_err(|e| CoreError::invalid(e.to_string()))?;
+        cfg.auth.host_public_key.get_or_insert_with(|| id.public_key());
+
+        let auth_state = match cfg.auth.shared_state.clone() {
+            Some(s) => s,
+            None => {
+                let s = HostAuthState::from_config(&cfg.auth);
+                cfg.auth.shared_state = Some(s.clone());
+                s
+            }
+        };
+        if let Some(cb) = &on_event {
+            let cb = cb.clone();
+            auth_state.set_on_otp_rotated(Some(Arc::new(move |otp| {
+                cb(HostStatusEvent::OtpRotated { otp });
+            })));
+        }
+
+        let device_id = id.device_id();
+        let listener = if let Some(rendezvous) = cfg.rendezvous {
+            let l = P2pListener::bind(cfg.bind, Some(rendezvous), &id).await?;
+            tracing::info!(
+                device_id = %device_id,
+                addr = %l.local_addr(),
+                %rendezvous,
+                max_fps = cfg.max_fps,
+                bitrate_kbps = cfg.bitrate_kbps,
+                codec = ?cfg.codec,
+                prefer_hw = cfg.prefer_hw,
+                "veloxdesk host listening (P2P + direct + relay)"
+            );
+            HostListener::P2p(l)
+        } else {
+            let l = veloxdesk_transport::listen(cfg.bind, &id).await?;
+            tracing::info!(
+                device_id = %device_id,
+                addr = %l.local_addr(),
+                max_fps = cfg.max_fps,
+                bitrate_kbps = cfg.bitrate_kbps,
+                codec = ?cfg.codec,
+                prefer_hw = cfg.prefer_hw,
+                "veloxdesk host listening"
+            );
+            HostListener::Direct(l)
+        };
+        let local_addr = listener.local_addr();
+        let active_sessions = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (disconnect_tx, disconnect_rx) = watch::channel(0u64);
+
+        let (ipc_addr, ipc_task) = if let Some(port) = cfg.ipc_port {
+            let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            let dev_id = device_id.clone();
+            let auth_c = auth_state.clone();
+            let active_c = active_sessions.clone();
+            let disc_c = disconnect_tx.clone();
+            let stop_c = stop_tx.clone();
+            let handler = Arc::new(move |req: IpcRequest| match req {
+                IpcRequest::Status => IpcResponse::Status {
+                    device_id: dev_id.clone(),
+                    active_otp: auth_c.current_otp(),
+                    active_sessions: active_c.load(Ordering::Relaxed),
+                    desktop: detect_desktop().to_string(),
+                },
+                IpcRequest::RotateOtp => IpcResponse::Otp { otp: auth_c.rotate_otp() },
+                IpcRequest::DisconnectAll => {
+                    disc_c.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                    IpcResponse::Ok { message: "disconnecting active sessions".into() }
+                }
+                IpcRequest::Shutdown => {
+                    let _ = stop_c.send(true);
+                    IpcResponse::Ok { message: "shutting down".into() }
+                }
+            });
+            match IpcServer::bind(bind_addr, handler).await {
+                Ok(srv) => {
+                    let addr = srv.local_addr();
+                    tracing::info!(addr = %addr, "veloxdesk local IPC listening");
+                    let rx = stop_rx.clone();
+                    let handle = tokio::spawn(async move {
+                        if let Err(e) = srv.run_until(rx).await {
+                            tracing::warn!("local IPC server exited with error: {e}");
+                        }
+                    });
+                    (Some(addr), Some(handle))
+                }
+                Err(e) => {
+                    tracing::warn!(port, "local IPC bind failed (continuing without IPC): {e}");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        let initial_otp = auth_state.current_otp();
+        if let Some(otp) = &initial_otp {
+            tracing::info!(otp = %otp, "veloxdesk host one-time password active");
+        }
+        if let Some(cb) = &on_event {
+            cb(HostStatusEvent::Listening {
+                bind: local_addr,
+                device_id: device_id.clone(),
+                otp: initial_otp,
+                rendezvous: cfg.rendezvous,
+            });
+        }
+
+        let hooks = SessionHooks {
+            active_sessions: Some(active_sessions.clone()),
+            on_event: on_event.clone(),
+        };
+        let stop_tx_done = stop_tx.clone();
+        let mut accept_stop = stop_rx;
+        let task = tokio::spawn(async move {
+            let res = serve_listener_core(
+                listener,
+                cfg,
+                backends,
+                wait_watch_true(&mut accept_stop),
+                disconnect_rx,
+                hooks,
+            )
+            .await;
+            let _ = stop_tx_done.send(true);
+            if let Some(ipc) = ipc_task {
+                let _ = tokio::time::timeout(Duration::from_secs(2), ipc).await;
+            }
+            if let Err(ref e) = res
+                && let Some(cb) = &on_event
+            {
+                cb(HostStatusEvent::Error(e.to_string()));
+            }
+            res
+        });
+
+        Ok(Self {
+            local_addr,
+            ipc_addr,
+            device_id,
+            auth_state,
+            active_sessions,
+            stop_tx,
+            task: Some(task),
+        })
+    }
+
+    /// Local UDP address the QUIC/P2P listener is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Local loopback TCP address of the live [`IpcServer`], if enabled and bound.
+    pub fn ipc_addr(&self) -> Option<SocketAddr> {
+        self.ipc_addr
+    }
+
+    /// 9-digit Device ID of this running host.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// Live shared authentication state (`current_otp()`, `rotate_otp()`, `trusted_peers()`,
+    /// `add_trusted_peer()`, `set_require_accept()`).
+    pub fn auth_state(&self) -> Arc<HostAuthState> {
+        self.auth_state.clone()
+    }
+
+    /// Number of currently authenticated, active viewer sessions.
+    pub fn active_sessions(&self) -> usize {
+        self.active_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Signal the host listener, active sessions, and local IPC server to shut down gracefully.
+    pub fn stop(&self) {
+        let _ = self.stop_tx.send(true);
+    }
+
+    /// Wait for the background host tasks to finish draining after [`Self::stop`] (or IPC shutdown).
+    pub async fn join(mut self) -> Result<()> {
+        if let Some(task) = self.task.take() {
+            match task.await {
+                Ok(res) => res,
+                Err(e) => Err(CoreError::platform(format!("host task panicked: {e}"))),
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for RunningHost {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+    }
+}
+
+async fn wait_watch_true(rx: &mut watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            break;
         }
     }
 }
@@ -105,7 +373,16 @@ pub async fn serve_until(
     backends: HostBackends,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    serve_listener_until(HostListener::Direct(listener), cfg, backends, shutdown).await
+    let (_disc_tx, disc_rx) = watch::channel(0u64);
+    serve_listener_core(
+        HostListener::Direct(listener),
+        cfg,
+        backends,
+        shutdown,
+        disc_rx,
+        SessionHooks::default(),
+    )
+    .await
 }
 
 /// Accept sessions on a multiplexed [`P2pListener`] (direct LAN + NAT hole-punched P2P +
@@ -116,14 +393,25 @@ pub async fn serve_p2p_until(
     backends: HostBackends,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    serve_listener_until(HostListener::P2p(listener), cfg, backends, shutdown).await
+    let (_disc_tx, disc_rx) = watch::channel(0u64);
+    serve_listener_core(
+        HostListener::P2p(listener),
+        cfg,
+        backends,
+        shutdown,
+        disc_rx,
+        SessionHooks::default(),
+    )
+    .await
 }
 
-async fn serve_listener_until(
+async fn serve_listener_core(
     listener: HostListener,
     mut cfg: HostConfig,
     backends: HostBackends,
     shutdown: impl Future<Output = ()>,
+    disconnect_rx: watch::Receiver<u64>,
+    hooks: SessionHooks,
 ) -> Result<()> {
     cfg.validate().map_err(|e| CoreError::invalid(e.to_string()))?;
     if !cfg.auth.is_open() {
@@ -164,10 +452,27 @@ async fn serve_listener_until(
                             Ok(permit) => {
                                 let cfg = cfg.clone();
                                 let backends = backends.clone();
-                                let rx = stop_rx.clone();
+                                let mut host_stop = stop_rx.clone();
+                                let mut disc = disconnect_rx.clone();
+                                let _ = disc.borrow_and_update();
+                                let hooks = hooks.clone();
                                 sessions.spawn(async move {
                                     let _permit = permit;
-                                    match run_session_until(ch, cfg, backends, rx).await {
+                                    let (sess_stop_tx, sess_stop_rx) = watch::channel(false);
+                                    let fwd = tokio::spawn(async move {
+                                        tokio::select! {
+                                            () = wait_watch_true(&mut host_stop) => {
+                                                let _ = sess_stop_tx.send(true);
+                                            }
+                                            res = disc.changed() => {
+                                                if res.is_ok() {
+                                                    let _ = sess_stop_tx.send(true);
+                                                }
+                                            }
+                                            () = sess_stop_tx.closed() => {}
+                                        }
+                                    });
+                                    match run_session_with_hooks(ch, cfg, backends, sess_stop_rx, hooks).await {
                                         Ok(s) => tracing::info!(
                                             session = s.session_id,
                                             peer = %s.peer_device_id,
@@ -179,6 +484,7 @@ async fn serve_listener_until(
                                         ),
                                         Err(e) => tracing::warn!("session error: {e}"),
                                     }
+                                    fwd.abort();
                                 });
                             }
                             Err(_) => {
@@ -212,49 +518,32 @@ async fn serve_listener_until(
     Ok(())
 }
 
-/// Listen on `cfg.bind` with `backends` until `shutdown` resolves.
+/// Listen on `cfg.bind` with `backends` (and live local IPC when `cfg.ipc_port.is_some()`)
+/// until `shutdown` resolves or an IPC `Shutdown` command is received.
 ///
 /// Uses [`P2pListener`] when `cfg.rendezvous` is set (registering the host's 9-digit Device ID
 /// and handling direct LAN, NAT hole punching, and zero-knowledge relay on one UDP socket),
 /// or a direct QUIC [`Listener`] otherwise.
 pub async fn run_host_with_backends(
-    mut cfg: HostConfig,
+    cfg: HostConfig,
     id: DeviceIdentity,
     backends: HostBackends,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
-    cfg.validate().map_err(|e| CoreError::invalid(e.to_string()))?;
-    cfg.auth.host_public_key.get_or_insert_with(|| id.public_key());
-    if let Some(rendezvous) = cfg.rendezvous {
-        let listener = P2pListener::bind(cfg.bind, Some(rendezvous), &id).await?;
-        tracing::info!(
-            device_id = %id.device_id(),
-            addr = %listener.local_addr(),
-            %rendezvous,
-            max_fps = cfg.max_fps,
-            bitrate_kbps = cfg.bitrate_kbps,
-            codec = ?cfg.codec,
-            prefer_hw = cfg.prefer_hw,
-            "veloxdesk host listening (P2P + direct + relay)"
-        );
-        serve_p2p_until(listener, cfg, backends, shutdown).await
-    } else {
-        let listener = veloxdesk_transport::listen(cfg.bind, &id).await?;
-        tracing::info!(
-            device_id = %id.device_id(),
-            addr = %listener.local_addr(),
-            max_fps = cfg.max_fps,
-            bitrate_kbps = cfg.bitrate_kbps,
-            codec = ?cfg.codec,
-            prefer_hw = cfg.prefer_hw,
-            "veloxdesk host listening"
-        );
-        serve_until(listener, cfg, backends, shutdown).await
+    let host = RunningHost::start(cfg, id, backends, None).await?;
+    let mut stop_rx = host.stop_tx.subscribe();
+    tokio::pin!(shutdown);
+    tokio::select! {
+        () = &mut shutdown => {
+            host.stop();
+        }
+        () = wait_watch_true(&mut stop_rx) => {}
     }
+    host.join().await
 }
 
-/// Start the VeloxDesk host: listen for QUIC sessions and stream capture → encode → FEC
-/// datagrams while injecting remote input.
+/// Start the VeloxDesk host: listen for QUIC sessions (plus local IPC) and stream
+/// capture → encode → FEC datagrams while injecting remote input.
 pub async fn run_host(cfg: HostConfig, id: DeviceIdentity) -> Result<()> {
     run_host_with_backends(cfg, id, HostBackends::system(), std::future::pending()).await
 }
@@ -262,7 +551,12 @@ pub async fn run_host(cfg: HostConfig, id: DeviceIdentity) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use veloxdesk_core_traits::video::{ChromaFormat, ColorSpace, EncoderConfig, PixelFormat, RateControl, VideoCodec};
+    use veloxdesk_crypto::auth::{derive_password_key, password_proof};
+    use veloxdesk_protocol::StreamKind;
+    use veloxdesk_protocol::control::{AuthMethod, AuthResponse, Hello, envelope::Msg};
+    use veloxdesk_transport::{connect, framed};
 
     #[test]
     fn system_backends_creates_encoder() {
@@ -284,5 +578,245 @@ mod tests {
         };
         let enc = (backends.encoder)(&cfg, false).expect("system SW encoder");
         assert!(enc.caps().codecs.contains(&VideoCodec::H264));
+    }
+
+    /// Minimal synthetic backends for deterministic `RunningHost` loopback tests.
+    fn synthetic_backends() -> HostBackends {
+        use bytes::Bytes;
+        use veloxdesk_core_traits::input::{DisplayGeometry, InputCaps, InputEvent, InputFeedback};
+        use veloxdesk_core_traits::video::{
+            CaptureCaps, CaptureConfig, CapturedFrame, ColorRange, Display, DisplayId, EncodeOptions, EncodedPacket,
+            EncoderCaps, EncoderUpdate, Frame, FrameData, Plane,
+        };
+        use veloxdesk_core_traits::{FrameCapture, InputInjector, VideoEncoder};
+
+        struct StubCap;
+        impl FrameCapture for StubCap {
+            fn caps(&self) -> CaptureCaps {
+                CaptureCaps { backend: "stub", formats: vec![PixelFormat::Bgra8], ..Default::default() }
+            }
+            fn displays(&self) -> Result<Vec<Display>> {
+                Ok(vec![Display {
+                    id: DisplayId("D0".into()),
+                    index: 0,
+                    name: "Stub".into(),
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 32,
+                    refresh_hz: 60,
+                    scale_factor: 1.0,
+                    primary: true,
+                    hdr: false,
+                }])
+            }
+            fn start(&mut self, _cfg: &CaptureConfig) -> Result<()> {
+                Ok(())
+            }
+            fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>> {
+                std::thread::sleep(timeout.min(Duration::from_millis(10)));
+                Ok(Some(CapturedFrame {
+                    frame: Frame {
+                        width: 64,
+                        height: 32,
+                        format: PixelFormat::Bgra8,
+                        color_space: ColorSpace::Srgb,
+                        color_range: ColorRange::Full,
+                        data: FrameData::Cpu(vec![Plane { data: Bytes::from(vec![0u8; 64 * 32 * 4]), stride: 256 }]),
+                        capture_ts: Timestamp::now(),
+                    },
+                    dirty_rects: Vec::new(),
+                    cursor: None,
+                    capture_us: 10,
+                    convert_us: 0,
+                }))
+            }
+            fn stop(&mut self) {}
+        }
+
+        struct StubEnc(EncoderConfig, u32);
+        impl VideoEncoder for StubEnc {
+            fn caps(&self) -> EncoderCaps {
+                EncoderCaps { name: "stub", codecs: vec![VideoCodec::H264], ..Default::default() }
+            }
+            fn config(&self) -> &EncoderConfig {
+                &self.0
+            }
+            fn encode(&mut self, frame: &Frame, opts: EncodeOptions) -> Result<Option<EncodedPacket>> {
+                self.1 += 1;
+                Ok(Some(EncodedPacket {
+                    data: Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88]),
+                    codec: self.0.codec,
+                    keyframe: opts.force_keyframe || self.1 == 1,
+                    recovery_point: false,
+                    width: frame.width,
+                    height: frame.height,
+                    capture_ts: frame.capture_ts,
+                    frame_id: self.1,
+                    encode_us: 10,
+                    convert_us: 0,
+                }))
+            }
+            fn update(&mut self, _u: EncoderUpdate) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        struct StubInj;
+        impl InputInjector for StubInj {
+            fn caps(&self) -> InputCaps {
+                InputCaps::default()
+            }
+            fn set_displays(&mut self, _d: &[DisplayGeometry]) {}
+            fn inject(&mut self, _ev: &InputEvent) -> Result<()> {
+                Ok(())
+            }
+            fn release_all(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn poll_feedback(&mut self) -> Vec<InputFeedback> {
+                Vec::new()
+            }
+        }
+
+        HostBackends {
+            capture: Arc::new(|_| Ok(Box::new(StubCap))),
+            encoder: Arc::new(|cfg, _| Ok(Box::new(StubEnc(cfg.clone(), 0)))),
+            injector: Arc::new(|| Ok(Box::new(StubInj))),
+            video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
+            rate: Arc::new(|s, mi, ma| Box::new(TransportAbr(AbrController::new(s, mi, ma)))),
+            audio_capture: None,
+            audio_encoder: None,
+            audio_playback: None,
+            clipboard: None,
+            privacy: None,
+            file_transfer: None,
+            tunnel_policy: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_host_live_ipc_otp_session_and_disconnect() {
+        let host_id = DeviceIdentity::generate();
+        let expected_device_id = host_id.device_id();
+        let expected_host_pk = host_id.public_key();
+        let viewer_id = DeviceIdentity::generate();
+
+        let events: Arc<Mutex<Vec<HostStatusEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_c = events.clone();
+
+        let mut cfg = HostConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ipc_port: Some(0),
+            audio_enabled: false,
+            ..Default::default()
+        };
+        cfg.auth = crate::auth::HostAuthConfig::with_auto_otp();
+
+        let host = RunningHost::start(
+            cfg,
+            host_id,
+            synthetic_backends(),
+            Some(Arc::new(move |ev| events_c.lock().unwrap().push(ev))),
+        )
+        .await
+        .expect("RunningHost::start");
+
+        let ipc_addr = host.ipc_addr().expect("IPC bound on ephemeral loopback port");
+        let initial_otp = host.auth_state().current_otp().expect("auto_otp active");
+
+        // 1. Live IPC Status returns real device_id, OTP, 0 sessions, desktop.
+        let st = crate::ipc::IpcClient::request(ipc_addr, &IpcRequest::Status).await.unwrap();
+        match st {
+            IpcResponse::Status { device_id, active_otp, active_sessions, desktop } => {
+                assert_eq!(device_id, expected_device_id);
+                assert_eq!(active_otp.as_deref(), Some(initial_otp.as_str()));
+                assert_eq!(active_sessions, 0);
+                assert!(!desktop.is_empty());
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        // 2. Live IPC RotateOtp updates auth_state and fires OtpRotated event.
+        let rot = crate::ipc::IpcClient::request(ipc_addr, &IpcRequest::RotateOtp).await.unwrap();
+        let IpcResponse::Otp { otp: rotated_otp } = rot else { panic!("expected Otp") };
+        assert_ne!(rotated_otp, initial_otp);
+        assert_eq!(host.auth_state().current_otp().as_deref(), Some(rotated_otp.as_str()));
+
+        // 3. Connect viewer over real QUIC using the newly rotated OTP.
+        let ch = connect(host.local_addr(), &viewer_id, Some(expected_host_pk)).await.expect("connect");
+        let (send, recv) = ch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut writer, mut reader) = framed(send, recv);
+        writer
+            .send(
+                &Msg::Hello(Hello {
+                    protocol_version: veloxdesk_protocol::PROTOCOL_VERSION,
+                    device_id: viewer_id.device_id(),
+                    device_name: "test-viewer".into(),
+                    os: "windows".into(),
+                    public_key: viewer_id.public_key().to_vec(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let ch_msg = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+        let Some(Msg::AuthChallenge(challenge)) = ch_msg.msg else {
+            panic!("expected AuthChallenge, got {:?}", ch_msg.msg);
+        };
+        let params = veloxdesk_crypto::auth::Argon2Params {
+            m_cost_kib: challenge.argon2_m_cost_kib,
+            t_cost: challenge.argon2_t_cost,
+            p_cost: challenge.argon2_p_cost,
+        };
+        let key = derive_password_key(&rotated_otp, &challenge.salt, params).unwrap();
+        let nonce: [u8; 32] = challenge.nonce.as_slice().try_into().unwrap();
+        let proof = password_proof(&key, &nonce);
+        writer
+            .send(&Msg::AuthResponse(AuthResponse { method: AuthMethod::OneTimePassword as i32, proof: proof.to_vec() }).into())
+            .await
+            .unwrap();
+
+        let res_msg = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+        let Some(Msg::AuthResult(res)) = res_msg.msg else {
+            panic!("expected AuthResult, got {:?}", res_msg.msg);
+        };
+        assert!(res.ok, "OTP auth failed: {}", res.reason);
+
+        // Wait for SessionConfig so the session is fully active.
+        let cfg_msg = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+        assert!(matches!(cfg_msg.msg, Some(Msg::SessionConfig(_))));
+
+        // 4. Live IPC Status now reports active_sessions == 1 and OTP was auto-rotated again.
+        let st2 = crate::ipc::IpcClient::request(ipc_addr, &IpcRequest::Status).await.unwrap();
+        match st2 {
+            IpcResponse::Status { active_sessions, active_otp, .. } => {
+                assert_eq!(active_sessions, 1);
+                assert_ne!(active_otp.as_deref(), Some(rotated_otp.as_str()));
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+        assert_eq!(host.active_sessions(), 1);
+
+        // 5. DisconnectAll closes the active session without stopping the host.
+        let disc = crate::ipc::IpcClient::request(ipc_addr, &IpcRequest::DisconnectAll).await.unwrap();
+        assert!(matches!(disc, IpcResponse::Ok { .. }));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while host.active_sessions() > 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(host.active_sessions(), 0);
+
+        // 6. Stop cleanly shuts down RunningHost and drains background tasks.
+        host.stop();
+        tokio::time::timeout(Duration::from_secs(5), host.join()).await.unwrap().unwrap();
+
+        let recorded = events.lock().unwrap();
+        assert!(recorded.iter().any(|e| matches!(e, HostStatusEvent::Listening { .. })));
+        assert!(recorded.iter().any(|e| matches!(e, HostStatusEvent::OtpRotated { .. })));
+        assert!(recorded.iter().any(|e| matches!(e, HostStatusEvent::SessionStarted { .. })));
+        assert!(recorded.iter().any(|e| matches!(e, HostStatusEvent::SessionEnded { .. })));
     }
 }

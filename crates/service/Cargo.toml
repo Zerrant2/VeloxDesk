@@ -34,7 +34,7 @@ veloxdesk-tunnel = { workspace = true }
 veloxdesk-virtual-display = { workspace = true }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_StationsAndDesktops"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Services", "Win32_System_StationsAndDesktops"] }
 
 [lints]
 workspace = true

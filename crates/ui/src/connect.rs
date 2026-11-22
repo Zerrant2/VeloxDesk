@@ -83,6 +83,14 @@ pub fn parse_target(input: &str) -> Result<ConnectTarget, String> {
 pub enum ConnectAction {
     Connect { address: String, target: ConnectTarget },
     OpenSettings,
+    /// Start (`true`) or stop (`false`) the embedded local host.
+    ToggleHost(bool),
+    /// Rotate the one-time password on the embedded host.
+    RotateOtp,
+    /// Copy text (Device ID or OTP) to the system clipboard.
+    CopyText(String),
+    /// Toggle whether incoming sessions require interactive Accept/Reject approval.
+    SetRequireAccept(bool),
 }
 
 #[derive(Debug, Default)]
@@ -92,88 +100,257 @@ pub struct ConnectScreen {
     pub error: Option<String>,
     /// Status text while connecting (`None` = idle).
     pub status: Option<String>,
-    /// This device's ID (informational).
+    /// This device's 9-digit ID.
     pub device_id: String,
+    /// Whether the embedded local host is currently running.
+    pub host_running: bool,
+    /// Human-readable host status (e.g. `"Listening on :21118"`, `"Stopped"`, `"Connected: ..."`).
+    pub host_status: String,
+    /// Current one-time password for incoming connections.
+    pub host_otp: String,
+    /// Whether the OTP is shown in plaintext (`false` = masked).
+    pub show_otp: bool,
+    /// Number of active incoming sessions connected to this desk.
+    pub active_sessions: usize,
+    /// Last embedded-host error, if any.
+    pub host_error: Option<String>,
+    /// Transient visual feedback after copying (e.g. `"ID copied"` / `"OTP copied"`).
+    pub copied_notice: Option<String>,
 }
 
 impl ConnectScreen {
     pub fn new(settings: &Settings) -> Self {
-        Self { address: settings.recent.first().cloned().unwrap_or_default(), ..Default::default() }
+        Self {
+            address: settings.recent.first().cloned().unwrap_or_default(),
+            host_status: "Stopped".into(),
+            ..Default::default()
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, settings: &mut Settings) -> Option<ConnectAction> {
         let mut action = None;
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(24.0);
+            ui.add_space(16.0);
             ui.vertical_centered(|ui| {
-                ui.heading(egui::RichText::new("VeloxDesk").size(32.0).strong());
-                ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
-                if !self.device_id.is_empty() {
-                    ui.label(format!("This device: {}", format_device_id(&self.device_id)));
-                }
-                if !settings.rendezvous_server.trim().is_empty() {
-                    ui.weak(format!("Rendezvous: {}", settings.rendezvous_server.trim()));
-                }
-                ui.add_space(16.0);
-                ui.label("Remote Device ID or address (ip:port)");
-                let busy = self.status.is_some();
-                let edit = ui.add_enabled(
-                    !busy,
-                    egui::TextEdit::singleline(&mut self.address)
-                        .hint_text("123 456 789 or 192.168.1.20:21118")
-                        .desired_width(280.0),
-                );
-                let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                ui.heading(egui::RichText::new("VeloxDesk").size(30.0).strong());
                 ui.horizontal(|ui| {
-                    ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
-                    let connect = ui.add_enabled(!busy, egui::Button::new("Connect").min_size(egui::vec2(120.0, 28.0)));
-                    if (connect.clicked() || enter) && !busy {
-                        action = self.try_connect();
-                    }
-                    if ui.add(egui::Button::new("Settings").min_size(egui::vec2(120.0, 28.0))).clicked() {
-                        action = Some(ConnectAction::OpenSettings);
-                    }
+                    let badge = if settings.rendezvous_server.trim().is_empty() {
+                        format!("v{}", env!("CARGO_PKG_VERSION"))
+                    } else {
+                        format!("v{}  ·  Rendezvous: {}", env!("CARGO_PKG_VERSION"), settings.rendezvous_server.trim())
+                    };
+                    let width = ui.available_width();
+                    ui.add_space((width - (badge.len() as f32 * 6.5)).max(0.0) / 2.0);
+                    ui.weak(badge);
                 });
-                ui.horizontal(|ui| {
-                    ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
-                    ui.label("Mode:");
-                    ui.selectable_value(&mut settings.mode, crate::settings::Mode::Desktop, "Desktop");
-                    ui.selectable_value(&mut settings.mode, crate::settings::Mode::Gaming, "Gaming");
-                });
-                if let Some(s) = &self.status {
-                    ui.horizontal(|ui| {
-                        ui.add_space((ui.available_width() - 200.0).max(0.0) / 2.0);
-                        ui.spinner();
-                        ui.label(s);
-                    });
-                }
-                if let Some(e) = &self.error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 110, 110), e);
-                }
-                ui.add_space(20.0);
-                if !settings.recent.is_empty() {
-                    ui.label(egui::RichText::new("Recent").strong());
-                    let mut remove = None;
-                    for (i, addr) in settings.recent.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
-                            if ui.add_enabled(!busy, egui::Button::new(addr).min_size(egui::vec2(220.0, 22.0))).clicked() {
-                                self.address = addr.clone();
-                                action = self.try_connect();
-                            }
-                            if ui.small_button("✕").on_hover_text("Remove").clicked() {
-                                remove = Some(i);
-                            }
+            });
+            ui.add_space(18.0);
+
+            let max_w = ui.available_width().min(860.0);
+            let side_pad = ((ui.available_width() - max_w) * 0.5).max(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(side_pad);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(max_w, ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.columns(2, |cols| {
+                            self.show_this_desk(&mut cols[0], settings, &mut action);
+                            self.show_remote_desk(&mut cols[1], settings, &mut action);
                         });
-                    }
-                    if let Some(i) = remove {
-                        settings.recent.remove(i);
-                        settings.save_default();
-                    }
-                }
+                    },
+                );
             });
         });
         action
+    }
+
+    fn show_this_desk(&mut self, ui: &mut egui::Ui, settings: &mut Settings, action: &mut Option<ConnectAction>) {
+        egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("This Desk").size(18.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (dot_color, pill) = if self.active_sessions > 0 {
+                        (egui::Color32::from_rgb(100, 190, 255), format!("{} active", self.active_sessions))
+                    } else if self.host_running {
+                        (egui::Color32::from_rgb(110, 230, 140), "Ready".into())
+                    } else {
+                        (egui::Color32::from_rgb(150, 150, 160), "Offline".into())
+                    };
+                    ui.colored_label(dot_color, format!("● {pill}"));
+                });
+            });
+            ui.weak("Share your Device ID and one-time password to allow remote access.");
+            ui.separator();
+
+            // Device ID block
+            ui.label(egui::RichText::new("Device ID").small().weak());
+            let formatted_id = if self.device_id.is_empty() {
+                "Unavailable".to_string()
+            } else {
+                format_device_id(&self.device_id)
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&formatted_id).monospace().size(22.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!self.device_id.is_empty(), egui::Button::new("Copy ID"))
+                        .clicked()
+                    {
+                        self.copied_notice = Some("Device ID copied".into());
+                        *action = Some(ConnectAction::CopyText(formatted_id.clone()));
+                    }
+                });
+            });
+
+            ui.add_space(10.0);
+
+            // One-Time Password block
+            ui.label(egui::RichText::new("One-Time Password").small().weak());
+            let otp_display = if self.host_otp.is_empty() {
+                "—".to_string()
+            } else if self.show_otp {
+                self.host_otp.clone()
+            } else {
+                "•".repeat(self.host_otp.len().max(8))
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&otp_display).monospace().size(18.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let has_otp = !self.host_otp.is_empty();
+                    if ui
+                        .add_enabled(self.host_running, egui::Button::new("Refresh"))
+                        .on_hover_text("Generate a new one-time password")
+                        .clicked()
+                    {
+                        self.copied_notice = None;
+                        *action = Some(ConnectAction::RotateOtp);
+                    }
+                    if ui.add_enabled(has_otp, egui::Button::new("Copy")).clicked() {
+                        self.copied_notice = Some("OTP copied".into());
+                        *action = Some(ConnectAction::CopyText(self.host_otp.clone()));
+                    }
+                    if ui
+                        .add_enabled(has_otp, egui::Button::new(if self.show_otp { "Hide" } else { "Show" }))
+                        .clicked()
+                    {
+                        self.show_otp = !self.show_otp;
+                    }
+                });
+            });
+
+            if let Some(note) = &self.copied_notice {
+                ui.colored_label(egui::Color32::from_rgb(130, 225, 160), note);
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+
+            // Status line + Start/Stop + Require Accept
+            let status_text = if self.host_status.is_empty() {
+                if self.host_running { "Listening" } else { "Stopped" }
+            } else {
+                self.host_status.as_str()
+            };
+            ui.label(format!("Status: {status_text}"));
+            if let Some(err) = &self.host_error {
+                ui.colored_label(egui::Color32::from_rgb(255, 110, 110), err);
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let toggle_label = if self.host_running { "Stop Hosting" } else { "Start Hosting" };
+                let toggle_text = if self.host_running {
+                    egui::RichText::new(toggle_label).color(egui::Color32::from_rgb(255, 140, 130))
+                } else {
+                    egui::RichText::new(toggle_label).color(egui::Color32::from_rgb(130, 235, 150))
+                };
+                if ui.add(egui::Button::new(toggle_text).min_size(egui::vec2(120.0, 28.0))).clicked() {
+                    *action = Some(ConnectAction::ToggleHost(!self.host_running));
+                }
+            });
+
+            ui.add_space(6.0);
+            if ui
+                .checkbox(&mut settings.require_accept, "Require Accept Dialog")
+                .on_hover_text("Prompt to accept or reject incoming connections with per-session permissions")
+                .changed()
+            {
+                *action = Some(ConnectAction::SetRequireAccept(settings.require_accept));
+            }
+        });
+    }
+
+    fn show_remote_desk(&mut self, ui: &mut egui::Ui, settings: &mut Settings, action: &mut Option<ConnectAction>) {
+        egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(egui::RichText::new("Control Remote Desk").size(18.0).strong());
+            ui.weak("Enter a 9-digit Device ID or direct host address (ip:port).");
+            ui.separator();
+
+            let busy = self.status.is_some();
+            let edit = ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut self.address)
+                    .hint_text("123 456 789 or 192.168.1.20:21118")
+                    .desired_width(ui.available_width()),
+            );
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let connect = ui.add_enabled(!busy, egui::Button::new("Connect").min_size(egui::vec2(110.0, 28.0)));
+                if (connect.clicked() || enter) && !busy {
+                    *action = self.try_connect();
+                }
+                if ui.add(egui::Button::new("Settings").min_size(egui::vec2(96.0, 28.0))).clicked() {
+                    *action = Some(ConnectAction::OpenSettings);
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Mode:");
+                ui.selectable_value(&mut settings.mode, crate::settings::Mode::Desktop, "Desktop");
+                ui.selectable_value(&mut settings.mode, crate::settings::Mode::Gaming, "Gaming");
+            });
+
+            if let Some(s) = &self.status {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(s);
+                });
+            }
+            if let Some(e) = &self.error {
+                ui.add_space(4.0);
+                ui.colored_label(egui::Color32::from_rgb(255, 110, 110), e);
+            }
+
+            if !settings.recent.is_empty() {
+                ui.add_space(12.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Recent Connections").strong());
+                let mut remove = None;
+                for (i, addr) in settings.recent.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let btn_w = (ui.available_width() - 32.0).max(120.0);
+                        if ui.add_enabled(!busy, egui::Button::new(addr).min_size(egui::vec2(btn_w, 22.0))).clicked() {
+                            self.address = addr.clone();
+                            *action = self.try_connect();
+                        }
+                        if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    settings.recent.remove(i);
+                    settings.save_default();
+                }
+            }
+        });
     }
 
     fn try_connect(&mut self) -> Option<ConnectAction> {
@@ -225,5 +402,25 @@ mod tests {
             ConnectTarget::Direct("10.0.0.5:21118".parse().unwrap())
         );
         assert!(parse_target("   ").is_err());
+    }
+
+    #[test]
+    fn connect_screen_renders_headless() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            ..Default::default()
+        };
+        let mut settings = Settings::default();
+        settings.recent.push("10.0.0.5:21118".into());
+        let mut screen = ConnectScreen::new(&settings);
+        screen.device_id = "123456789".into();
+        screen.host_running = true;
+        screen.host_status = "Listening on :21118".into();
+        screen.host_otp = "AB12CD34".into();
+        let mut out = ctx.run_ui(input, |ui| {
+            assert!(screen.show(ui, &mut settings).is_none());
+        });
+        out.textures_delta.clear();
     }
 }

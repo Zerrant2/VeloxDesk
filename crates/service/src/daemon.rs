@@ -4,6 +4,7 @@
 use std::fmt;
 use std::path::Path;
 
+use tokio::sync::watch;
 use veloxdesk_core_traits::{CoreError, Result};
 
 /// Service name registered with Windows SCM / Linux systemd.
@@ -281,6 +282,258 @@ pub fn service_status() -> Result<ServiceStatus> {
     }
 }
 
+/// Await until a shutdown signal transitions to `true` (or its sender is dropped).
+pub async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Run a host entry point under the OS service manager (Windows SCM) when launched by
+/// `services.msc` / `sc start`, or transparently in the foreground console (stopping cleanly
+/// on Ctrl+C) when launched interactively from a terminal.
+///
+/// `run_fn` receives a [`watch::Receiver<bool>`] shutdown signal that becomes `true` when
+/// Windows SCM delivers `SERVICE_CONTROL_STOP` / `SERVICE_CONTROL_SHUTDOWN` or when the user
+/// presses Ctrl+C in foreground console mode.
+pub fn run_service_or_console<F>(run_fn: F) -> Result<()>
+where
+    F: FnOnce(watch::Receiver<bool>) -> Result<()> + Send + 'static,
+{
+    #[cfg(windows)]
+    {
+        win_scm::run_service_or_console(run_fn)
+    }
+    #[cfg(not(windows))]
+    {
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        run_fn(stop_rx)
+    }
+}
+
+#[cfg(windows)]
+mod win_scm {
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::Mutex;
+
+    use tokio::sync::watch;
+    use veloxdesk_core_traits::{CoreError, Result};
+    use windows_sys::Win32::Foundation::{
+        ERROR_CALL_NOT_IMPLEMENTED, ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, GetLastError, NO_ERROR,
+    };
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::System::Services::{
+        RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_INTERROGATE,
+        SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
+        SERVICE_STATUS_HANDLE, SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+        SetServiceStatus, StartServiceCtrlDispatcherW,
+    };
+
+    use super::SERVICE_NAME;
+
+    type ServiceTask = Box<dyn FnOnce(watch::Receiver<bool>) -> Result<()> + Send + 'static>;
+
+    struct ScmSlot {
+        run_fn: Option<ServiceTask>,
+        stop_tx: Option<watch::Sender<bool>>,
+        stop_rx: Option<watch::Receiver<bool>>,
+        status_handle: usize,
+        result: Option<Result<()>>,
+    }
+
+    static SCM_STATE: Mutex<Option<ScmSlot>> = Mutex::new(None);
+    static CONSOLE_STOP: Mutex<Option<watch::Sender<bool>>> = Mutex::new(None);
+
+    fn wide_service_name() -> Vec<u16> {
+        SERVICE_NAME.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn report_status(handle: SERVICE_STATUS_HANDLE, state: u32, win32_exit_code: u32, wait_hint: u32) {
+        if handle.is_null() {
+            return;
+        }
+        let controls_accepted = if state == SERVICE_RUNNING {
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+        } else {
+            0
+        };
+        let status = SERVICE_STATUS {
+            dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+            dwCurrentState: state,
+            dwControlsAccepted: controls_accepted,
+            dwWin32ExitCode: win32_exit_code,
+            dwServiceSpecificExitCode: 0,
+            dwCheckPoint: u32::from(matches!(state, SERVICE_START_PENDING | SERVICE_STOP_PENDING)),
+            dwWaitHint: wait_hint,
+        };
+        // SAFETY: `handle` is a valid SERVICE_STATUS_HANDLE returned by RegisterServiceCtrlHandlerExW.
+        unsafe {
+            let _ = SetServiceStatus(handle, &raw const status);
+        }
+    }
+
+    unsafe extern "system" fn service_ctrl_handler(
+        control: u32,
+        _event_type: u32,
+        _event_data: *mut c_void,
+        _context: *mut c_void,
+    ) -> u32 {
+        match control {
+            SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+                let (handle, stop_tx) = {
+                    let g = SCM_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    match g.as_ref() {
+                        Some(slot) => (slot.status_handle as SERVICE_STATUS_HANDLE, slot.stop_tx.clone()),
+                        None => (ptr::null_mut(), None),
+                    }
+                };
+                report_status(handle, SERVICE_STOP_PENDING, NO_ERROR, 5_000);
+                if let Some(tx) = stop_tx {
+                    let _ = tx.send(true);
+                }
+                NO_ERROR
+            }
+            SERVICE_CONTROL_INTERROGATE => NO_ERROR,
+            _ => ERROR_CALL_NOT_IMPLEMENTED,
+        }
+    }
+
+    unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
+        let name = wide_service_name();
+        // SAFETY: `name` is NUL-terminated UTF-16; `service_ctrl_handler` matches LPHANDLER_FUNCTION_EX.
+        let handle = unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(service_ctrl_handler), ptr::null()) };
+        if handle.is_null() {
+            let err = unsafe { GetLastError() };
+            let mut g = SCM_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = g.as_mut() {
+                slot.result = Some(Err(CoreError::platform(format!(
+                    "RegisterServiceCtrlHandlerExW failed (Win32 error {err})"
+                ))));
+            }
+            return;
+        }
+
+        let (run_fn, stop_rx) = {
+            let mut g = SCM_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = g.as_mut() {
+                slot.status_handle = handle as usize;
+                (slot.run_fn.take(), slot.stop_rx.take())
+            } else {
+                (None, None)
+            }
+        };
+
+        report_status(handle, SERVICE_START_PENDING, NO_ERROR, 5_000);
+        report_status(handle, SERVICE_RUNNING, NO_ERROR, 0);
+
+        let res = match (run_fn, stop_rx) {
+            (Some(f), Some(rx)) => f(rx),
+            _ => Err(CoreError::platform("Windows SCM service_main invoked without a task")),
+        };
+        let exit_code = if res.is_ok() { NO_ERROR } else { 1 };
+
+        {
+            let mut g = SCM_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = g.as_mut() {
+                slot.result = Some(res);
+                slot.status_handle = 0;
+            }
+        }
+        report_status(handle, SERVICE_STOPPED, exit_code, 0);
+    }
+
+    unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> i32 {
+        match ctrl_type {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_SHUTDOWN_EVENT => {
+                let tx = CONSOLE_STOP.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if let Some(tx) = tx {
+                    let _ = tx.send(true);
+                    return 1;
+                }
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    struct ConsoleHandlerGuard;
+
+    impl ConsoleHandlerGuard {
+        fn install(stop_tx: watch::Sender<bool>) -> Self {
+            *CONSOLE_STOP.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop_tx);
+            // SAFETY: `console_ctrl_handler` matches PHANDLER_ROUTINE; removed on Drop.
+            unsafe {
+                let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
+            }
+            Self
+        }
+    }
+
+    impl Drop for ConsoleHandlerGuard {
+        fn drop(&mut self) {
+            // SAFETY: unregisters the previously registered handler.
+            unsafe {
+                let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), 0);
+            }
+            *CONSOLE_STOP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(super) fn run_service_or_console<F>(run_fn: F) -> Result<()>
+    where
+        F: FnOnce(watch::Receiver<bool>) -> Result<()> + Send + 'static,
+    {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mut g = SCM_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if g.is_some() {
+                return Err(CoreError::invalid("run_service_or_console is already active in this process"));
+            }
+            *g = Some(ScmSlot {
+                run_fn: Some(Box::new(run_fn)),
+                stop_tx: Some(stop_tx),
+                stop_rx: Some(stop_rx),
+                status_handle: 0,
+                result: None,
+            });
+        }
+
+        let mut name = wide_service_name();
+        let table = [
+            SERVICE_TABLE_ENTRYW { lpServiceName: name.as_mut_ptr(), lpServiceProc: Some(service_main) },
+            SERVICE_TABLE_ENTRYW { lpServiceName: ptr::null_mut(), lpServiceProc: None },
+        ];
+
+        // SAFETY: `table` is properly null-terminated and `name` outlives the blocking call.
+        let started = unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) };
+        if started != 0 {
+            let slot = SCM_STATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+            return slot.and_then(|s| s.result).unwrap_or(Ok(()));
+        }
+
+        let err = unsafe { GetLastError() };
+        let slot = SCM_STATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT {
+            let Some(mut slot) = slot else {
+                return Err(CoreError::platform("SCM fallback missing task slot"));
+            };
+            let (Some(f), Some(tx), Some(rx)) = (slot.run_fn.take(), slot.stop_tx.take(), slot.stop_rx.take()) else {
+                return Err(CoreError::platform("SCM fallback task already consumed"));
+            };
+            tracing::debug!("not launched by Windows SCM; running in foreground console mode");
+            let _guard = ConsoleHandlerGuard::install(tx);
+            return f(rx);
+        }
+
+        Err(CoreError::platform(format!("StartServiceCtrlDispatcherW failed (Win32 error {err})")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +555,18 @@ mod tests {
     fn service_status_queries_cleanly() {
         let st = service_status().expect("service_status should not panic");
         assert!(!st.to_string().is_empty());
+    }
+
+    #[test]
+    fn run_service_or_console_falls_back_in_console() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_c = ran.clone();
+        run_service_or_console(move |shutdown_rx| {
+            assert!(!*shutdown_rx.borrow(), "shutdown signal should start false");
+            ran_c.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("console fallback should succeed");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
