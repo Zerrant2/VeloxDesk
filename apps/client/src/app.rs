@@ -379,6 +379,7 @@ impl App {
         self.cursor_image = None;
         if let Some(s) = &mut self.surface {
             s.set_cursor(None, 0, 0, false);
+            let _ = s.set_present_mode(veloxdesk_core_traits::render::PresentMode::Fifo);
             s.window().set_title("VeloxDesk");
             s.window().request_redraw();
         }
@@ -1141,6 +1142,12 @@ impl App {
             hud.snapshot.resolution = (v.width, v.height);
         }
         hud.snapshot.path = self.path_kind;
+        let pref = self.present_pref().to_core();
+        if let Some(s) = &mut self.surface
+            && s.present_mode() != pref
+        {
+            let _ = s.set_present_mode(pref);
+        }
     }
 
     fn on_keyboard(&mut self, event: &veloxdesk_render::winit::event::KeyEvent, consumed: bool) {
@@ -1255,8 +1262,13 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        let initial_present = if matches!(launch, Launch::Gui) {
+            veloxdesk_core_traits::render::PresentMode::Fifo
+        } else {
+            self.present_pref().to_core()
+        };
         let opts = SurfaceOptions {
-            present_mode: self.present_pref().to_core(),
+            present_mode: initial_present,
             scale_mode: self.settings.scale.to_core(),
             backends: None,
         };
@@ -1317,11 +1329,27 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(surface) = self.surface.as_mut() else { return };
-        // Moving the window on Windows/macOS/Wayland is composited by the OS DWM without
-        // invalidating pixels; requesting a GPU redraw on every `Moved` event stalls drag loops.
-        let is_move = matches!(event, WindowEvent::Moved(_));
+        // Handle RedrawRequested BEFORE feeding egui_winit: egui_winit returns `repaint: true`
+        // for RedrawRequested itself, which would otherwise trigger an infinite busy render loop!
+        if matches!(event, WindowEvent::RedrawRequested) {
+            if matches!(&self.state, State::TestPattern(tp) if tp.opts.fps == 0) {
+                self.present_test_pattern(event_loop);
+            } else {
+                let _ = self.render(event_loop, None);
+            }
+            return;
+        }
+        // Moving/occluding/closing the window does not invalidate pixels; requesting a GPU
+        // redraw on `Moved` stalls Windows' modal drag loop.
+        let skip_repaint = matches!(
+            event,
+            WindowEvent::Moved(_)
+                | WindowEvent::Occluded(_)
+                | WindowEvent::CloseRequested
+                | WindowEvent::Destroyed
+        );
         let response = surface.on_window_event(&event);
-        if response.repaint && !is_move {
+        if response.repaint && !skip_repaint {
             surface.window().request_redraw();
         }
         let egui_wants_pointer = surface.egui_ctx().egui_wants_pointer_input();
@@ -1330,13 +1358,6 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => {
                 surface.resize(size.width, size.height);
                 surface.window().request_redraw();
-            }
-            WindowEvent::RedrawRequested => {
-                if matches!(&self.state, State::TestPattern(tp) if tp.opts.fps == 0) {
-                    self.present_test_pattern(event_loop);
-                } else {
-                    let _ = self.render(event_loop, None);
-                }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::Focused(false) => {
