@@ -7,6 +7,7 @@ mod input;
 mod latest;
 mod session;
 mod stats;
+mod tailscale;
 mod tray;
 mod viewer;
 

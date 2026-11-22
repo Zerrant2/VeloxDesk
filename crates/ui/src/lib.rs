@@ -16,8 +16,8 @@ pub use auth::{
     AcceptDecision, AcceptPrompt, IncomingSessionInfo, PasswordAction, PasswordPrompt, format_fingerprint,
 };
 pub use connect::{
-    ConnectAction, ConnectScreen, ConnectTarget, format_device_id, parse_address, parse_device_id,
-    parse_rendezvous_addr, parse_target,
+    ConnectAction, ConnectScreen, ConnectTarget, TailscaleInfo, TailscalePeer, format_device_id, parse_address,
+    parse_device_id, parse_rendezvous_addr, parse_target,
 };
 pub use files::{FileAction, FileManagerWindow, TransferProgress, format_size, join_remote_path, parent_remote_path};
 pub use session::{SessionInfo, SessionToolbar, ToolbarAction, settings_window};

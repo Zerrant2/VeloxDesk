@@ -4142,6 +4142,7 @@ dependencies = [
  "egui",
  "parking_lot",
  "prost",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

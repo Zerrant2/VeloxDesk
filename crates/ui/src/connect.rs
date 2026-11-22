@@ -78,6 +78,26 @@ pub fn parse_target(input: &str) -> Result<ConnectTarget, String> {
     parse_address(s).map(ConnectTarget::Direct)
 }
 
+/// A discovered peer on the user's Tailscale tailnet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailscalePeer {
+    pub name: String,
+    pub ip: String,
+    pub os: String,
+    pub online: bool,
+}
+
+/// Snapshot of local Tailscale CLI status and discovered peers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TailscaleInfo {
+    pub installed: bool,
+    pub running: bool,
+    pub self_ip: Option<String>,
+    pub self_name: Option<String>,
+    pub peers: Vec<TailscalePeer>,
+    pub error: Option<String>,
+}
+
 /// What the connect screen asks the app to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectAction {
@@ -87,10 +107,16 @@ pub enum ConnectAction {
     ToggleHost(bool),
     /// Rotate the one-time password on the embedded host.
     RotateOtp,
-    /// Copy text (Device ID or OTP) to the system clipboard.
+    /// Copy text (Device ID, OTP, or Tailscale IP) to the system clipboard.
     CopyText(String),
     /// Toggle whether incoming sessions require interactive Accept/Reject approval.
     SetRequireAccept(bool),
+    /// Re-query local `tailscale status --json` in the background.
+    RefreshTailscale,
+    /// Launch / log in to Tailscale (`tailscale-ipn.exe` or `tailscale up`).
+    StartTailscale,
+    /// Open an external URL in the user's default browser.
+    OpenUrl(String),
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +142,8 @@ pub struct ConnectScreen {
     pub host_error: Option<String>,
     /// Transient visual feedback after copying (e.g. `"ID copied"` / `"OTP copied"`).
     pub copied_notice: Option<String>,
+    /// Auto-detected Tailscale status and peers for 1-click P2P connections.
+    pub tailscale: TailscaleInfo,
 }
 
 impl ConnectScreen {
@@ -203,6 +231,22 @@ impl ConnectScreen {
                     }
                 });
             });
+
+            if self.tailscale.running
+                && let Some(ts_ip) = self.tailscale.self_ip.clone()
+            {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Tailscale IP").small().weak());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&ts_ip).monospace().size(15.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Copy").clicked() {
+                            self.copied_notice = Some("Tailscale IP copied".into());
+                            *action = Some(ConnectAction::CopyText(ts_ip.clone()));
+                        }
+                    });
+                });
+            }
 
             ui.add_space(10.0);
 
@@ -350,6 +394,68 @@ impl ConnectScreen {
                     settings.save_default();
                 }
             }
+
+            // Tailscale Devices section (1-click zero-VPS P2P)
+            ui.add_space(12.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Tailscale Devices").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Refresh").on_hover_text("Query tailscale status").clicked() {
+                        *action = Some(ConnectAction::RefreshTailscale);
+                    }
+                });
+            });
+
+            if !self.tailscale.installed {
+                ui.weak("No white IP? Install free Tailscale for 1-click P2P");
+                ui.add_space(4.0);
+                if ui.button("Download Tailscale").clicked() {
+                    *action = Some(ConnectAction::OpenUrl("https://tailscale.com/download".into()));
+                }
+            } else if !self.tailscale.running {
+                let msg = self.tailscale.error.as_deref().unwrap_or("Tailscale is not connected");
+                ui.weak(msg);
+                ui.add_space(4.0);
+                if ui.button("Start / Login Tailscale").clicked() {
+                    *action = Some(ConnectAction::StartTailscale);
+                }
+            } else if self.tailscale.peers.is_empty() {
+                ui.weak("Connected to Tailscale — no other devices found yet.");
+            } else {
+                let mut connect_peer_addr: Option<String> = None;
+                egui::ScrollArea::vertical().id_salt("veloxdesk-ts-peers").max_height(180.0).show(ui, |ui| {
+                    for peer in &self.tailscale.peers {
+                        ui.horizontal(|ui| {
+                            let dot_color = if peer.online {
+                                egui::Color32::from_rgb(110, 230, 140)
+                            } else {
+                                egui::Color32::from_rgb(140, 140, 150)
+                            };
+                            ui.colored_label(dot_color, "●");
+                            ui.label(egui::RichText::new(&peer.name).strong());
+                            ui.weak(&peer.ip);
+                            if !peer.os.is_empty() {
+                                ui.weak(format!("({})", peer.os));
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add_enabled(!busy, egui::Button::new("Connect").small()).clicked() {
+                                    let addr = if peer.ip.contains(':') {
+                                        format!("[{}]:{DEFAULT_DIRECT_PORT}", peer.ip)
+                                    } else {
+                                        format!("{}:{DEFAULT_DIRECT_PORT}", peer.ip)
+                                    };
+                                    connect_peer_addr = Some(addr);
+                                }
+                            });
+                        });
+                    }
+                });
+                if let Some(addr) = connect_peer_addr {
+                    self.address = addr;
+                    *action = self.try_connect();
+                }
+            }
         });
     }
 
@@ -418,6 +524,27 @@ mod tests {
         screen.host_running = true;
         screen.host_status = "Listening on :21118".into();
         screen.host_otp = "AB12CD34".into();
+        screen.tailscale = TailscaleInfo {
+            installed: true,
+            running: true,
+            self_ip: Some("100.64.1.10".into()),
+            self_name: Some("my-pc".into()),
+            peers: vec![
+                TailscalePeer {
+                    name: "gaming-rig".into(),
+                    ip: "100.64.1.20".into(),
+                    os: "windows".into(),
+                    online: true,
+                },
+                TailscalePeer {
+                    name: "linux-box".into(),
+                    ip: "100.64.1.30".into(),
+                    os: "linux".into(),
+                    online: false,
+                },
+            ],
+            error: None,
+        };
         let mut out = ctx.run_ui(input, |ui| {
             assert!(screen.show(ui, &mut settings).is_none());
         });

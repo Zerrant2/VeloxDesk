@@ -21,9 +21,9 @@ use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, Window
 use veloxdesk_render::{RenderBreakdown, SurfaceOptions, VideoSurface, egui};
 use veloxdesk_ui::{
     AcceptDecision, AcceptPrompt, ConnectAction, ConnectScreen, ConnectTarget, FileAction, FileManagerWindow, Mode,
-    PasswordAction, PasswordPrompt, Present, SessionInfo, SessionToolbar, Settings, TerminalAction, TerminalWindow,
-    ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, format_device_id, parse_rendezvous_addr, parse_target,
-    settings_window,
+    PasswordAction, PasswordPrompt, Present, SessionInfo, SessionToolbar, Settings, TailscaleInfo, TerminalAction,
+    TerminalWindow, ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, format_device_id, parse_rendezvous_addr,
+    parse_target, settings_window,
 };
 
 use crate::embedded_host::{EmbeddedHostEvent, EmbeddedHostHandle};
@@ -31,6 +31,7 @@ use crate::input::{self, RelativeAccum, WheelAccum};
 use crate::latest::Latest;
 use crate::session::{ConnectOptions, SessionCommand, SessionEvent, SessionHandle};
 use crate::stats::PresentedFrame;
+use crate::tailscale;
 use crate::tray::{TrayAction, TrayHandle};
 
 /// Events delivered to the winit loop from other threads.
@@ -44,6 +45,7 @@ pub enum UserEvent {
     Host(EmbeddedHostEvent),
     #[cfg_attr(not(windows), allow(dead_code))]
     Tray(TrayAction),
+    Tailscale(TailscaleInfo),
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +235,29 @@ impl App {
         self.connect.active_sessions = 0;
         self.connect.host_otp.clear();
         self.connect.host_status = "Stopped".into();
+    }
+
+    fn refresh_tailscale(&self) {
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("veloxdesk-ts".into()).spawn(move || {
+            let info = tailscale::query_status();
+            let _ = proxy.send_event(UserEvent::Tailscale(info));
+        });
+    }
+
+    fn start_tailscale_bg(&self) {
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("veloxdesk-ts-start".into()).spawn(move || {
+            let start_res = tailscale::start_tailscale();
+            std::thread::sleep(Duration::from_millis(1200));
+            let mut info = tailscale::query_status();
+            if let Err(err) = start_res
+                && !info.running
+            {
+                info.error = Some(err);
+            }
+            let _ = proxy.send_event(UserEvent::Tailscale(info));
+        });
     }
 
     fn save_settings(&self) {
@@ -696,6 +721,19 @@ impl App {
                     if let Some(h) = &self.embedded_host {
                         h.set_require_accept(req);
                     }
+                }
+                UiAction::Connect(ConnectAction::RefreshTailscale) => {
+                    self.refresh_tailscale();
+                }
+                UiAction::Connect(ConnectAction::StartTailscale) => {
+                    self.connect.tailscale.error = Some("Starting Tailscale…".into());
+                    self.start_tailscale_bg();
+                    if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
+                }
+                UiAction::Connect(ConnectAction::OpenUrl(url)) => {
+                    tailscale::open_url(&url);
                 }
                 UiAction::Toolbar(t) => self.apply_toolbar(t, event_loop),
                 UiAction::Password(PasswordAction::Submit(pw)) => {
@@ -1247,6 +1285,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.tray = TrayHandle::spawn(tooltip, self.proxy.clone());
                 #[cfg(feature = "net")]
                 self.start_embedded_host();
+                self.refresh_tailscale();
             }
             Launch::Connect(addr) => match parse_target(&addr) {
                 Ok(target) => self.start_connect(addr, target),
@@ -1267,6 +1306,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Session(ev) => self.handle_session_event(ev),
             UserEvent::Host(ev) => self.handle_host_event(ev),
             UserEvent::Tray(action) => self.handle_tray_action(action, event_loop),
+            UserEvent::Tailscale(info) => {
+                self.connect.tailscale = info;
+                if let Some(s) = &self.surface {
+                    s.window().request_redraw();
+                }
+            }
         }
     }
 
