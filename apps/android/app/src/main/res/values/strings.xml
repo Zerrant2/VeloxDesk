@@ -123,10 +123,28 @@
     <string name="settings_touch_mode">Default Touch Mode</string>
     <string name="settings_audio">Remote Audio</string>
     <string name="settings_audio_desc">Stream host audio to this device via Opus.</string>
+    <string name="settings_section_audio_voice">Audio &amp; Voice</string>
+    <string name="settings_mic">Microphone</string>
+    <string name="settings_mic_desc">Stream local microphone voice uplink to the remote host.</string>
+    <string name="settings_aec">Echo Cancellation (AEC)</string>
+    <string name="settings_aec_desc">Cancel speaker playback echo from microphone uplink.</string>
+    <string name="settings_noise_suppression">Noise Suppression</string>
+    <string name="settings_noise_suppression_desc">Attenuate steady background noise on microphone input.</string>
+    <string name="settings_audio_frame_latency">Audio Frame Latency</string>
+    <string name="audio_latency_auto_desktop">Auto (10 ms)</string>
+    <string name="audio_latency_auto_gaming">Auto (5 ms)</string>
+    <string name="audio_latency_2_5ms">2.5 ms</string>
+    <string name="audio_latency_5ms">5 ms</string>
+    <string name="audio_latency_10ms">10 ms</string>
+    <string name="audio_latency_20ms">20 ms</string>
+    <string name="settings_yuv444">YUV 4:4:4 Full Chroma</string>
+    <string name="settings_yuv444_desc">Crisper text and UI edges for desktop work when supported by the host.</string>
     <string name="settings_clipboard">Clipboard Sync</string>
     <string name="settings_clipboard_desc">Bidirectional text clipboard synchronization.</string>
     <string name="settings_show_hud">Show Performance HUD on Connect</string>
     <string name="settings_show_hud_desc">Display real-time FPS, latency, loss, and decoder telemetry.</string>
+    <string name="btn_reset_profile_defaults">Reset profile defaults</string>
+    <string name="settings_profile_reset_done">Profile defaults restored</string>
 
     <!-- Host Access & Security Settings -->
     <string name="settings_section_host_security">Host Access &amp; Security</string>
@@ -145,6 +163,15 @@
     <string name="settings_host_perm_pw_hash_failed">Failed to hash password</string>
     <string name="settings_host_require_accept">Require Accept Confirmation</string>
     <string name="settings_host_require_accept_desc">Show an approval dialog for incoming connections. Disable with a permanent password for unattended access.</string>
+    <string name="settings_host_default_perms_title">Default Host Permissions</string>
+    <string name="settings_host_allow_input">Allow Remote Input</string>
+    <string name="settings_host_allow_input_desc">Allow viewers to send remote touch, mouse, and keyboard input.</string>
+    <string name="settings_host_allow_clipboard">Allow Clipboard Sync</string>
+    <string name="settings_host_allow_clipboard_desc">Allow bidirectional text clipboard sync with connected viewers.</string>
+    <string name="settings_host_allow_audio">Allow Audio Streaming</string>
+    <string name="settings_host_allow_audio_desc">Allow streaming device audio to connected viewers.</string>
+    <string name="settings_host_allow_chat">Allow Chat</string>
+    <string name="settings_host_allow_chat_desc">Allow in-session text chat with connected viewers.</string>
     <string name="settings_host_trusted_title">Trusted Devices</string>
     <string name="settings_host_trusted_empty">No trusted devices yet.</string>
     <string name="settings_host_trusted_revoked">Trusted device removed</string>

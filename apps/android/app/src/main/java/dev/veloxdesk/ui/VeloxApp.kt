@@ -90,6 +90,15 @@ fun VeloxApp(
                 )
             }
 
+            fun pushHostDefaultPermissions(current: AppSettings) {
+                HostController.setDefaultPermissions(
+                    allowInput = current.hostAllowInput,
+                    allowClipboard = current.hostAllowClipboard,
+                    allowAudio = current.hostAllowAudio,
+                    allowChat = current.hostAllowChat,
+                )
+            }
+
             // Bind process-wide AppPreferences singleton to HostController so newly remembered
             // trusted peers persist even if MainActivity is destroyed while hosting in background.
             LaunchedEffect(preferences) {
@@ -128,6 +137,10 @@ fun VeloxApp(
                             passwordMode = HostPasswordMode.fromId(latest.hostPasswordMode),
                             permanentHashPhc = latest.effectiveHostPermanentHash,
                             requireAccept = latest.hostRequireAccept,
+                            allowInput = latest.hostAllowInput,
+                            allowClipboard = latest.hostAllowClipboard,
+                            allowAudio = latest.hostAllowAudio,
+                            allowChat = latest.hostAllowChat,
                             trustedPeers = latest.hostTrustedPeers,
                         ),
                     )
@@ -247,6 +260,12 @@ fun VeloxApp(
                             onRendezvousChange = preferences::setRendezvousServer,
                             onRelayOnlyChange = preferences::setRelayOnly,
                             onUpdateProfile = preferences::updateProfile,
+                            onResetProfileDefaults = { mode ->
+                                preferences.resetProfileDefaults(mode)
+                                showSnackbar(
+                                    localizedResources.getString(R.string.settings_profile_reset_done),
+                                )
+                            },
                             onHostPasswordModeChange = { mode ->
                                 preferences.setHostPasswordMode(mode)
                                 pushHostAuthUpdate(preferences.settings.value)
@@ -290,6 +309,22 @@ fun VeloxApp(
                             onHostRequireAcceptChange = { requireAccept ->
                                 preferences.setHostRequireAccept(requireAccept)
                                 pushHostAuthUpdate(preferences.settings.value)
+                            },
+                            onHostAllowInputChange = { allow ->
+                                preferences.setHostAllowInput(allow)
+                                pushHostDefaultPermissions(preferences.settings.value)
+                            },
+                            onHostAllowClipboardChange = { allow ->
+                                preferences.setHostAllowClipboard(allow)
+                                pushHostDefaultPermissions(preferences.settings.value)
+                            },
+                            onHostAllowAudioChange = { allow ->
+                                preferences.setHostAllowAudio(allow)
+                                pushHostDefaultPermissions(preferences.settings.value)
+                            },
+                            onHostAllowChatChange = { allow ->
+                                preferences.setHostAllowChat(allow)
+                                pushHostDefaultPermissions(preferences.settings.value)
                             },
                             onRemoveHostTrustedPeer = { pubKeyHex ->
                                 preferences.removeHostTrustedPeer(pubKeyHex)
@@ -355,6 +390,9 @@ fun VeloxApp(
             if (approval != null) {
                 HostAcceptDialog(
                     request = approval,
+                    defaultAllowInput = settings.hostAllowInput,
+                    defaultAllowClipboard = settings.hostAllowClipboard,
+                    defaultAllowAudio = settings.hostAllowAudio,
                     onAccept = { rememberPeer, allowInput, allowClipboard, allowAudio ->
                         HostController.respondApproval(
                             requestId = approval.requestId,

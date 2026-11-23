@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use veloxdesk_core_traits::{CoreError, Result, Timestamp, TransportChannel};
 use veloxdesk_crypto::DeviceIdentity;
 use veloxdesk_protocol::control::{ChatMessage, Nack, ReceiverReport};
 use veloxdesk_transport::{AbrController, Listener, P2pListener, QuicChannel, VideoSender};
+use veloxdesk_virtual_display::{PrivacyController, PrivacyModeKind};
 
 use crate::auth::{HostAuthState, TrustedPeer};
 use crate::backends::{AudioCaptureFactory, EncoderFactory, HostBackends, RateController, RateDecision, VideoSink};
@@ -155,6 +156,9 @@ pub struct RunningHost {
     device_id: String,
     auth_state: Arc<HostAuthState>,
     active_sessions: Arc<AtomicUsize>,
+    echo_cancellation: Arc<AtomicBool>,
+    privacy: Option<Arc<dyn PrivacyController>>,
+    privacy_mode_kind: Mutex<PrivacyModeKind>,
     chat_tx: broadcast::Sender<ChatMessage>,
     next_chat_id: AtomicU64,
     stop_tx: watch::Sender<bool>,
@@ -287,12 +291,20 @@ impl RunningHost {
             });
         }
 
+        let echo_cancellation = Arc::new(AtomicBool::new(cfg.echo_cancellation));
+        let privacy = backends.privacy.clone();
+        let initial_privacy_mode = cfg.privacy_mode_kind;
+        if let Some(ctrl) = &privacy {
+            ctrl.set_mode(initial_privacy_mode);
+        }
+
         let (chat_tx, _) = broadcast::channel::<ChatMessage>(64);
         let hooks = SessionHooks {
             active_sessions: Some(active_sessions.clone()),
             on_event: on_event.clone(),
             chat_tx: Some(chat_tx.clone()),
             power_executor: None,
+            echo_cancellation: Some(echo_cancellation.clone()),
         };
         let stop_tx_done = stop_tx.clone();
         let mut accept_stop = stop_rx;
@@ -324,6 +336,9 @@ impl RunningHost {
             device_id,
             auth_state,
             active_sessions,
+            echo_cancellation,
+            privacy,
+            privacy_mode_kind: Mutex::new(initial_privacy_mode),
             chat_tx,
             next_chat_id: AtomicU64::new(1),
             stop_tx,
@@ -369,6 +384,38 @@ impl RunningHost {
         // Ignore SendError when no viewer session is currently subscribed.
         let _ = self.chat_tx.send(msg);
         Ok(id)
+    }
+
+    /// Update default permissions granted to unattended/new sessions on the fly (v0.6.0).
+    pub fn set_default_permissions(&self, perms: veloxdesk_protocol::control::Permissions) {
+        self.auth_state.set_default_permissions(perms);
+    }
+
+    /// Update host loopback echo-cancellation toggle on the fly (v0.6.0).
+    pub fn set_echo_cancellation(&self, enabled: bool) {
+        self.echo_cancellation.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Current live echo-cancellation toggle state (v0.6.0).
+    pub fn echo_cancellation(&self) -> bool {
+        self.echo_cancellation.load(Ordering::Relaxed)
+    }
+
+    /// Update Windows privacy curtain strategy on the fly (v0.6.0).
+    pub fn set_privacy_mode_kind(&self, kind: PrivacyModeKind) {
+        *self.privacy_mode_kind.lock().unwrap_or_else(|e| e.into_inner()) = kind;
+        if let Some(ctrl) = &self.privacy {
+            ctrl.set_mode(kind);
+        }
+    }
+
+    /// Current privacy curtain strategy configured on this host (v0.6.0).
+    pub fn privacy_mode_kind(&self) -> PrivacyModeKind {
+        if let Some(ctrl) = &self.privacy {
+            ctrl.mode()
+        } else {
+            *self.privacy_mode_kind.lock().unwrap_or_else(|e| e.into_inner())
+        }
     }
 
     /// Signal the host listener, active sessions, and local IPC server to shut down gracefully.
@@ -1203,5 +1250,88 @@ mod tests {
             recorded.iter().any(|e| matches!(e, HostStatusEvent::ChatAcked { id: 1, .. })),
             "expected ChatAcked event, got {recorded:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_host_live_default_permissions_aec_and_privacy_mode() {
+        use veloxdesk_protocol::control::Permissions;
+        use veloxdesk_virtual_display::SimulatedPrivacyController;
+
+        let host_id = DeviceIdentity::generate();
+        let expected_host_pk = host_id.public_key();
+        let viewer_id = DeviceIdentity::generate();
+
+        let privacy = Arc::new(SimulatedPrivacyController::new());
+        let backends = synthetic_backends().with_privacy(privacy.clone());
+        let cfg = HostConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ipc_port: None,
+            audio_enabled: false,
+            echo_cancellation: true,
+            privacy_mode_kind: PrivacyModeKind::VddMonitorOff,
+            ..Default::default()
+        };
+
+        let host = RunningHost::start(cfg, host_id, backends, None).await.expect("RunningHost::start");
+
+        // Initial privacy_mode_kind from HostConfig applied to PrivacyController on start.
+        assert_eq!(privacy.mode(), PrivacyModeKind::VddMonitorOff);
+        assert_eq!(host.privacy_mode_kind(), PrivacyModeKind::VddMonitorOff);
+        assert!(host.echo_cancellation());
+
+        // Live toggle of privacy_mode_kind propagates immediately to PrivacyController.
+        host.set_privacy_mode_kind(PrivacyModeKind::CurtainOverlay);
+        assert_eq!(privacy.mode(), PrivacyModeKind::CurtainOverlay);
+        assert_eq!(host.privacy_mode_kind(), PrivacyModeKind::CurtainOverlay);
+
+        // Live toggle of echo_cancellation updates shared AtomicBool.
+        host.set_echo_cancellation(false);
+        assert!(!host.echo_cancellation());
+        host.set_echo_cancellation(true);
+        assert!(host.echo_cancellation());
+
+        // Live update of default_permissions applies to the very next incoming session.
+        let custom = Permissions {
+            view: true,
+            input: false,
+            clipboard: false,
+            file_transfer: true,
+            audio: false,
+            tunnel: false,
+            terminal: false,
+            restart: false,
+            privacy_mode: true,
+            allow_chat: true,
+            allow_power: true,
+        };
+        host.set_default_permissions(custom.clone());
+
+        let ch = connect(host.local_addr(), &viewer_id, Some(expected_host_pk)).await.expect("connect");
+        let (send, recv) = ch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut writer, mut reader) = framed(send, recv);
+        writer
+            .send(
+                &Msg::Hello(Hello {
+                    protocol_version: veloxdesk_protocol::PROTOCOL_VERSION,
+                    device_id: viewer_id.device_id(),
+                    device_name: "live-settings-viewer".into(),
+                    os: "windows".into(),
+                    public_key: viewer_id.public_key().to_vec(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let res_msg = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+        let Some(Msg::AuthResult(res)) = res_msg.msg else {
+            panic!("expected AuthResult, got {:?}", res_msg.msg);
+        };
+        assert!(res.ok);
+        assert_eq!(res.permissions, Some(custom));
+
+        host.stop();
+        tokio::time::timeout(Duration::from_secs(5), host.join()).await.unwrap().unwrap();
     }
 }

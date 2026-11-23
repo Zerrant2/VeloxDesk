@@ -27,7 +27,8 @@ use jni::{JNIEnv, JavaVM};
 use veloxdesk_protocol::control::SessionConfig;
 
 use crate::host::{
-    AndroidHostConfig, HostCallbacks, HostHandleTable, HostPasswordMode, hash_password_phc, is_valid_phc_hash,
+    AndroidHostConfig, HostCallbacks, HostDefaultPermissions, HostHandleTable, HostPasswordMode, hash_password_phc,
+    is_valid_phc_hash,
 };
 use crate::session::{ConnectConfig, HandleTable, SessionCallbacks, load_or_create_identity};
 use crate::stats::HudMetrics;
@@ -778,6 +779,33 @@ pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeSetMaxBitrate
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeUpdateSessionMode<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    mode: jint,
+    max_bitrate_kbps: jint,
+    max_fps: jint,
+    audio_frame_us: jint,
+    prefer_yuv444: jboolean,
+) {
+    let _ = catch_unwind(|| {
+        if let Some(id) = handle_id_from_jlong(handle)
+            && let Some(h) = handles().get(id)
+        {
+            h.update_session_mode(
+                mode,
+                max_bitrate_kbps.max(0) as u32,
+                max_fps.max(0) as u32,
+                audio_frame_us.max(0) as u32,
+                prefer_yuv444 != 0,
+            );
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeSwitchDisplay<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -807,6 +835,59 @@ pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeSetAudioEnabl
             h.set_audio_enabled(enabled != 0);
         }
     });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeSetAudioProcessing<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    echo_cancellation: jboolean,
+    noise_suppression: jboolean,
+) {
+    let _ = catch_unwind(|| {
+        if let Some(id) = handle_id_from_jlong(handle)
+            && let Some(h) = handles().get(id)
+        {
+            h.set_audio_processing(echo_cancellation != 0, noise_suppression != 0);
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativePushMicPcm<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    pcm16: JShortArray<'local>,
+    sample_rate: jint,
+    channels: jint,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if pcm16.is_null() || sample_rate <= 0 || (channels != 1 && channels != 2) {
+            return;
+        }
+        let Some(id) = handle_id_from_jlong(handle) else { return };
+        let Some(h) = handles().get(id) else { return };
+        let len = match env.get_array_length(&pcm16) {
+            Ok(l) if l > 0 && l <= 1_048_576 => l as usize,
+            Ok(_) => return,
+            Err(_) => {
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+                return;
+            }
+        };
+        let mut buf = vec![0i16; len];
+        if env.get_short_array_region(&pcm16, 0, &mut buf).is_err() {
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            return;
+        }
+        h.push_mic_pcm(buf, sample_rate as u32, channels as u16);
+    }));
 }
 
 #[unsafe(no_mangle)]
@@ -1522,6 +1603,7 @@ pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostStart<'lo
             permanent_hash_phc: perm_hash_str,
             require_accept: require_accept != 0,
             trusted_peers_json: trusted_json_str,
+            default_permissions: HostDefaultPermissions::default(),
         };
 
         match host_handles().spawn_host(cfg, callbacks.clone()) {
@@ -1670,6 +1752,30 @@ pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostUpdateAut
         let phc = jstring_to_rust(&mut env, &permanent_hash_phc).unwrap_or_default();
         h.update_auth(HostPasswordMode::from_i32(password_mode), &phc, require_accept != 0);
     }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostSetDefaultPermissions<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    allow_input: jboolean,
+    allow_clipboard: jboolean,
+    allow_audio: jboolean,
+    allow_chat: jboolean,
+) {
+    let _ = catch_unwind(|| {
+        if let Some(id) = handle_id_from_jlong(handle)
+            && let Some(h) = host_handles().get(id)
+        {
+            h.set_default_permissions(HostDefaultPermissions {
+                allow_input: allow_input != 0,
+                allow_clipboard: allow_clipboard != 0,
+                allow_audio: allow_audio != 0,
+                allow_chat: allow_chat != 0,
+            });
+        }
+    });
 }
 
 #[unsafe(no_mangle)]

@@ -123,10 +123,28 @@
     <string name="settings_touch_mode">Режим касания по умолчанию</string>
     <string name="settings_audio">Удалённый звук</string>
     <string name="settings_audio_desc">Передавать звук с хоста на это устройство через Opus.</string>
+    <string name="settings_section_audio_voice">Звук и голос</string>
+    <string name="settings_mic">Микрофон</string>
+    <string name="settings_mic_desc">Передавать звук с микрофона на удалённый хост.</string>
+    <string name="settings_aec">Подавление эха (AEC)</string>
+    <string name="settings_aec_desc">Убирать эхо воспроизведения хоста из сигнала микрофона.</string>
+    <string name="settings_noise_suppression">Шумоподавление</string>
+    <string name="settings_noise_suppression_desc">Подавлять фоновый шум при передаче речи с микрофона.</string>
+    <string name="settings_audio_frame_latency">Длительность кадра аудио</string>
+    <string name="audio_latency_auto_desktop">Авто (10 мс)</string>
+    <string name="audio_latency_auto_gaming">Авто (5 мс)</string>
+    <string name="audio_latency_2_5ms">2.5 мс</string>
+    <string name="audio_latency_5ms">5 мс</string>
+    <string name="audio_latency_10ms">10 мс</string>
+    <string name="audio_latency_20ms">20 мс</string>
+    <string name="settings_yuv444">YUV 4:4:4 (полная чёткость цвета)</string>
+    <string name="settings_yuv444_desc">Более чёткий текст и интерфейс для работы с рабочим столом при поддержке хостом.</string>
     <string name="settings_clipboard">Синхронизация буфера</string>
     <string name="settings_clipboard_desc">Двусторонняя синхронизация текстового буфера обмена.</string>
     <string name="settings_show_hud">Показывать HUD при подключении</string>
     <string name="settings_show_hud_desc">Отображать FPS, задержку, потери пакетов и статус декодера.</string>
+    <string name="btn_reset_profile_defaults">Сбросить настройки профиля</string>
+    <string name="settings_profile_reset_done">Настройки профиля сброшены по умолчанию</string>
 
     <!-- Host Access & Security Settings -->
     <string name="settings_section_host_security">Доступ к этому устройству</string>
@@ -145,6 +163,15 @@
     <string name="settings_host_perm_pw_hash_failed">Не удалось захешировать пароль</string>
     <string name="settings_host_require_accept">Запрашивать подтверждение</string>
     <string name="settings_host_require_accept_desc">Показывать окно подтверждения при подключении. Отключите вместе с постоянным паролем для автономного доступа.</string>
+    <string name="settings_host_default_perms_title">Разрешения хоста по умолчанию</string>
+    <string name="settings_host_allow_input">Разрешить управление</string>
+    <string name="settings_host_allow_input_desc">Разрешить клиентам удалённый ввод касаниями, мышью и клавиатурой.</string>
+    <string name="settings_host_allow_clipboard">Разрешить буфер обмена</string>
+    <string name="settings_host_allow_clipboard_desc">Разрешить двустороннюю синхронизацию текстового буфера с клиентами.</string>
+    <string name="settings_host_allow_audio">Разрешить передачу звука</string>
+    <string name="settings_host_allow_audio_desc">Разрешить передачу звука устройства подключённым клиентам.</string>
+    <string name="settings_host_allow_chat">Разрешить чат</string>
+    <string name="settings_host_allow_chat_desc">Разрешить текстовый чат во время сессии с подключёнными клиентами.</string>
     <string name="settings_host_trusted_title">Доверенные устройства</string>
     <string name="settings_host_trusted_empty">Доверенных устройств пока нет.</string>
     <string name="settings_host_trusted_revoked">Доверенное устройство удалено</string>

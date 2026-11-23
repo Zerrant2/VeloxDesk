@@ -1,7 +1,7 @@
 //! One viewer session on the host: control handshake, video pipeline, input, feedback.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, mpsc, watch};
@@ -25,14 +25,16 @@ use veloxdesk_transport::{
 };
 use veloxdesk_virtual_display::PrivacyGuard;
 
-use crate::audio::{AudioParams, AudioPipeline, MicHandle, MicPlayback, frame_ms_to_us};
+use crate::audio::{
+    AudioParams, AudioPipeline, MicHandle, MicPlayback, negotiate_audio_frame_us, normalize_opus_frame_us,
+};
 use crate::auth::CLOSE_AUTH_FAILED;
 use crate::backends::{HostBackends, RateController, RateDecision};
 use crate::config::HostConfig;
 use crate::host::HostStatusEvent;
 use crate::inject::{InputHandle, InputThread};
 use crate::power::{PowerExecutor, SystemPowerExecutor};
-use crate::video::{VideoEvent, VideoParams, VideoPipeline};
+use crate::video::{VideoEvent, VideoParams, VideoPipeline, VideoProfileUpdate};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Close codes sent in `Close.code`.
@@ -77,7 +79,8 @@ pub fn negotiate_params(cfg: &HostConfig, hello: &Hello) -> VideoParams {
     if hello.max_bitrate_kbps > 0 {
         bitrate = bitrate.min(hello.max_bitrate_kbps.max(cfg.min_bitrate_kbps));
     }
-    let gaming = hello.mode == SessionMode::Gaming as i32;
+    let mode = SessionMode::try_from(hello.mode).unwrap_or(SessionMode::Desktop);
+    let gaming = mode == SessionMode::Gaming;
     let codec = negotiate_codec(cfg.codec, hello);
     let viewer_cap = hello.video_caps.iter().find(|c| c.codec == codec as i32);
     let ten_bit = cfg.ten_bit && viewer_cap.is_none_or(|c| c.ten_bit);
@@ -86,6 +89,8 @@ pub fn negotiate_params(cfg: &HostConfig, hello: &Hello) -> VideoParams {
     } else {
         ChromaFormat::Yuv420
     };
+    let idle_fps = if gaming { cfg.idle_fps } else { cfg.idle_fps.max(1) };
+    let parity_percent = if gaming { cfg.fec_parity_percent.max(15) } else { cfg.fec_parity_percent };
     VideoParams {
         stream_id: 0,
         display: cfg.display,
@@ -95,8 +100,8 @@ pub fn negotiate_params(cfg: &HostConfig, hello: &Hello) -> VideoParams {
         prefer_hw: cfg.prefer_hw,
         prefer_gpu: cfg.prefer_gpu,
         draw_cursor: !gaming,
-        idle_fps: cfg.idle_fps,
-        parity_percent: cfg.fec_parity_percent,
+        idle_fps,
+        parity_percent,
         ten_bit,
         chroma,
     }
@@ -180,6 +185,8 @@ pub struct SessionHooks {
     pub chat_tx: Option<broadcast::Sender<ChatMessage>>,
     /// Optional override for remote host power management (defaults to [`SystemPowerExecutor`]).
     pub power_executor: Option<Arc<dyn PowerExecutor>>,
+    /// Shared live echo-cancellation toggle updated by [`crate::RunningHost::set_echo_cancellation`] (v0.6.0).
+    pub echo_cancellation: Option<Arc<AtomicBool>>,
 }
 
 struct ActiveSessionGuard {
@@ -287,6 +294,10 @@ pub async fn run_session_with_hooks(
     let on_event_cb = hooks.on_event.clone();
     let power_executor: Arc<dyn PowerExecutor> =
         hooks.power_executor.clone().unwrap_or_else(|| Arc::new(SystemPowerExecutor));
+    let echo_cancel_flag = hooks
+        .echo_cancellation
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(cfg.echo_cancellation)));
     let mut chat_rx = if auth.permissions.allow_chat {
         hooks.chat_tx.as_ref().map(broadcast::Sender::subscribe)
     } else {
@@ -300,31 +311,35 @@ pub async fn run_session_with_hooks(
     let allow_mic = cfg.allow_mic && auth.permissions.audio;
 
     // 3. start video, audio and input pipelines, wait until displays + encoder are known.
+    let initial_mode = SessionMode::try_from(hello.mode).unwrap_or(SessionMode::Desktop);
     let params = negotiate_params(&cfg, &hello);
+    let viewer_cap_yuv444 =
+        hello.video_caps.iter().find(|c| c.codec == params.codec as i32).is_none_or(|c| c.yuv444);
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let pipeline = VideoPipeline::start(params.clone(), &backends, ch.clone(), ev_tx)?;
     let (fb_tx, mut fb_rx) = mpsc::unbounded_channel::<InputFeedback>();
     let input =
         if allow_input { Some(InputThread::start_with_feedback(backends.injector.clone(), Some(fb_tx))?) } else { None };
-    let audio_frame_us = frame_ms_to_us(cfg.audio_frame_ms).unwrap_or(5_000);
-    let aec_feed = (cfg.echo_cancellation
-        && allow_audio
+    let mut active_audio_frame_us =
+        negotiate_audio_frame_us(cfg.audio_frame_ms, cfg.audio_frame_ms_explicit, initial_mode);
+    let aec_feed = (allow_audio
         && allow_mic
         && backends.audio_capture.is_some()
         && backends.audio_encoder.is_some()
         && backends.audio_playback.is_some())
     .then(|| AecReferenceFeed::new(48_000));
-    let (audio, audio_cfg) = if allow_audio && backends.audio_capture.is_some() && backends.audio_encoder.is_some() {
-        match AudioPipeline::start_with_aec(
+    let (mut audio, audio_cfg) = if allow_audio && backends.audio_capture.is_some() && backends.audio_encoder.is_some() {
+        match AudioPipeline::start_with_live_aec(
             AudioParams {
                 stream_id: 0,
                 bitrate_kbps: cfg.audio_bitrate_kbps,
-                frame_duration_us: audio_frame_us,
-                echo_cancellation: cfg.echo_cancellation,
+                frame_duration_us: active_audio_frame_us,
+                echo_cancellation: echo_cancel_flag.load(Ordering::Relaxed),
             },
             &backends,
             ch.clone(),
             aec_feed.clone(),
+            Some(echo_cancel_flag.clone()),
         ) {
             Ok((p, c)) => (Some(p), Some(c)),
             Err(e) => {
@@ -336,7 +351,12 @@ pub async fn run_session_with_hooks(
         (None, None)
     };
     let mic = if allow_mic && backends.audio_playback.is_some() {
-        match MicPlayback::start_with_aec_feed(audio_frame_us, &backends, aec_feed) {
+        match MicPlayback::start_with_options(
+            active_audio_frame_us,
+            &backends,
+            aec_feed.clone(),
+            cfg.mic_noise_suppression,
+        ) {
             Ok(m) => Some(m),
             Err(e) => {
                 tracing::warn!(session = sid, "host mic playback unavailable: {e}");
@@ -347,7 +367,7 @@ pub async fn run_session_with_hooks(
         None
     };
 
-    let mut st = State { displays: Vec::new(), active: 0, video: None, audio: audio_cfg, mode: hello.mode };
+    let mut st = State { displays: Vec::new(), active: 0, video: None, audio: audio_cfg, mode: initial_mode as i32 };
     let ready = timeout(HANDSHAKE_TIMEOUT, async {
         while st.video.is_none() || st.displays.is_empty() {
             match ev_rx.recv().await {
@@ -412,6 +432,8 @@ pub async fn run_session_with_hooks(
     let mut rate: Box<dyn RateController> =
         (backends.rate)(params.bitrate_kbps, cfg.min_bitrate_kbps, params.bitrate_kbps);
     let mut viewer_cap = params.bitrate_kbps;
+    let mut active_fps = params.max_fps;
+    let mut active_parity = params.parity_percent;
     // RAII guard: guaranteed to restore display & local input on normal exit, error, disconnect, or abort.
     let mut privacy_guard: Option<PrivacyGuard> = None;
     let reason = loop {
@@ -475,7 +497,7 @@ pub async fn run_session_with_hooks(
                             let d = RateDecision { bitrate_kbps: d.bitrate_kbps.min(viewer_cap), ..d };
                             pipeline.apply_rate(d);
                             let _ = out.send(Msg::BitrateUpdate(BitrateUpdate { stream_id: rr.stream_id,
-                                bitrate_kbps: d.bitrate_kbps, fps: params.max_fps,
+                                bitrate_kbps: d.bitrate_kbps, fps: active_fps,
                                 fec_parity_percent: d.parity_percent as u32 }).into());
                         }
                     }
@@ -484,7 +506,96 @@ pub async fn run_session_with_hooks(
                         viewer_cap = b.bitrate_kbps.clamp(cfg.min_bitrate_kbps, cfg.bitrate_kbps);
                         rate = (backends.rate)(viewer_cap, cfg.min_bitrate_kbps.min(viewer_cap), viewer_cap);
                         pipeline.apply_rate(RateDecision { bitrate_kbps: viewer_cap,
-                            parity_percent: cfg.fec_parity_percent });
+                            parity_percent: active_parity });
+                    }
+                    Some(Msg::SessionModeUpdate(upd)) => {
+                        let new_mode = SessionMode::try_from(upd.mode).unwrap_or(SessionMode::Desktop);
+                        let gaming = new_mode == SessionMode::Gaming;
+                        st.mode = new_mode as i32;
+                        if upd.max_fps > 0 {
+                            active_fps = upd.max_fps.clamp(1, cfg.max_fps);
+                        }
+                        if upd.max_bitrate_kbps > 0 {
+                            viewer_cap = upd.max_bitrate_kbps.clamp(cfg.min_bitrate_kbps, cfg.bitrate_kbps);
+                            rate = (backends.rate)(viewer_cap, cfg.min_bitrate_kbps.min(viewer_cap), viewer_cap);
+                        }
+                        active_parity = if gaming { cfg.fec_parity_percent.max(15) } else { cfg.fec_parity_percent };
+                        let new_draw_cursor = !gaming;
+                        let new_idle_fps = if gaming { cfg.idle_fps } else { cfg.idle_fps.max(1) };
+                        let new_chroma = if upd.prefer_yuv444 && viewer_cap_yuv444 {
+                            ChromaFormat::Yuv444
+                        } else {
+                            ChromaFormat::Yuv420
+                        };
+                        pipeline.update_profile(VideoProfileUpdate {
+                            max_fps: active_fps,
+                            bitrate_kbps: viewer_cap,
+                            parity_percent: active_parity,
+                            draw_cursor: new_draw_cursor,
+                            idle_fps: new_idle_fps,
+                            chroma: new_chroma,
+                        });
+                        if let Some(v) = st.video.as_mut() {
+                            v.fps = active_fps;
+                            v.bitrate_kbps = viewer_cap;
+                            v.fec_parity_percent = active_parity as u32;
+                        }
+
+                        let new_audio_frame_us = normalize_opus_frame_us(upd.audio_frame_duration_us, new_mode);
+                        if new_audio_frame_us != active_audio_frame_us {
+                            active_audio_frame_us = new_audio_frame_us;
+                            if allow_audio && backends.audio_capture.is_some() && backends.audio_encoder.is_some() {
+                                if let Some(old_audio) = audio.take() {
+                                    let _ = tokio::task::spawn_blocking(move || old_audio.stop()).await;
+                                }
+                                match AudioPipeline::start_with_live_aec(
+                                    AudioParams {
+                                        stream_id: 0,
+                                        bitrate_kbps: cfg.audio_bitrate_kbps,
+                                        frame_duration_us: active_audio_frame_us,
+                                        echo_cancellation: echo_cancel_flag.load(Ordering::Relaxed),
+                                    },
+                                    &backends,
+                                    ch.clone(),
+                                    aec_feed.clone(),
+                                    Some(echo_cancel_flag.clone()),
+                                ) {
+                                    Ok((p, c)) => {
+                                        audio = Some(p);
+                                        st.audio = Some(c);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            session = sid,
+                                            frame_duration_us = active_audio_frame_us,
+                                            "host audio reconfigure failed: {e}"
+                                        );
+                                        st.audio = None;
+                                    }
+                                }
+                            }
+                        }
+
+                        tracing::info!(
+                            session = sid,
+                            ?new_mode,
+                            fps = active_fps,
+                            bitrate_kbps = viewer_cap,
+                            fec_parity_percent = active_parity,
+                            audio_frame_us = active_audio_frame_us,
+                            draw_cursor = new_draw_cursor,
+                            "applied live SessionModeUpdate"
+                        );
+                        let _ = out.send(
+                            Msg::BitrateUpdate(BitrateUpdate {
+                                stream_id: params.stream_id as u32,
+                                bitrate_kbps: viewer_cap,
+                                fps: active_fps,
+                                fec_parity_percent: active_parity as u32,
+                            })
+                            .into(),
+                        );
+                        let _ = out.send(Msg::SessionConfig(st.session_config()).into());
                     }
                     Some(Msg::SwitchDisplay(s)) => pipeline.switch_display(s.index),
                     Some(Msg::PrivacyMode(pm)) => {
@@ -958,9 +1069,59 @@ mod tests {
         assert_eq!(p.bitrate_kbps, 30_000);
         assert_eq!(p.codec, VideoCodec::H265); // no caps advertised → trust config
         assert!(!p.draw_cursor);
+        assert!(p.parity_percent >= 15);
         hello.video_caps = vec![VideoCodecCap { codec: VideoCodec::H264 as i32, ..Default::default() }];
         assert_eq!(negotiate_params(&cfg, &hello).codec, VideoCodec::H264);
         hello.mode = 0;
-        assert!(negotiate_params(&cfg, &hello).draw_cursor);
+        let pd = negotiate_params(&cfg, &hello);
+        assert!(pd.draw_cursor);
+        assert_eq!(pd.parity_percent, cfg.fec_parity_percent);
+    }
+
+    #[test]
+    fn desktop_vs_gaming_negotiates_distinct_audio_fec_idle_and_cursor() {
+        let cfg = HostConfig {
+            idle_fps: 0,
+            fec_parity_percent: 10,
+            audio_frame_ms: 5.0,
+            audio_frame_ms_explicit: false,
+            ..Default::default()
+        };
+        let hello_desktop = Hello { mode: SessionMode::Desktop as i32, ..Default::default() };
+        let hello_gaming = Hello { mode: SessionMode::Gaming as i32, ..Default::default() };
+
+        let p_desk = negotiate_params(&cfg, &hello_desktop);
+        let p_game = negotiate_params(&cfg, &hello_gaming);
+
+        // Desktop: idle_fps >= 1, base FEC parity (10%), cursor drawn, 10 ms Opus frame.
+        assert_eq!(p_desk.idle_fps, 1);
+        assert_eq!(p_desk.parity_percent, 10);
+        assert!(p_desk.draw_cursor);
+        assert_eq!(
+            negotiate_audio_frame_us(cfg.audio_frame_ms, cfg.audio_frame_ms_explicit, SessionMode::Desktop),
+            10_000
+        );
+
+        // Gaming: elevated FEC parity (>= 15%), separate cursor (draw_cursor = false), 5 ms Opus frame.
+        assert_eq!(p_game.parity_percent, 15);
+        assert!(!p_game.draw_cursor);
+        assert_eq!(
+            negotiate_audio_frame_us(cfg.audio_frame_ms, cfg.audio_frame_ms_explicit, SessionMode::Gaming),
+            5_000
+        );
+
+        // Explicit audio_frame_ms (e.g. 2.5 ms) overrides Auto in both modes.
+        assert_eq!(negotiate_audio_frame_us(2.5, true, SessionMode::Desktop), 2_500);
+        assert_eq!(negotiate_audio_frame_us(2.5, true, SessionMode::Gaming), 2_500);
+
+        // normalize_opus_frame_us handles Auto (0) and clamping to valid Opus frame durations.
+        assert_eq!(normalize_opus_frame_us(0, SessionMode::Desktop), 10_000);
+        assert_eq!(normalize_opus_frame_us(0, SessionMode::Gaming), 5_000);
+        assert_eq!(normalize_opus_frame_us(2_500, SessionMode::Gaming), 2_500);
+        assert_eq!(normalize_opus_frame_us(5_000, SessionMode::Desktop), 5_000);
+        assert_eq!(normalize_opus_frame_us(10_000, SessionMode::Gaming), 10_000);
+        assert_eq!(normalize_opus_frame_us(20_000, SessionMode::Gaming), 20_000);
+        assert_eq!(normalize_opus_frame_us(1_000, SessionMode::Gaming), 2_500);
+        assert_eq!(normalize_opus_frame_us(40_000, SessionMode::Desktop), 20_000);
     }
 }

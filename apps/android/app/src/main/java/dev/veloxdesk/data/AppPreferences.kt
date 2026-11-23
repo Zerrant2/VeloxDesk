@@ -56,6 +56,21 @@ enum class BitratePreset(val kbps: Int, val mbps: Int) {
     }
 }
 
+enum class StreamMode(val id: Int) {
+    DESKTOP(BridgeConstants.MODE_DESKTOP),
+    GAMING(BridgeConstants.MODE_GAMING);
+
+    fun defaultProfile(): StreamProfile = when (this) {
+        DESKTOP -> StreamProfile.defaultDesktop()
+        GAMING -> StreamProfile.defaultGaming()
+    }
+
+    companion object {
+        fun fromId(id: Int): StreamMode =
+            if (id == BridgeConstants.MODE_GAMING) GAMING else DESKTOP
+    }
+}
+
 data class StreamProfile(
     val bitrateKbps: Int,
     val fpsCap: Int,
@@ -64,8 +79,39 @@ data class StreamProfile(
     val audioEnabled: Boolean,
     val clipboardEnabled: Boolean,
     val showHudOnConnect: Boolean,
+    val preferYuv444: Boolean = false,
+    val micEnabled: Boolean = false,
+    val echoCancellation: Boolean = true,
+    val noiseSuppression: Boolean = true,
+    val audioFrameLatencyMs: Int = AUDIO_FRAME_LATENCY_AUTO,
 ) {
+    /** Effective Opus frame duration in microseconds (resolves Auto: 10 ms Desktop, 5 ms Gaming). */
+    fun effectiveAudioFrameUs(mode: Int): Int = when (audioFrameLatencyMs) {
+        2 -> 2_500
+        5 -> 5_000
+        10 -> 10_000
+        20 -> 20_000
+        else -> if (mode == BridgeConstants.MODE_GAMING) 5_000 else 10_000
+    }
+
+    fun effectiveAudioFrameUs(mode: StreamMode): Int = effectiveAudioFrameUs(mode.id)
+
+    /** Wire `SessionModeUpdate.audio_frame_duration_us` (`0` = Auto, `2500/5000/10000/20000`). */
+    fun protocolAudioFrameUs(): Int = when (audioFrameLatencyMs) {
+        2 -> 2_500
+        5 -> 5_000
+        10 -> 10_000
+        20 -> 20_000
+        else -> 0
+    }
+
     companion object {
+        const val AUDIO_FRAME_LATENCY_AUTO = 0
+        val VALID_AUDIO_FRAME_LATENCIES_MS: List<Int> = listOf(0, 2, 5, 10, 20)
+
+        fun normalizeAudioFrameLatencyMs(raw: Int): Int =
+            if (raw in VALID_AUDIO_FRAME_LATENCIES_MS) raw else AUDIO_FRAME_LATENCY_AUTO
+
         fun defaultDesktop(): StreamProfile = StreamProfile(
             bitrateKbps = BitratePreset.BALANCED.kbps,
             fpsCap = 60,
@@ -74,6 +120,11 @@ data class StreamProfile(
             audioEnabled = true,
             clipboardEnabled = true,
             showHudOnConnect = false,
+            preferYuv444 = true,
+            micEnabled = false,
+            echoCancellation = true,
+            noiseSuppression = true,
+            audioFrameLatencyMs = AUDIO_FRAME_LATENCY_AUTO,
         )
 
         fun defaultGaming(): StreamProfile = StreamProfile(
@@ -84,6 +135,11 @@ data class StreamProfile(
             audioEnabled = true,
             clipboardEnabled = true,
             showHudOnConnect = true,
+            preferYuv444 = false,
+            micEnabled = false,
+            echoCancellation = true,
+            noiseSuppression = true,
+            audioFrameLatencyMs = AUDIO_FRAME_LATENCY_AUTO,
         )
     }
 }
@@ -107,10 +163,16 @@ data class AppSettings(
     val hostPasswordMode: Int = HostPasswordMode.ONE_TIME.id,
     val hostPermanentPasswordHash: String = "",
     val hostRequireAccept: Boolean = true,
+    val hostAllowInput: Boolean = true,
+    val hostAllowClipboard: Boolean = true,
+    val hostAllowAudio: Boolean = true,
+    val hostAllowChat: Boolean = true,
     val hostTrustedPeers: List<HostSavedTrustedPeer> = emptyList(),
 ) {
     fun profileForMode(mode: Int): StreamProfile =
         if (mode == BridgeConstants.MODE_GAMING) gamingProfile else desktopProfile
+
+    fun profileForMode(mode: StreamMode): StreamProfile = profileForMode(mode.id)
 
     val hasHostPermanentPassword: Boolean
         get() = hostPermanentPasswordHash.trim().startsWith("\$argon2id\$")
@@ -129,9 +191,12 @@ data class AppSettings(
 /**
  * SharedPreferences-backed persistence for VeloxDesk Android settings, profiles, host security, and recent hosts.
  */
-class AppPreferences(context: Context) {
-    private val prefs: SharedPreferences =
-        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+class AppPreferences internal constructor(
+    private val prefs: SharedPreferences,
+) {
+    constructor(context: Context) : this(
+        context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE),
+    )
 
     private val _settings = MutableStateFlow(loadSettings())
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
@@ -155,6 +220,10 @@ class AppPreferences(context: Context) {
         val hostPwMode = HostPasswordMode.fromId(prefs.getInt(KEY_HOST_PASSWORD_MODE, HostPasswordMode.ONE_TIME.id)).id
         val hostPermHash = prefs.getString(KEY_HOST_PERM_HASH, "").orEmpty().trim()
         val hostRequireAccept = prefs.getBoolean(KEY_HOST_REQUIRE_ACCEPT, true)
+        val hostAllowInput = prefs.getBoolean(KEY_HOST_ALLOW_INPUT, true)
+        val hostAllowClipboard = prefs.getBoolean(KEY_HOST_ALLOW_CLIPBOARD, true)
+        val hostAllowAudio = prefs.getBoolean(KEY_HOST_ALLOW_AUDIO, true)
+        val hostAllowChat = prefs.getBoolean(KEY_HOST_ALLOW_CHAT, true)
         val hostTrustedJson = prefs.getString(KEY_HOST_TRUSTED_PEERS, "[]").orEmpty()
         val hostTrusted = HostSavedTrustedPeer.listFromJson(hostTrustedJson)
 
@@ -170,6 +239,10 @@ class AppPreferences(context: Context) {
             hostPasswordMode = hostPwMode,
             hostPermanentPasswordHash = hostPermHash,
             hostRequireAccept = hostRequireAccept,
+            hostAllowInput = hostAllowInput,
+            hostAllowClipboard = hostAllowClipboard,
+            hostAllowAudio = hostAllowAudio,
+            hostAllowChat = hostAllowChat,
             hostTrustedPeers = hostTrusted,
         )
     }
@@ -177,6 +250,7 @@ class AppPreferences(context: Context) {
     private fun loadProfile(prefix: String, defaults: StreamProfile): StreamProfile {
         val rawFps = prefs.getInt("${prefix}fps_cap", defaults.fpsCap)
         val fpsCap = if (rawFps >= 120) 120 else 60
+        val rawLatency = prefs.getInt("${prefix}audio_frame_latency_ms", defaults.audioFrameLatencyMs)
         return StreamProfile(
             bitrateKbps = prefs.getInt("${prefix}bitrate_kbps", defaults.bitrateKbps)
                 .coerceIn(1_000, 200_000),
@@ -186,6 +260,11 @@ class AppPreferences(context: Context) {
             audioEnabled = prefs.getBoolean("${prefix}audio_enabled", defaults.audioEnabled),
             clipboardEnabled = prefs.getBoolean("${prefix}clipboard_enabled", defaults.clipboardEnabled),
             showHudOnConnect = prefs.getBoolean("${prefix}show_hud", defaults.showHudOnConnect),
+            preferYuv444 = prefs.getBoolean("${prefix}prefer_yuv444", defaults.preferYuv444),
+            micEnabled = prefs.getBoolean("${prefix}mic_enabled", defaults.micEnabled),
+            echoCancellation = prefs.getBoolean("${prefix}echo_cancellation", defaults.echoCancellation),
+            noiseSuppression = prefs.getBoolean("${prefix}noise_suppression", defaults.noiseSuppression),
+            audioFrameLatencyMs = StreamProfile.normalizeAudioFrameLatencyMs(rawLatency),
         )
     }
 
@@ -197,6 +276,14 @@ class AppPreferences(context: Context) {
         editor.putBoolean("${prefix}audio_enabled", profile.audioEnabled)
         editor.putBoolean("${prefix}clipboard_enabled", profile.clipboardEnabled)
         editor.putBoolean("${prefix}show_hud", profile.showHudOnConnect)
+        editor.putBoolean("${prefix}prefer_yuv444", profile.preferYuv444)
+        editor.putBoolean("${prefix}mic_enabled", profile.micEnabled)
+        editor.putBoolean("${prefix}echo_cancellation", profile.echoCancellation)
+        editor.putBoolean("${prefix}noise_suppression", profile.noiseSuppression)
+        editor.putInt(
+            "${prefix}audio_frame_latency_ms",
+            StreamProfile.normalizeAudioFrameLatencyMs(profile.audioFrameLatencyMs),
+        )
     }
 
     fun setLanguage(language: AppLanguage) {
@@ -243,6 +330,17 @@ class AppPreferences(context: Context) {
         }
     }
 
+    fun resetProfileDefaults(mode: StreamMode) {
+        val defaults = mode.defaultProfile()
+        val prefix = if (mode == StreamMode.GAMING) PREFIX_GAMING else PREFIX_DESKTOP
+        prefs.edit().also { saveProfile(it, prefix, defaults) }.apply()
+        _settings.value = resetProfileDefaults(_settings.value, mode)
+    }
+
+    fun resetProfileDefaults(mode: Int) {
+        resetProfileDefaults(StreamMode.fromId(mode))
+    }
+
     fun setHostPasswordMode(mode: Int) {
         val normalized = HostPasswordMode.fromId(mode).id
         prefs.edit().putInt(KEY_HOST_PASSWORD_MODE, normalized).apply()
@@ -263,6 +361,26 @@ class AppPreferences(context: Context) {
     fun setHostRequireAccept(requireAccept: Boolean) {
         prefs.edit().putBoolean(KEY_HOST_REQUIRE_ACCEPT, requireAccept).apply()
         _settings.value = _settings.value.copy(hostRequireAccept = requireAccept)
+    }
+
+    fun setHostAllowInput(allow: Boolean) {
+        prefs.edit().putBoolean(KEY_HOST_ALLOW_INPUT, allow).apply()
+        _settings.value = _settings.value.copy(hostAllowInput = allow)
+    }
+
+    fun setHostAllowClipboard(allow: Boolean) {
+        prefs.edit().putBoolean(KEY_HOST_ALLOW_CLIPBOARD, allow).apply()
+        _settings.value = _settings.value.copy(hostAllowClipboard = allow)
+    }
+
+    fun setHostAllowAudio(allow: Boolean) {
+        prefs.edit().putBoolean(KEY_HOST_ALLOW_AUDIO, allow).apply()
+        _settings.value = _settings.value.copy(hostAllowAudio = allow)
+    }
+
+    fun setHostAllowChat(allow: Boolean) {
+        prefs.edit().putBoolean(KEY_HOST_ALLOW_CHAT, allow).apply()
+        _settings.value = _settings.value.copy(hostAllowChat = allow)
     }
 
     @Synchronized
@@ -321,10 +439,20 @@ class AppPreferences(context: Context) {
         private const val KEY_HOST_PASSWORD_MODE = "host_password_mode"
         private const val KEY_HOST_PERM_HASH = "host_permanent_password_hash"
         private const val KEY_HOST_REQUIRE_ACCEPT = "host_require_accept"
+        private const val KEY_HOST_ALLOW_INPUT = "host_allow_input"
+        private const val KEY_HOST_ALLOW_CLIPBOARD = "host_allow_clipboard"
+        private const val KEY_HOST_ALLOW_AUDIO = "host_allow_audio"
+        private const val KEY_HOST_ALLOW_CHAT = "host_allow_chat"
         private const val KEY_HOST_TRUSTED_PEERS = "host_trusted_peers_json"
         private const val PREFIX_DESKTOP = "profile_desktop_"
         private const val PREFIX_GAMING = "profile_gaming_"
         const val MAX_RECENT = 12
+
+        fun resetProfileDefaults(settings: AppSettings, mode: StreamMode): AppSettings =
+            when (mode) {
+                StreamMode.DESKTOP -> settings.copy(desktopProfile = StreamProfile.defaultDesktop())
+                StreamMode.GAMING -> settings.copy(gamingProfile = StreamProfile.defaultGaming())
+            }
 
         fun upsertTrustedPeer(
             existing: List<HostSavedTrustedPeer>,

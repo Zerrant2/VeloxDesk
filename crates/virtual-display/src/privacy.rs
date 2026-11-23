@@ -2,15 +2,48 @@
 //! with hard RAII [`PrivacyGuard`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use veloxdesk_core_traits::{CoreError, Result};
+
+/// Physical monitor blanking strategy used by [`PrivacyController`] on Windows (v0.6.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrivacyModeKind {
+    /// Black fullscreen topmost curtain overlay per physical monitor with `WDA_EXCLUDEFROMCAPTURE`
+    /// (works on Windows 10 2004+ / 11 without VDD and without admin privileges).
+    #[default]
+    CurtainOverlay,
+    /// Curtain overlay plus `SC_MONITORPOWER` blanking when a Virtual Display (VDD) is active.
+    VddMonitorOff,
+}
+
+#[inline]
+fn privacy_mode_to_u8(mode: PrivacyModeKind) -> u8 {
+    match mode {
+        PrivacyModeKind::CurtainOverlay => 0,
+        PrivacyModeKind::VddMonitorOff => 1,
+    }
+}
+
+#[inline]
+fn privacy_mode_from_u8(v: u8) -> PrivacyModeKind {
+    match v {
+        1 => PrivacyModeKind::VddMonitorOff,
+        _ => PrivacyModeKind::CurtainOverlay,
+    }
+}
 
 /// Controls host privacy mode (hiding physical monitors and optionally blocking local input).
 pub trait PrivacyController: Send + Sync {
     fn enable(&self) -> Result<()>;
     fn disable(&self) -> Result<()>;
     fn is_enabled(&self) -> bool;
+    /// Configure the active privacy strategy (v0.6.0). Default is a no-op for mock/simple controllers.
+    fn set_mode(&self, _mode: PrivacyModeKind) {}
+    /// Current privacy strategy (v0.6.0).
+    fn mode(&self) -> PrivacyModeKind {
+        PrivacyModeKind::CurtainOverlay
+    }
 }
 
 /// RAII guard for an active privacy-mode session.
@@ -61,6 +94,7 @@ pub struct SimulatedPrivacyController {
     enables: AtomicU64,
     disables: AtomicU64,
     fail_enable: AtomicBool,
+    mode: AtomicU8,
 }
 
 impl SimulatedPrivacyController {
@@ -100,13 +134,21 @@ impl PrivacyController for SimulatedPrivacyController {
     fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
     }
+
+    fn set_mode(&self, mode: PrivacyModeKind) {
+        self.mode.store(privacy_mode_to_u8(mode), Ordering::Release);
+    }
+
+    fn mode(&self) -> PrivacyModeKind {
+        privacy_mode_from_u8(self.mode.load(Ordering::Acquire))
+    }
 }
 
 #[cfg(windows)]
 pub mod win {
     use std::cell::RefCell;
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -141,7 +183,7 @@ pub mod win {
     };
     use windows::core::{BOOL, HSTRING, PCWSTR};
 
-    use super::PrivacyController;
+    use super::{PrivacyController, PrivacyModeKind, privacy_mode_from_u8, privacy_mode_to_u8};
 
     const MONITOR_OFF: isize = 2;
     const MONITOR_ON: isize = -1;
@@ -185,7 +227,7 @@ pub mod win {
     pub struct WindowsPrivacyController {
         enabled: Arc<AtomicBool>,
         input_blocked: Arc<AtomicBool>,
-        vdd_active: AtomicBool,
+        mode: AtomicU8,
         monitor_powered_off: AtomicBool,
         runtime: Mutex<Option<CurtainRuntime>>,
     }
@@ -201,30 +243,43 @@ pub mod win {
             Self {
                 enabled: Arc::new(AtomicBool::new(false)),
                 input_blocked: Arc::new(AtomicBool::new(false)),
-                vdd_active: AtomicBool::new(false),
+                mode: AtomicU8::new(privacy_mode_to_u8(PrivacyModeKind::CurtainOverlay)),
                 monitor_powered_off: AtomicBool::new(false),
                 runtime: Mutex::new(None),
             }
         }
 
-        /// Builder method indicating whether a virtual display (VDD) is currently active.
-        ///
-        /// When `true`, `enable()` additionally sends `SC_MONITORPOWER` to power down physical
-        /// monitors; when `false` (default), only the capture-excluded curtain overlay + optional
-        /// `BlockInput` are used so physical monitors do not wake on mouse movement.
-        pub fn with_vdd_active(self, active: bool) -> Self {
-            self.vdd_active.store(active, Ordering::Release);
+        /// Builder method selecting the initial [`PrivacyModeKind`] strategy.
+        pub fn with_mode(self, mode: PrivacyModeKind) -> Self {
+            self.set_mode(mode);
             self
         }
 
-        /// Update whether a virtual display (VDD) is active.
+        /// Builder method indicating whether a virtual display (VDD) is currently active.
+        ///
+        /// When `true`, selects [`PrivacyModeKind::VddMonitorOff`] so `enable()` additionally
+        /// sends `SC_MONITORPOWER` to power down physical monitors; when `false` (default),
+        /// selects [`PrivacyModeKind::CurtainOverlay`] (capture-excluded curtain overlay + optional
+        /// `BlockInput`, no `SC_MONITORPOWER`).
+        pub fn with_vdd_active(self, active: bool) -> Self {
+            self.set_vdd_active(active);
+            self
+        }
+
+        /// Update whether a virtual display (VDD) is active (`true` -> `VddMonitorOff`,
+        /// `false` -> `CurtainOverlay`).
         pub fn set_vdd_active(&self, active: bool) {
-            self.vdd_active.store(active, Ordering::Release);
+            let mode = if active {
+                PrivacyModeKind::VddMonitorOff
+            } else {
+                PrivacyModeKind::CurtainOverlay
+            };
+            self.set_mode(mode);
         }
 
         /// Returns whether VDD-assisted `SC_MONITORPOWER` blanking is enabled.
         pub fn is_vdd_active(&self) -> bool {
-            self.vdd_active.load(Ordering::Acquire)
+            self.mode() == PrivacyModeKind::VddMonitorOff
         }
 
         /// Number of active curtain overlay windows currently managed by this controller.
@@ -630,8 +685,8 @@ pub mod win {
                 }
             }
 
-            // Optional layer 2b: SC_MONITORPOWER ONLY when a virtual display (VDD) is active.
-            if self.vdd_active.load(Ordering::Acquire) {
+            // Optional layer 2b: SC_MONITORPOWER ONLY when PrivacyModeKind::VddMonitorOff is selected.
+            if self.mode() == PrivacyModeKind::VddMonitorOff {
                 Self::set_monitor_power(MONITOR_OFF);
                 self.monitor_powered_off.store(true, Ordering::Release);
             } else {
@@ -639,6 +694,7 @@ pub mod win {
             }
 
             tracing::info!(
+                mode = ?self.mode(),
                 curtains = startup.hwnds.len(),
                 input_blocked = self.input_blocked.load(Ordering::Acquire),
                 vdd_power_off = self.monitor_powered_off.load(Ordering::Acquire),
@@ -691,6 +747,28 @@ pub mod win {
         fn is_enabled(&self) -> bool {
             self.enabled.load(Ordering::Acquire)
         }
+
+        fn set_mode(&self, mode: PrivacyModeKind) {
+            self.mode.store(privacy_mode_to_u8(mode), Ordering::Release);
+            if self.is_enabled() {
+                match mode {
+                    PrivacyModeKind::CurtainOverlay => {
+                        if self.monitor_powered_off.swap(false, Ordering::AcqRel) {
+                            Self::set_monitor_power(MONITOR_ON);
+                        }
+                    }
+                    PrivacyModeKind::VddMonitorOff => {
+                        if !self.monitor_powered_off.swap(true, Ordering::AcqRel) {
+                            Self::set_monitor_power(MONITOR_OFF);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn mode(&self) -> PrivacyModeKind {
+            privacy_mode_from_u8(self.mode.load(Ordering::Acquire))
+        }
     }
 
     impl Drop for WindowsPrivacyController {
@@ -705,16 +783,17 @@ pub mod win {
 
 #[cfg(target_os = "linux")]
 pub mod linux {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     use veloxdesk_core_traits::{CoreError, Result};
 
-    use super::PrivacyController;
+    use super::{PrivacyController, PrivacyModeKind, privacy_mode_from_u8, privacy_mode_to_u8};
 
     /// Linux DPMS privacy controller interface.
     #[derive(Default)]
     pub struct LinuxPrivacyController {
         enabled: AtomicBool,
+        mode: AtomicU8,
     }
 
     impl LinuxPrivacyController {
@@ -735,6 +814,14 @@ pub mod linux {
 
         fn is_enabled(&self) -> bool {
             self.enabled.load(Ordering::Acquire)
+        }
+
+        fn set_mode(&self, mode: PrivacyModeKind) {
+            self.mode.store(privacy_mode_to_u8(mode), Ordering::Release);
+        }
+
+        fn mode(&self) -> PrivacyModeKind {
+            privacy_mode_from_u8(self.mode.load(Ordering::Acquire))
         }
     }
 }

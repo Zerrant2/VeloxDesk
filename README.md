@@ -23,23 +23,24 @@ RustDesk-class desktop administration + Parsec-class low-latency gaming mode —
 - **Multilingual UI**: Full **English** and **Russian** interface (including HUD, settings, modals, hover tooltips, and system tray), persisted across restarts.
 - **Built-in Auto-Updater**: Checks [GitHub Releases](https://github.com/Zerrant2/VeloxDesk/releases) over HTTPS (`rustls`), verifies PE headers & GitHub SHA-256 digests, atomically replaces the running executable with rollback on failure, and relaunches cleanly.
 
-### Parsec-Class Gaming Mode
-- **Independent Profiles**: Separate persisted streaming settings for **Desktop** and **Gaming** modes (quality/bitrate, FPS cap up to 240 FPS, Mailbox/Immediate/FIFO presentation, scaling, HUD, HW decode, audio, mic, echo cancellation, clipboard, HDR, YUV 4:4:4, relative mouse).
+### Parsec-Class Gaming Mode & Deep Desktop / Gaming Split
+- **Deeply Differentiated Profiles**: Separate persisted streaming profiles for **Desktop** (`Balanced` 20 Mbps, 60 FPS, VSync `Fifo`, YUV 4:4:4 crisp text, 10 ms Opus, static idle refresh, cursor composited) and **Gaming** (`High` 50 Mbps, 120 FPS, `Mailbox` low-latency present, HUD on, relative mouse lock, YUV 4:2:0 fast HW encode, 5 ms Opus `RestrictedLowDelay`, elevated >=15% FEC parity, instant cursor hiding) — with 1-click **Reset profile defaults** and **live mid-session `Desktop ↔ Gaming` renegotiation** (`SessionModeUpdate`).
 - **GPU Zero-Copy Pipeline**: Windows DXGI Desktop Duplication + DX12 GPU Zero-Copy (`~3.03 ms` p50 @ 1080p120; `~3.23 ms` p50 @ 1080p240 in local pipeline benchmarks).
 - **Hardware Video & High Fidelity**: NVENC / D3D11VA / Media Foundation hardware encode & decode (with `openh264` software fallback), **10-bit HDR** (`P010` / HEVC Main10 / AV1 10-bit), and **YUV 4:4:4** full chroma.
-- **Low-Latency Audio, Echo Cancellation & Gamepads**: Pure-Rust Opus (`rusty-opus`), Windows 10 2004+/11 **Process Loopback Exclusion** (`AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS`) + pure-Rust **NLMS Acoustic Echo Canceller (AEC)** (enabled by default in Gaming mode), microphone passthrough, and up to **4 gamepads** (XInput → ViGEmBus / uinput) with rumble feedback.
-- **Zero Re-Encode Session Recording**: Client-side pure-Rust Matroska (`.mkv`) muxer on a dedicated IO thread (H.264/HEVC/AV1 + Opus) that starts cleanly on an IDR keyframe without adding render latency, complete with a live `REC` toolbar indicator, timer, and file size readout (default `Videos\VeloxDesk`).
+- **Low-Latency Audio, Echo Cancellation, Noise Suppression & Gamepads**: Pure-Rust Opus (`rusty-opus`, configurable `Auto / 2.5 / 5 / 10 / 20 ms` frames), Windows 10 2004+/11 **Process Loopback Exclusion** + pure-Rust **NLMS Acoustic Echo Canceller (AEC)**, pure-Rust **5-band Microphone Noise Suppression + smooth VAD gate** (`>23 dB` stationary noise reduction), microphone passthrough, and up to **4 gamepads** (XInput → ViGEmBus / uinput) with rumble feedback.
+- **Zero Re-Encode Session Recording**: Client-side pure-Rust Matroska (`.mkv`) muxer on a dedicated IO thread (H.264/HEVC/AV1 + Opus) that starts cleanly on an IDR keyframe without adding render latency, complete with a live `REC` toolbar indicator, timer, file size readout, configurable folder (default `Videos\VeloxDesk`), and 1-click **Open folder** button in Settings.
 
 ### RustDesk-Class Remote Admin, Android & Networking
 - **Flexible Connectivity**:
   - Direct **LAN / IP** connections (`UDP 21118`).
   - **Native Tailscale Integration**: Auto-detects installed `tailscale` CLI, copies your Tailscale IP in one click, and lists online Tailscale peers for 1-click connect.
   - **Connect by 9-Digit Device ID**: Self-hosted `veloxdesk-server` with UDP NAT hole punching (`UDP 21116`) and zero-knowledge UDP relay fallback (`UDP 21117`).
-- **Android Companion (Viewer & Host)**: Native Jetpack Compose Android app (`apps/android`, v0.5.0) backed by the Rust JNI bridge (`crates/android-bridge`) with bidirectional PC ↔ Android session chat, remote control, and screen streaming.
+- **Android Companion (Viewer & Host)**: Native Jetpack Compose Android app (`apps/android`, v0.6.0) backed by the Rust JNI bridge (`crates/android-bridge`) with bidirectional PC ↔ Android session chat, differentiated Desktop/Gaming profiles, AEC & microphone noise suppression settings, configurable Android Host permissions, remote control, and screen streaming.
 - **Resilient Media Transport**: QUIC (`quinn`) with unreliable media datagrams + Reed-Solomon FEC + adaptive bitrate (ABR), plus reliable streams for control, input, files, tunnels, and terminal.
-- **Admin Tools**:
+- **Admin Tools & Live Host Settings**:
+  - **Full Settings Control (PC + Android)**: Live-synced **Host Access & Security** toggles for granular default permissions (`Input`, `Clipboard`, `File Transfer`, `Audio & Mic`, `Chat`, `Terminal & Tunnels`, `Remote Power / Reboot`), Host Loopback Echo Exclusion, Windows Privacy strategy (`Curtain Overlay` vs `VDD + Monitor Off`), and Auto-Reconnect toggle.
   - **Bidirectional Session Chat**: Built-in chat panel on Desktop (both Viewer and embedded Host GUI) and Android with unread badges and delivery acknowledgements (`allow_chat` permission).
-  - **Remote Power & Auto-Reconnect**: Confirmation-gated `Reboot`, `Reboot (Safe Mode)`, `Lock Screen`, and `Sleep` (`allow_power` permission, off by default for interactive sessions) with automatic exponential-backoff reconnect for up to 5 minutes after host reboot.
+  - **Remote Power & Auto-Reconnect**: Confirmation-gated `Reboot`, `Reboot (Safe Mode)`, `Lock Screen`, and `Sleep` (`allow_power` permission, configurable in Host Settings) with automatic exponential-backoff reconnect for up to 5 minutes after host reboot.
   - **Reliable Windows Privacy Mode**: Two-tier `WindowsPrivacyController` using a black fullscreen topmost curtain overlay per physical monitor with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (works without VDD or admin privileges while DXGI/WGC captures cleanly underneath), optional `BlockInput` / VDD `SC_MONITORPOWER`, and strict RAII `PrivacyGuard` cleanup.
   - Bidirectional clipboard sync (text, HTML, PNG, file lists with `zstd` compression & echo suppression).
   - Resumable file manager with `zstd` compression and SHA-256 verification.

@@ -390,6 +390,42 @@ define_strings!(
     power_reboot_hint_reconnect,
     reconnect_title,
     reconnect_timed_out,
+
+    // v0.6.0 Deep Profile Defaults, Audio & Voice, Recording & Session, Host Policy
+    audio_latency_auto,
+    audio_latency_2_5ms,
+    audio_latency_5ms,
+    audio_latency_10ms,
+    audio_latency_20ms,
+    privacy_mode_curtain,
+    privacy_mode_vdd,
+    settings_reset_profile_btn,
+    tip_reset_profile,
+    settings_audio_heading,
+    settings_noise_suppression,
+    tip_noise_suppression,
+    settings_audio_frame_latency,
+    tip_audio_frame_latency,
+    settings_recording_heading,
+    settings_open_folder_btn,
+    tip_open_folder,
+    settings_auto_reconnect,
+    settings_auto_reconnect_cb,
+    tip_auto_reconnect,
+    settings_host_permissions,
+    tip_host_permissions,
+    host_perm_input,
+    host_perm_clipboard,
+    host_perm_file_transfer,
+    host_perm_audio,
+    host_perm_chat,
+    host_perm_terminal_tunnel,
+    host_perm_power,
+    settings_host_echo_exclusion,
+    settings_host_echo_exclusion_cb,
+    tip_host_echo_exclusion,
+    settings_host_privacy_mode,
+    tip_host_privacy_mode,
 );
 
 pub const EN: Strings = Strings {
@@ -514,7 +550,7 @@ pub const EN: Strings = Strings {
     tip_default_mode: "Choose the default session mode: Desktop for standard cursor control, or Gaming for relative mouse lock and gamepads.",
     tip_editing_profile: "Select which mode's independent streaming profile (Desktop or Gaming) you are configuring below.",
     tip_quality: "Maximum video bitrate ceiling (5–100 Mb/s). Higher values improve image sharpness at the cost of network bandwidth.",
-    tip_target_fps: "Target frame rate cap (60–240 FPS) requested from the remote host (applies on reconnect).",
+    tip_target_fps: "Target frame rate cap (60–240 FPS) requested from the remote host (updates live during active sessions).",
     tip_color_hdr: "Color depth and chroma subsampling options for the active streaming profile.",
     tip_hdr_10bit: "Request 10-bit HDR (P010 / HEVC Main10 / AV1 10-bit) when both host and client GPU support it.",
     tip_yuv444: "Request full-chroma YUV 4:4:4 encoding for razor-sharp small text and UI edges (uses more bandwidth).",
@@ -758,6 +794,42 @@ pub const EN: Strings = Strings {
     power_reboot_hint_reconnect: "VeloxDesk will automatically retry reconnecting while the host restarts (up to 5 minutes).",
     reconnect_title: "Reconnecting to remote host…",
     reconnect_timed_out: "Auto-reconnect timed out after 5 minutes.",
+
+    // v0.6.0 Deep Profile Defaults, Audio & Voice, Recording & Session, Host Policy
+    audio_latency_auto: "Auto (5 ms Gaming / 10 ms Desktop)",
+    audio_latency_2_5ms: "2.5 ms",
+    audio_latency_5ms: "5 ms",
+    audio_latency_10ms: "10 ms",
+    audio_latency_20ms: "20 ms",
+    privacy_mode_curtain: "Curtain Overlay (no VDD)",
+    privacy_mode_vdd: "VDD + Monitor Off",
+    settings_reset_profile_btn: "Reset profile defaults",
+    tip_reset_profile: "Restore the edited Desktop or Gaming profile back to its recommended default values.",
+    settings_audio_heading: "Audio & Voice",
+    settings_noise_suppression: "Noise suppression",
+    tip_noise_suppression: "Suppress stationary microphone background noise (fans, keyboard) with a smooth VAD gate before echo cancellation and Opus encoding.",
+    settings_audio_frame_latency: "Opus frame latency",
+    tip_audio_frame_latency: "Opus audio frame duration: Auto uses 5 ms in Gaming mode and 10 ms in Desktop mode; lower values reduce latency while higher values save bandwidth.",
+    settings_recording_heading: "Recording & Session",
+    settings_open_folder_btn: "Open folder",
+    tip_open_folder: "Create the recordings folder if needed and open it in the system file manager.",
+    settings_auto_reconnect: "Auto-reconnect",
+    settings_auto_reconnect_cb: "Automatically reconnect after remote reboot",
+    tip_auto_reconnect: "Automatically retry connecting for up to 5 minutes after triggering a remote host reboot.",
+    settings_host_permissions: "Default permissions",
+    tip_host_permissions: "Default permissions granted to incoming sessions and pre-checked in the Accept dialog.",
+    host_perm_input: "Input",
+    host_perm_clipboard: "Clipboard",
+    host_perm_file_transfer: "File Transfer",
+    host_perm_audio: "Audio & Mic",
+    host_perm_chat: "Chat",
+    host_perm_terminal_tunnel: "Terminal & Tunnels",
+    host_perm_power: "Remote Power / Reboot",
+    settings_host_echo_exclusion: "Host echo exclusion",
+    settings_host_echo_exclusion_cb: "Host Loopback Echo Exclusion",
+    tip_host_echo_exclusion: "Exclude VeloxDesk's own audio playback from Windows WASAPI loopback capture so remote voice does not echo back.",
+    settings_host_privacy_mode: "Windows Privacy Mode",
+    tip_host_privacy_mode: "Choose how Privacy Mode blanks physical monitors on Windows: Curtain Overlay works without VDD; VDD + Monitor Off also powers off displays when a virtual display is active.",
 };
 
 pub const RU: Strings = Strings {
@@ -882,7 +954,7 @@ pub const RU: Strings = Strings {
     tip_default_mode: "Выберите режим сеанса по умолчанию: Рабочий стол для обычного курсора или Игровой для захвата мыши и геймпадов.",
     tip_editing_profile: "Выберите независимый профиль трансляции (Рабочий стол или Игровой), параметры которого настраиваются ниже.",
     tip_quality: "Максимальный битрейт видео (5–100 Мбит/с). Более высокое значение повышает чёткость, но требует больше пропускной способности.",
-    tip_target_fps: "Целевое ограничение частоты кадров (60–240 FPS), запрашиваемое у удалённого хоста (применяется при переподключении).",
+    tip_target_fps: "Целевое ограничение частоты кадров (60–240 FPS), запрашиваемое у удалённого хоста (применяется на лету в активном сеансе).",
     tip_color_hdr: "Настройки глубины цвета и цветовой субдискретизации для выбранного профиля трансляции.",
     tip_hdr_10bit: "Запрашивать 10-битный HDR (P010 / HEVC Main10 / AV1 10-bit), если его поддерживают хост и видеокарта.",
     tip_yuv444: "Запрашивать полную чёткость цвета YUV 4:4:4 для мелкого текста и элементов интерфейса (увеличивает трафик).",
@@ -1126,6 +1198,42 @@ pub const RU: Strings = Strings {
     power_reboot_hint_reconnect: "VeloxDesk будет автоматически пытаться переподключиться, пока хост перезагружается (до 5 минут).",
     reconnect_title: "Переподключение к удалённому хосту…",
     reconnect_timed_out: "Автопереподключение не удалось за 5 минут.",
+
+    // v0.6.0 Deep Profile Defaults, Audio & Voice, Recording & Session, Host Policy
+    audio_latency_auto: "Авто (5 мс Игровой / 10 мс Рабочий стол)",
+    audio_latency_2_5ms: "2.5 мс",
+    audio_latency_5ms: "5 мс",
+    audio_latency_10ms: "10 мс",
+    audio_latency_20ms: "20 мс",
+    privacy_mode_curtain: "Чёрный экран поверх окон (без VDD)",
+    privacy_mode_vdd: "VDD + отключение монитора",
+    settings_reset_profile_btn: "Сбросить профиль по умолчанию",
+    tip_reset_profile: "Сбросить настройки выбранного профиля (Рабочий стол или Игровой) к рекомендуемым значениям по умолчанию.",
+    settings_audio_heading: "Аудио и голос",
+    settings_noise_suppression: "Шумоподавление",
+    tip_noise_suppression: "Подавлять фоновый шум микрофона (вентиляторы, клавиатура) с плавным VAD-фильтром до эхоподавления и кодирования Opus.",
+    settings_audio_frame_latency: "Кадр аудио Opus",
+    tip_audio_frame_latency: "Длительность кадра Opus: «Авто» использует 5 мс в игровом режиме и 10 мс на рабочем столе; меньше — ниже задержка, больше — ниже трафик.",
+    settings_recording_heading: "Запись и сеанс",
+    settings_open_folder_btn: "Открыть папку",
+    tip_open_folder: "Создать папку записей при необходимости и открыть её в системном файловом менеджере.",
+    settings_auto_reconnect: "Автопереподключение",
+    settings_auto_reconnect_cb: "Автоматически переподключаться после перезагрузки хоста",
+    tip_auto_reconnect: "Автоматически повторять попытки подключения до 5 минут после перезагрузки удалённого хоста.",
+    settings_host_permissions: "Разрешения по умолчанию",
+    tip_host_permissions: "Разрешения по умолчанию для входящих подключений и окна подтверждения.",
+    host_perm_input: "Ввод",
+    host_perm_clipboard: "Буфер обмена",
+    host_perm_file_transfer: "Передача файлов",
+    host_perm_audio: "Аудио и микрофон",
+    host_perm_chat: "Чат",
+    host_perm_terminal_tunnel: "Терминал и туннели",
+    host_perm_power: "Питание / Перезагрузка",
+    settings_host_echo_exclusion: "Исключение эха хоста",
+    settings_host_echo_exclusion_cb: "Исключать звук VeloxDesk из захвата на хосте",
+    tip_host_echo_exclusion: "Исключать собственное воспроизведение VeloxDesk из системного захвата WASAPI на Windows, чтобы голос не возвращался эхом.",
+    settings_host_privacy_mode: "Режим приватности (Windows)",
+    tip_host_privacy_mode: "Способ скрытия физических мониторов на Windows: «Чёрный экран» работает без VDD; «VDD + отключение монитора» также выключает дисплей при активном VDD.",
 };
 
 /// Return the static localization table for `lang`.
@@ -1826,6 +1934,12 @@ mod tests {
             for th in crate::settings::ThemePreference::ALL {
                 assert!(!th.label_for(lang).is_empty());
             }
+            for lat in crate::settings::AudioFrameLatency::ALL {
+                assert!(!lat.label_for(lang).is_empty());
+            }
+            for pm in crate::settings::HostPrivacyMode::ALL {
+                assert!(!pm.label_for(lang).is_empty());
+            }
         }
     }
 
@@ -1991,6 +2105,95 @@ mod tests {
                 texts2.iter().any(|s| s.contains(expected)),
                 "expected RU heading {expected:?} in rendered output"
             );
+        }
+    }
+
+    #[test]
+    fn settings_all_v060_sections_render_dark_light_en_ru_without_missing_glyphs() {
+        use crate::settings::ThemePreference;
+
+        let make_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            events,
+            ..Default::default()
+        };
+
+        for theme in [ThemePreference::Dark, ThemePreference::Light] {
+            for lang in Language::ALL {
+                let t = tr(lang);
+                let ctx = egui::Context::default();
+                ctx.set_theme(theme.to_egui());
+                let mut settings = Settings { language: lang, theme, ..Default::default() };
+                let mut open = true;
+
+                // Top view (unscrolled): profile reset, Audio & Voice, Recording & Session.
+                let mut top_texts = Vec::new();
+                for _ in 0..2 {
+                    let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                        let _ = settings_window_at(ui.ctx(), &mut open, &mut settings, None);
+                    });
+                    out.textures_delta.clear();
+                    top_texts.clear();
+                    for clipped in &out.shapes {
+                        verify_text_shapes_have_glyphs(&ctx, &clipped.shape);
+                        collect_text(&clipped.shape, &mut top_texts);
+                    }
+                }
+                for needle in [
+                    t.settings_reset_profile_btn,
+                    t.settings_audio_heading,
+                    t.settings_noise_suppression,
+                    t.settings_audio_frame_latency,
+                    t.settings_recording_heading,
+                    t.settings_open_folder_btn,
+                    t.settings_auto_reconnect,
+                ] {
+                    assert!(
+                        top_texts.iter().any(|s| s.contains(needle)),
+                        "missing top settings text {needle:?} for ({theme:?}, {lang:?})"
+                    );
+                }
+
+                // Bottom view (scrolled): Host Access & Security with permissions, echo exclusion, privacy mode.
+                let mut bottom_texts = Vec::new();
+                for _ in 0..3 {
+                    let mut out = ctx.run_ui(
+                        make_input(vec![
+                            egui::Event::PointerMoved(egui::pos2(300.0, 300.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -600.0),
+                                modifiers: egui::Modifiers::NONE,
+                                phase: egui::TouchPhase::Move,
+                                source: egui::MouseWheelSource::Trackpad,
+                            },
+                        ]),
+                        |ui| {
+                            let _ = settings_window_at(ui.ctx(), &mut open, &mut settings, None);
+                        },
+                    );
+                    out.textures_delta.clear();
+                    bottom_texts.clear();
+                    for clipped in &out.shapes {
+                        verify_text_shapes_have_glyphs(&ctx, &clipped.shape);
+                        collect_text(&clipped.shape, &mut bottom_texts);
+                    }
+                }
+                for needle in [
+                    t.settings_security_heading,
+                    t.settings_host_permissions,
+                    t.host_perm_input,
+                    t.host_perm_power,
+                    t.settings_host_echo_exclusion_cb,
+                    t.settings_host_privacy_mode,
+                    t.privacy_mode_curtain,
+                ] {
+                    assert!(
+                        bottom_texts.iter().any(|s| s.contains(needle)),
+                        "missing host security text {needle:?} for ({theme:?}, {lang:?})"
+                    );
+                }
+            }
         }
     }
 }

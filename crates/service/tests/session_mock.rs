@@ -339,5 +339,232 @@ async fn full_session_over_memory_transport() {
     assert!(il.releases >= 1, "release_all not called on disconnect");
     assert_eq!(il.displays.len(), 1);
     assert!(host_ch.closed.lock().unwrap().is_some());
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_session_mode_update_switches_desktop_gaming_desktop_without_disconnect() {
+    use veloxdesk_core_traits::audio::{AudioCapture, AudioCaptureConfig, AudioEncoder, AudioFormat, AudioFrame};
+    use veloxdesk_protocol::control::{SessionMode, SessionModeUpdate};
+
+    struct RecCapture {
+        started: bool,
+        configs: Arc<Mutex<Vec<(u32, bool)>>>,
+    }
+    impl FrameCapture for RecCapture {
+        fn caps(&self) -> CaptureCaps {
+            CaptureCaps { backend: "rec-synth", formats: vec![PixelFormat::Bgra8], ..Default::default() }
+        }
+        fn displays(&self) -> Result<Vec<Display>> {
+            Ok(vec![Display {
+                id: DisplayId("synth0".into()),
+                index: 0,
+                name: "Synthetic".into(),
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 32,
+                refresh_hz: 120,
+                scale_factor: 1.0,
+                primary: true,
+                hdr: false,
+            }])
+        }
+        fn start(&mut self, cfg: &CaptureConfig) -> Result<()> {
+            self.started = true;
+            self.configs.lock().unwrap().push((cfg.max_fps, cfg.draw_cursor));
+            Ok(())
+        }
+        fn next_frame(&mut self, _timeout: Duration) -> Result<Option<CapturedFrame>> {
+            assert!(self.started);
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(Some(CapturedFrame {
+                frame: Frame {
+                    width: 64,
+                    height: 32,
+                    format: PixelFormat::Bgra8,
+                    color_space: ColorSpace::Srgb,
+                    color_range: ColorRange::Full,
+                    data: FrameData::Cpu(vec![Plane { data: Bytes::from(vec![0u8; 64 * 32 * 4]), stride: 256 }]),
+                    capture_ts: Timestamp::now(),
+                },
+                dirty_rects: vec![],
+                cursor: None,
+                capture_us: 100,
+                convert_us: 0,
+            }))
+        }
+        fn stop(&mut self) {}
+    }
+
+    struct StubAudioCap;
+    impl AudioCapture for StubAudioCap {
+        fn backend(&self) -> &'static str {
+            "stub-audio"
+        }
+        fn start(&mut self, cfg: &AudioCaptureConfig) -> Result<AudioFormat> {
+            Ok(cfg.format)
+        }
+        fn read(&mut self, _timeout: Duration) -> Result<Option<AudioFrame>> {
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(Some(AudioFrame {
+                format: AudioFormat::STEREO_48K,
+                samples: vec![0.0f32; 240 * 2],
+                capture_ts: Timestamp::now(),
+            }))
+        }
+        fn stop(&mut self) {}
+    }
+
+    let cap_configs = Arc::new(Mutex::new(Vec::new()));
+    let sink_log = Arc::new(Mutex::new(SinkLog::default()));
+    let inj_log = Arc::new(Mutex::new(InjLog::default()));
+    let bitrates = Arc::new(Mutex::new(Vec::new()));
+
+    let backends = {
+        let cap_configs = cap_configs.clone();
+        let sink_log = sink_log.clone();
+        let inj_log = inj_log.clone();
+        let bitrates = bitrates.clone();
+        HostBackends {
+            capture: Arc::new(move |_gpu| {
+                Ok(Box::new(RecCapture { started: false, configs: cap_configs.clone() }) as Box<dyn FrameCapture>)
+            }),
+            encoder: Arc::new(move |cfg, _hw| {
+                Ok(Box::new(SynthEncoder { cfg: cfg.clone(), next_id: 0, bitrate: bitrates.clone() })
+                    as Box<dyn VideoEncoder>)
+            }),
+            injector: Arc::new(move || Ok(Box::new(RecInjector(inj_log.clone())) as Box<dyn InputInjector>)),
+            video_sink: Arc::new(move |_ch, _sid| Box::new(RecSink(sink_log.clone())) as Box<dyn VideoSink>),
+            rate: Arc::new(|s, mn, mx| Box::new(SimpleRate::new(s, mn, mx)) as Box<dyn veloxdesk_service::RateController>),
+            audio_capture: Some(Arc::new(|| Ok(Box::new(StubAudioCap) as Box<dyn AudioCapture>))),
+            audio_encoder: Some(Arc::new(|cfg| {
+                Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?) as Box<dyn AudioEncoder>)
+            })),
+            audio_playback: None,
+            clipboard: None,
+            privacy: None,
+            file_transfer: None,
+            tunnel_policy: None,
+        }
+    };
+
+    let cfg = Arc::new(HostConfig {
+        max_fps: 120,
+        bitrate_kbps: 25_000,
+        fec_parity_percent: 10,
+        audio_enabled: true,
+        audio_frame_ms_explicit: false,
+        ..Default::default()
+    });
+    let (host_ch, viewer_ch) = mem_pair();
+    let host = tokio::spawn(run_session(host_ch.clone() as Arc<dyn TransportChannel>, cfg, backends));
+
+    let (send, recv) = viewer_ch.open_bi(StreamKind::Control).await.unwrap();
+    let mut w = EnvelopeWriter::new(send);
+    let mut r = EnvelopeReader::new(recv);
+
+    // 1. Connect in Desktop mode: 10 ms Opus, 10% FEC parity, draw_cursor = true.
+    w.send(
+        &Msg::Hello(Hello {
+            device_id: "123456789".into(),
+            protocol_version: 1,
+            mode: SessionMode::Desktop as i32,
+            viewer_refresh_hz: 60,
+            ..Default::default()
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+    let Msg::AuthResult(a) = recv_until(&mut r, |m| matches!(m, Msg::AuthResult(_))).await else { unreachable!() };
+    assert!(a.ok);
+    let Msg::SessionConfig(sc_desk) = recv_until(&mut r, |m| matches!(m, Msg::SessionConfig(_))).await else {
+        unreachable!()
+    };
+    assert_eq!(sc_desk.mode, SessionMode::Desktop as i32);
+    let v_desk = sc_desk.video.expect("desktop video config");
+    assert_eq!(v_desk.fec_parity_percent, 10);
+    assert_eq!(v_desk.fps, 60);
+    let a_desk = sc_desk.audio.expect("desktop audio config");
+    assert_eq!(a_desk.frame_duration_us, 10_000);
+    assert_eq!(cap_configs.lock().unwrap().first(), Some(&(60, true)));
+
+    // 2. Live switch Desktop -> Gaming WITHOUT disconnecting:
+    //    auto audio frame -> 5 ms, FEC parity >= 15%, fps -> 120, bitrate -> 20_000, draw_cursor -> false.
+    w.send(
+        &Msg::SessionModeUpdate(SessionModeUpdate {
+            mode: SessionMode::Gaming as i32,
+            max_bitrate_kbps: 20_000,
+            max_fps: 120,
+            audio_frame_duration_us: 0,
+            prefer_yuv444: false,
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+
+    let Msg::SessionConfig(sc_game) =
+        recv_until(&mut r, |m| matches!(m, Msg::SessionConfig(sc) if sc.mode == SessionMode::Gaming as i32)).await
+    else {
+        unreachable!()
+    };
+    let v_game = sc_game.video.expect("gaming video config");
+    assert_eq!(v_game.fps, 120);
+    assert_eq!(v_game.bitrate_kbps, 20_000);
+    assert!(v_game.fec_parity_percent >= 15);
+    let a_game = sc_game.audio.expect("gaming audio config");
+    assert_eq!(a_game.frame_duration_us, 5_000);
+
+    // Wait briefly for capture thread to process draw_cursor=false restart.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cap_configs.lock().unwrap().contains(&(120, false)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("capture did not restart with draw_cursor=false for Gaming");
+
+    // 3. Live switch Gaming -> Desktop WITHOUT disconnecting:
+    //    auto audio frame -> 10 ms, FEC parity -> 10%, fps -> 60, bitrate -> 10_000, draw_cursor -> true.
+    w.send(
+        &Msg::SessionModeUpdate(SessionModeUpdate {
+            mode: SessionMode::Desktop as i32,
+            max_bitrate_kbps: 10_000,
+            max_fps: 60,
+            audio_frame_duration_us: 0,
+            prefer_yuv444: false,
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+
+    let Msg::SessionConfig(sc_back) =
+        recv_until(&mut r, |m| matches!(m, Msg::SessionConfig(sc) if sc.mode == SessionMode::Desktop as i32)).await
+    else {
+        unreachable!()
+    };
+    let v_back = sc_back.video.expect("desktop-return video config");
+    assert_eq!(v_back.fps, 60);
+    assert_eq!(v_back.bitrate_kbps, 10_000);
+    assert_eq!(v_back.fec_parity_percent, 10);
+    let a_back = sc_back.audio.expect("desktop-return audio config");
+    assert_eq!(a_back.frame_duration_us, 10_000);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while cap_configs.lock().unwrap().last() != Some(&(60, true)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("capture did not restart with draw_cursor=true for Desktop");
+
+    // Close cleanly — proves the single session survived Desktop -> Gaming -> Desktop.
+    w.send(&Msg::Close(Default::default()).into()).await.unwrap();
+    let summary = tokio::time::timeout(Duration::from_secs(5), host).await.unwrap().unwrap().unwrap();
+    assert!(summary.close_reason.contains("viewer closed"));
+    let parities = &sink_log.lock().unwrap().parity;
+    assert!(parities.contains(&15), "expected Gaming parity >= 15 in {parities:?}");
+    assert_eq!(parities.last(), Some(&10), "expected Desktop parity 10 at end in {parities:?}");
 }

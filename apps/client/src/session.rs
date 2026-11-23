@@ -11,8 +11,8 @@ use veloxdesk_core_traits::time::ClockSync;
 use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
 use veloxdesk_protocol::control::{
-    ChatMessage, DisplayInfo, FileEntry, InputEvent, Permissions, SessionConfig, SessionMode, SystemPowerAction,
-    SystemPowerResult, VideoConfig,
+    ChatMessage, DisplayInfo, FileEntry, InputEvent, Permissions, SessionConfig, SessionMode, SessionModeUpdate,
+    SystemPowerAction, SystemPowerResult, VideoConfig,
 };
 use veloxdesk_recorder::RecorderStats;
 use veloxdesk_ui::{
@@ -84,6 +84,8 @@ pub enum SessionCommand {
     SetAudio(bool),
     SetMic(bool),
     SetEchoCancellation(bool),
+    SetNoiseSuppression(bool),
+    UpdateSessionMode(SessionModeUpdate),
     SetClipboardSync(bool),
     SetPrivacyMode(bool),
     StartRecording { output_path: PathBuf },
@@ -129,6 +131,9 @@ pub struct ConnectOptions {
     pub audio_enabled: bool,
     pub mic_enabled: bool,
     pub echo_cancellation: bool,
+    pub noise_suppression: bool,
+    /// Requested Opus audio frame duration in µs (`0` = Auto: 5 ms Gaming / 10 ms Desktop).
+    pub audio_frame_duration_us: u32,
     pub clipboard_sync: bool,
     pub initial_tunnels: Vec<TunnelSpec>,
     pub hdr_10bit: bool,

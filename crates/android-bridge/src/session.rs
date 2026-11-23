@@ -13,8 +13,11 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, timeout};
-use veloxdesk_audio::{AudioJitterBuffer, JitterConfig, OpusDecoder};
-use veloxdesk_core_traits::audio::{AudioCodecId, AudioFormat, EncodedAudio};
+use veloxdesk_audio::{
+    AcousticEchoCanceller, AecConfig, AecReferenceFeed, AudioJitterBuffer, DenoiseConfig, JitterConfig,
+    NoiseSuppressor, OpusDecoder, OpusEncoder,
+};
+use veloxdesk_core_traits::audio::{AudioCodecId, AudioEncoder, AudioEncoderConfig, AudioFormat, AudioFrame, EncodedAudio};
 use veloxdesk_core_traits::time::ClockSync;
 use veloxdesk_core_traits::video::VideoCodec as CoreVideoCodec;
 use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
@@ -23,13 +26,14 @@ use veloxdesk_crypto::auth::{Argon2Params, derive_password_key, password_proof, 
 use veloxdesk_protocol::control::{
     AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, ChatAck, ChatMessage, Close,
     DisplayInfo, Envelope, GamepadState, Hello, InputEvent, KeyEvent, MouseButtonEvent, MouseMove, MouseRelative,
-    MouseWheel, Ping, SessionConfig, SwitchDisplay, TextInput, VideoCodecCap, envelope::Msg, input_event,
+    MouseWheel, Ping, SessionConfig, SessionModeUpdate, SwitchDisplay, TextInput, VideoCodecCap, envelope::Msg,
+    input_event,
 };
 use veloxdesk_protocol::media::MediaKind;
 use veloxdesk_protocol::{PROTOCOL_VERSION, StreamKind};
 use veloxdesk_transport::{
-    AudioReceiver, ControlReceiver, ControlSender, P2pConnectOptions, ReceivedFrame, VideoReceiver, datagram_kind,
-    encode_gamepad_datagram, framed,
+    AudioReceiver, AudioSender, ControlReceiver, ControlSender, P2pConnectOptions, ReceivedFrame, VideoReceiver,
+    datagram_kind, encode_gamepad_datagram, framed,
 };
 
 use crate::clipboard::run_android_clipboard_stream;
@@ -210,8 +214,18 @@ enum SessionCommand {
     Disconnect,
     RequestKeyframe,
     SetMaxBitrate(u32),
+    UpdateSessionMode(SessionModeUpdate),
     SwitchDisplay(u32),
     SetAudioEnabled(bool),
+    SetAudioProcessing {
+        echo_cancellation: bool,
+        noise_suppression: bool,
+    },
+    PushMicPcm {
+        pcm16: Vec<i16>,
+        sample_rate: u32,
+        channels: u16,
+    },
     SetClipboardEnabled(bool),
     Input(InputEvent),
     Gamepad(GamepadState),
@@ -226,6 +240,10 @@ struct SessionShared {
     render_us: AtomicU32,
     gamepads: Mutex<GamepadTracker>,
     next_chat_id: AtomicU64,
+    echo_cancellation: AtomicBool,
+    noise_suppression: AtomicBool,
+    mic_active: AtomicBool,
+    aec_ref: AecReferenceBus,
 }
 
 impl Default for SessionShared {
@@ -237,6 +255,10 @@ impl Default for SessionShared {
             render_us: AtomicU32::new(0),
             gamepads: Mutex::new(GamepadTracker::new()),
             next_chat_id: AtomicU64::new(1),
+            echo_cancellation: AtomicBool::new(true),
+            noise_suppression: AtomicBool::new(true),
+            mic_active: AtomicBool::new(false),
+            aec_ref: AecReferenceBus::new(),
         }
     }
 }
@@ -278,12 +300,57 @@ impl AndroidSessionHandle {
         let _ = self.cmd_tx.send(SessionCommand::SetMaxBitrate(bitrate_kbps));
     }
 
+    /// Send a live `SessionModeUpdate` control message to switch profile / stream parameters.
+    pub fn update_session_mode(
+        &self,
+        mode: i32,
+        max_bitrate_kbps: u32,
+        max_fps: u32,
+        audio_frame_duration_us: u32,
+        prefer_yuv444: bool,
+    ) {
+        let normalized_mode = if mode == constants::MODE_GAMING {
+            constants::MODE_GAMING
+        } else {
+            constants::MODE_DESKTOP
+        };
+        let _ = self.cmd_tx.send(SessionCommand::UpdateSessionMode(SessionModeUpdate {
+            mode: normalized_mode,
+            max_bitrate_kbps,
+            max_fps,
+            audio_frame_duration_us,
+            prefer_yuv444,
+        }));
+    }
+
     pub fn switch_display(&self, display_index: u32) {
         let _ = self.cmd_tx.send(SessionCommand::SwitchDisplay(display_index));
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {
         let _ = self.cmd_tx.send(SessionCommand::SetAudioEnabled(enabled));
+    }
+
+    /// Configure live viewer microphone DSP (`NoiseSuppressor` + `AcousticEchoCanceller`).
+    pub fn set_audio_processing(&self, echo_cancellation: bool, noise_suppression: bool) {
+        self.shared.echo_cancellation.store(echo_cancellation, Ordering::Relaxed);
+        self.shared.noise_suppression.store(noise_suppression, Ordering::Relaxed);
+        let _ = self.cmd_tx.send(SessionCommand::SetAudioProcessing {
+            echo_cancellation,
+            noise_suppression,
+        });
+    }
+
+    /// Push interleaved 16-bit PCM microphone samples through `Denoise -> AEC -> Opus` uplink.
+    pub fn push_mic_pcm(&self, pcm16: Vec<i16>, sample_rate: u32, channels: u16) {
+        if pcm16.is_empty() || sample_rate == 0 || (channels != 1 && channels != 2) {
+            return;
+        }
+        if self.disconnected.load(Ordering::Acquire) {
+            return;
+        }
+        self.shared.mic_active.store(true, Ordering::Relaxed);
+        let _ = self.cmd_tx.send(SessionCommand::PushMicPcm { pcm16, sample_rate, channels });
     }
 
     pub fn set_clipboard_enabled(&self, enabled: bool) {
@@ -517,6 +584,253 @@ enum SessionEnd {
     Error(String),
 }
 
+// ───────────────────────── Mic Audio Processing (Denoise -> AEC -> Opus) ─────────────────────────
+
+const MIC_OPUS_BITRATE_KBPS: u32 = 64;
+const MIC_DEFAULT_FRAME_US: u32 = 10_000;
+
+/// Dual-channel-layout far-end speaker reference bus feeding [`AcousticEchoCanceller`].
+///
+/// Playback from the host is typically stereo 48 kHz while Android microphone capture can be
+/// mono or stereo; maintaining both layouts avoids mismatched channel counts during NLMS.
+#[derive(Clone)]
+pub struct AecReferenceBus {
+    mono: AecReferenceFeed,
+    stereo: AecReferenceFeed,
+}
+
+impl Default for AecReferenceBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AecReferenceBus {
+    pub fn new() -> Self {
+        Self {
+            mono: AecReferenceFeed::new(9_600),
+            stereo: AecReferenceFeed::new(19_200),
+        }
+    }
+
+    pub fn push_playback(&self, samples: &[f32], channels: u16) {
+        if samples.is_empty() {
+            return;
+        }
+        if channels <= 1 {
+            self.mono.push(samples);
+            let mut stereo = Vec::with_capacity(samples.len() * 2);
+            for &s in samples {
+                stereo.push(s);
+                stereo.push(s);
+            }
+            self.stereo.push(&stereo);
+        } else {
+            self.stereo.push(samples);
+            let mut mono = Vec::with_capacity(samples.len() / 2);
+            for chunk in samples.chunks_exact(2) {
+                mono.push((chunk[0] + chunk[1]) * 0.5);
+            }
+            self.mono.push(&mono);
+        }
+    }
+
+    pub fn feed_for_channels(&self, channels: u16) -> &AecReferenceFeed {
+        if channels <= 1 { &self.mono } else { &self.stereo }
+    }
+
+    pub fn clear(&self) {
+        self.mono.clear();
+        self.stereo.clear();
+    }
+}
+
+/// Android viewer microphone uplink DSP pipeline:
+/// `PCM16 -> f32 -> NoiseSuppressor -> AcousticEchoCanceller -> OpusEncoder`.
+pub struct MicAudioProcessor {
+    echo_cancellation: bool,
+    noise_suppression: bool,
+    sample_rate: u32,
+    channels: u16,
+    frame_duration_us: u32,
+    denoiser: NoiseSuppressor,
+    aec: AcousticEchoCanceller,
+    encoder: Option<OpusEncoder>,
+    f32_scratch: Vec<f32>,
+    resample_scratch: Vec<f32>,
+}
+
+impl MicAudioProcessor {
+    pub fn new(sample_rate: u32, channels: u16, echo_cancellation: bool, noise_suppression: bool) -> Self {
+        let sr = sample_rate.max(8_000);
+        let ch = channels.clamp(1, 2);
+        let denoiser = NoiseSuppressor::new(DenoiseConfig {
+            sample_rate: sr,
+            channels: ch,
+            ..Default::default()
+        });
+        let aec = AcousticEchoCanceller::new(AecConfig {
+            sample_rate: sr,
+            channels: ch,
+            ..Default::default()
+        });
+        Self {
+            echo_cancellation,
+            noise_suppression,
+            sample_rate: sr,
+            channels: ch,
+            frame_duration_us: MIC_DEFAULT_FRAME_US,
+            denoiser,
+            aec,
+            encoder: None,
+            f32_scratch: Vec::with_capacity(1024),
+            resample_scratch: Vec::with_capacity(1024),
+        }
+    }
+
+    pub fn echo_cancellation(&self) -> bool {
+        self.echo_cancellation
+    }
+
+    pub fn noise_suppression(&self) -> bool {
+        self.noise_suppression
+    }
+
+    pub fn last_erle_db(&self) -> f32 {
+        self.aec.last_erle_db()
+    }
+
+    pub fn set_processing(&mut self, echo_cancellation: bool, noise_suppression: bool) {
+        if self.echo_cancellation != echo_cancellation {
+            self.echo_cancellation = echo_cancellation;
+            self.aec.reset();
+        }
+        if self.noise_suppression != noise_suppression {
+            self.noise_suppression = noise_suppression;
+            self.denoiser.reset();
+        }
+    }
+
+    pub fn set_frame_duration_us(&mut self, frame_duration_us: u32) {
+        let valid = matches!(frame_duration_us, 2_500 | 5_000 | 10_000 | 20_000);
+        if valid && self.frame_duration_us != frame_duration_us {
+            self.frame_duration_us = frame_duration_us;
+            self.encoder = None;
+        }
+    }
+
+    fn reconfigure_dsp_if_needed(&mut self, sample_rate: u32, channels: u16) {
+        if self.sample_rate != sample_rate || self.channels != channels {
+            self.sample_rate = sample_rate;
+            self.channels = channels;
+            self.denoiser = NoiseSuppressor::new(DenoiseConfig {
+                sample_rate,
+                channels,
+                ..Default::default()
+            });
+            self.aec = AcousticEchoCanceller::new(AecConfig {
+                sample_rate,
+                channels,
+                ..Default::default()
+            });
+            self.encoder = None;
+        }
+    }
+
+    /// Run `NoiseSuppressor -> AcousticEchoCanceller` in-place on interleaved `f32` samples.
+    pub fn process_f32_in_place(&mut self, samples: &mut [f32], aec_ref: Option<&AecReferenceBus>) {
+        if samples.is_empty() {
+            return;
+        }
+        if self.noise_suppression {
+            self.denoiser.process(samples);
+        }
+        if self.echo_cancellation {
+            if let Some(bus) = aec_ref {
+                self.aec.process_capture_with_feed(samples, bus.feed_for_channels(self.channels));
+            } else {
+                self.aec.process_capture(samples);
+            }
+        }
+    }
+
+    /// Convert PCM16 microphone samples to `f32`, apply `Denoise -> AEC`, and encode to Opus packets.
+    pub fn process_pcm16_to_opus(
+        &mut self,
+        pcm16: &[i16],
+        sample_rate: u32,
+        channels: u16,
+        aec_ref: Option<&AecReferenceBus>,
+    ) -> Vec<EncodedAudio> {
+        if pcm16.is_empty() || sample_rate == 0 || (channels != 1 && channels != 2) {
+            return Vec::new();
+        }
+        self.f32_scratch.clear();
+        self.f32_scratch.reserve(pcm16.len());
+        for &s in pcm16 {
+            self.f32_scratch.push(f32::from(s) / 32768.0);
+        }
+
+        const OPUS_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
+        let target_rate = if OPUS_RATES.contains(&sample_rate) {
+            sample_rate
+        } else {
+            crate::host::resample_linear_interleaved(
+                &self.f32_scratch,
+                sample_rate,
+                48_000,
+                channels as usize,
+                &mut self.resample_scratch,
+            );
+            std::mem::swap(&mut self.f32_scratch, &mut self.resample_scratch);
+            48_000
+        };
+
+        self.reconfigure_dsp_if_needed(target_rate, channels);
+
+        let mut samples = std::mem::take(&mut self.f32_scratch);
+        self.process_f32_in_place(&mut samples, aec_ref);
+
+        let target_fmt = AudioFormat { sample_rate: target_rate, channels };
+        let need_encoder = self.encoder.as_ref().is_none_or(|e| e.format() != target_fmt);
+        if need_encoder {
+            let cfg = AudioEncoderConfig {
+                format: target_fmt,
+                bitrate_kbps: MIC_OPUS_BITRATE_KBPS,
+                frame_duration: Duration::from_micros(self.frame_duration_us as u64),
+                low_delay: true,
+            };
+            match OpusEncoder::new(&cfg) {
+                Ok(enc) => self.encoder = Some(enc),
+                Err(e) => {
+                    tracing::warn!("Android viewer mic OpusEncoder init failed: {e}");
+                    self.f32_scratch = samples;
+                    return Vec::new();
+                }
+            }
+        }
+
+        let pkts = if let Some(enc) = self.encoder.as_mut() {
+            let frame = AudioFrame {
+                format: target_fmt,
+                samples: samples.clone(),
+                capture_ts: Timestamp::now(),
+            };
+            match enc.encode(&frame) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!("Android viewer mic Opus encode error: {e}");
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        self.f32_scratch = samples;
+        pkts
+    }
+}
+
 // ───────────────────────── Audio decode thread (Opus + JitterBuffer + PLC) ─────────────────────────
 
 struct AndroidAudioThread {
@@ -527,7 +841,12 @@ struct AndroidAudioThread {
 }
 
 impl AndroidAudioThread {
-    fn spawn(cfg: Option<&AudioConfig>, initial_enabled: bool, callbacks: Arc<dyn SessionCallbacks>) -> Option<Self> {
+    fn spawn(
+        cfg: Option<&AudioConfig>,
+        initial_enabled: bool,
+        shared: Arc<SessionShared>,
+        callbacks: Arc<dyn SessionCallbacks>,
+    ) -> Option<Self> {
         let fmt = cfg
             .map(|c| AudioFormat {
                 sample_rate: c.sample_rate.max(8_000),
@@ -542,7 +861,7 @@ impl AndroidAudioThread {
         let stop_bg = stop.clone();
         let join = std::thread::Builder::new()
             .name("velox-android-audio".into())
-            .spawn(move || audio_decode_loop(rx, fmt, frame_us, enabled_bg, stop_bg, callbacks))
+            .spawn(move || audio_decode_loop(rx, fmt, frame_us, enabled_bg, stop_bg, shared, callbacks))
             .ok()?;
         Some(Self { tx, enabled, stop, join: Some(join) })
     }
@@ -578,6 +897,7 @@ fn audio_decode_loop(
     frame_us: u32,
     enabled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    shared: Arc<SessionShared>,
     callbacks: Arc<dyn SessionCallbacks>,
 ) {
     let frame_dur = Duration::from_micros(frame_us as u64);
@@ -623,6 +943,11 @@ fn audio_decode_loop(
         match jb.pop_decoded(&mut decoder) {
             Ok(Some(pcm)) => {
                 if enabled.load(Ordering::Relaxed) && !pcm.samples.is_empty() {
+                    if shared.mic_active.load(Ordering::Relaxed)
+                        && shared.echo_cancellation.load(Ordering::Relaxed)
+                    {
+                        shared.aec_ref.push_playback(&pcm.samples, pcm.format.channels);
+                    }
                     f32_to_pcm16(&pcm.samples, &mut pcm16);
                     callbacks.on_audio_pcm(pcm.format.sample_rate as i32, pcm.format.channels as i32, &pcm16);
                 }
@@ -1116,8 +1441,20 @@ async fn run_session_async(
         let _ = sender.finish().await;
     });
 
-    // 5. Audio decode thread & optional clipboard stream.
-    let audio_out = AndroidAudioThread::spawn(initial_cfg.audio.as_ref(), cfg.audio_enabled, callbacks.clone());
+    // 5. Audio decode thread, mic uplink DSP (`Denoise -> AEC -> Opus`), & optional clipboard stream.
+    let audio_out = AndroidAudioThread::spawn(
+        initial_cfg.audio.as_ref(),
+        cfg.audio_enabled,
+        shared.clone(),
+        callbacks.clone(),
+    );
+    let mut mic_sender = AudioSender::new(ch.clone(), 1);
+    let mut mic_processor = MicAudioProcessor::new(
+        48_000,
+        1,
+        shared.echo_cancellation.load(Ordering::Relaxed),
+        shared.noise_suppression.load(Ordering::Relaxed),
+    );
     let mut clipboard = if cfg.clipboard_enabled {
         Some(ClipboardHandle::spawn(ch.clone(), callbacks.clone()))
     } else {
@@ -1303,12 +1640,45 @@ async fn run_session_async(
                             .into(),
                         );
                     }
+                    Some(SessionCommand::UpdateSessionMode(update)) => {
+                        if update.audio_frame_duration_us > 0 {
+                            mic_processor.set_frame_duration_us(update.audio_frame_duration_us);
+                        }
+                        let _ = ctrl_out_tx.send(Msg::SessionModeUpdate(update).into());
+                    }
                     Some(SessionCommand::SwitchDisplay(index)) => {
                         let _ = ctrl_out_tx.send(Msg::SwitchDisplay(SwitchDisplay { index }).into());
                     }
                     Some(SessionCommand::SetAudioEnabled(on)) => {
                         if let Some(ao) = &audio_out {
                             ao.set_enabled(on);
+                        }
+                    }
+                    Some(SessionCommand::SetAudioProcessing {
+                        echo_cancellation,
+                        noise_suppression,
+                    }) => {
+                        mic_processor.set_processing(echo_cancellation, noise_suppression);
+                        if !echo_cancellation {
+                            shared.aec_ref.clear();
+                        }
+                    }
+                    Some(SessionCommand::PushMicPcm {
+                        pcm16,
+                        sample_rate,
+                        channels,
+                    }) => {
+                        let pkts = mic_processor.process_pcm16_to_opus(
+                            &pcm16,
+                            sample_rate,
+                            channels,
+                            Some(&shared.aec_ref),
+                        );
+                        for pkt in pkts {
+                            if let Err(e) = mic_sender.send(&pkt) {
+                                tracing::debug!("Android viewer mic audio send error: {e}");
+                                break;
+                            }
                         }
                     }
                     Some(SessionCommand::SetClipboardEnabled(on)) => {
@@ -1609,5 +1979,150 @@ mod tests {
         assert_eq!(ack_env.msg, Some(Msg::ChatAck(ChatAck { id: 99 })));
         assert_eq!(rec.msgs.lock().as_slice(), &[(99, "DesktopHost".into(), "Hello from PC!".into(), 1_700_000_000_000)]);
         assert_eq!(rec.acks.lock().as_slice(), &[1]);
+    }
+
+    #[test]
+    fn update_session_mode_queues_normalized_update_and_roundtrips() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = AndroidSessionHandle {
+            cmd_tx: tx,
+            shared: Arc::new(SessionShared::default()),
+            disconnected: AtomicBool::new(false),
+        };
+
+        handle.update_session_mode(constants::MODE_GAMING, 50_000, 120, 5_000, false);
+        handle.update_session_mode(99, 20_000, 60, 10_000, true);
+
+        match rx.try_recv().unwrap() {
+            SessionCommand::UpdateSessionMode(u) => {
+                assert_eq!(u.mode, constants::MODE_GAMING);
+                assert_eq!(u.max_bitrate_kbps, 50_000);
+                assert_eq!(u.max_fps, 120);
+                assert_eq!(u.audio_frame_duration_us, 5_000);
+                assert!(!u.prefer_yuv444);
+                let env: Envelope = Msg::SessionModeUpdate(u.clone()).into();
+                assert_eq!(env.msg, Some(Msg::SessionModeUpdate(u)));
+            }
+            _ => panic!("expected UpdateSessionMode"),
+        }
+
+        // Unknown mode normalizes to MODE_DESKTOP.
+        match rx.try_recv().unwrap() {
+            SessionCommand::UpdateSessionMode(u) => {
+                assert_eq!(u.mode, constants::MODE_DESKTOP);
+                assert_eq!(u.max_bitrate_kbps, 20_000);
+                assert_eq!(u.max_fps, 60);
+                assert_eq!(u.audio_frame_duration_us, 10_000);
+                assert!(u.prefer_yuv444);
+            }
+            _ => panic!("expected UpdateSessionMode"),
+        }
+    }
+
+    #[test]
+    fn audio_processing_config_and_mic_dsp_pipeline_denoise_aec_opus() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(SessionShared::default());
+        let handle = AndroidSessionHandle {
+            cmd_tx: tx,
+            shared: shared.clone(),
+            disconnected: AtomicBool::new(false),
+        };
+
+        // Defaults: echo cancellation & noise suppression both enabled.
+        assert!(shared.echo_cancellation.load(Ordering::Relaxed));
+        assert!(shared.noise_suppression.load(Ordering::Relaxed));
+
+        handle.set_audio_processing(false, true);
+        assert!(!shared.echo_cancellation.load(Ordering::Relaxed));
+        assert!(shared.noise_suppression.load(Ordering::Relaxed));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionCommand::SetAudioProcessing {
+                echo_cancellation: false,
+                noise_suppression: true,
+            })
+        ));
+
+        // Invalid mic chunks are ignored; valid chunk sets mic_active and queues command.
+        handle.push_mic_pcm(Vec::new(), 48_000, 1);
+        handle.push_mic_pcm(vec![0; 480], 48_000, 3);
+        assert!(rx.try_recv().is_err());
+
+        handle.push_mic_pcm(vec![1000; 480], 48_000, 1);
+        assert!(shared.mic_active.load(Ordering::Relaxed));
+        assert!(matches!(rx.try_recv(), Ok(SessionCommand::PushMicPcm { sample_rate: 48_000, channels: 1, .. })));
+
+        // Verify NoiseSuppressor + AcousticEchoCanceller + OpusEncoder end-to-end.
+        let mut proc = MicAudioProcessor::new(48_000, 1, true, true);
+        assert!(proc.echo_cancellation());
+        assert!(proc.noise_suppression());
+
+        let bus = AecReferenceBus::new();
+        let mut x: u64 = 0xCAFE_BABE_1234_5678;
+        let mut next_sample = || -> f32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let u = (x >> 40) as f32 / ((1u32 << 24) as f32);
+            (u * 2.0 - 1.0) * 0.45
+        };
+
+        let mut total_pkts = 0usize;
+        let mut delay_line = std::collections::VecDeque::from(vec![0.0f32; 32]);
+        let mut tail_in_pow = 0.0f64;
+        let mut tail_out_pow = 0.0f64;
+
+        // 80 x 10 ms frames = 800 ms of stereo playback echoed into mono mic.
+        for frame_idx in 0..80usize {
+            let mut stereo_far = Vec::with_capacity(480 * 2);
+            let mut mono_mic = Vec::with_capacity(480);
+            for _ in 0..480 {
+                let s = next_sample();
+                stereo_far.push(s);
+                stereo_far.push(s);
+                let delayed = delay_line.pop_front().unwrap_or(0.0);
+                delay_line.push_back(s);
+                mono_mic.push(delayed * 0.5);
+            }
+            bus.push_playback(&stereo_far, 2);
+
+            let mut f32_copy = mono_mic.clone();
+            proc.process_f32_in_place(&mut f32_copy, Some(&bus));
+            assert!(f32_copy.iter().all(|v| v.is_finite()));
+            if frame_idx >= 50 {
+                tail_in_pow += mono_mic.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+                tail_out_pow += f32_copy.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+            }
+        }
+        assert!(
+            tail_out_pow < tail_in_pow * 0.25,
+            "AEC should strongly attenuate echo (in={tail_in_pow:.4}, out={tail_out_pow:.4}, erle={:.2}dB)",
+            proc.last_erle_db()
+        );
+
+        // Verify PCM16 -> Denoise -> AEC -> Opus produces real Opus packets.
+        let mut pcm_in = vec![0i16; 480];
+        for (i, slot) in pcm_in.iter_mut().enumerate() {
+            let t = i as f32 / 48_000.0;
+            *slot = ((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 12_000.0) as i16;
+        }
+        for _ in 0..3 {
+            let pkts = proc.process_pcm16_to_opus(&pcm_in, 48_000, 1, Some(&bus));
+            for pkt in &pkts {
+                assert_eq!(pkt.codec, AudioCodecId::Opus);
+                assert!(!pkt.data.is_empty());
+            }
+            total_pkts += pkts.len();
+        }
+        assert!(total_pkts >= 3, "expected at least 3 encoded Opus mic packets, got {total_pkts}");
+
+        // Toggling flags off resets state and leaves non-finite sanitization intact.
+        proc.set_processing(false, false);
+        assert!(!proc.echo_cancellation());
+        assert!(!proc.noise_suppression());
+        let mut raw = [0.25f32, -0.25f32];
+        proc.process_f32_in_place(&mut raw, None);
+        assert_eq!(raw, [0.25f32, -0.25f32]);
     }
 }

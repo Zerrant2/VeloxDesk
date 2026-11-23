@@ -26,6 +26,9 @@ class UpdateCheckerTest {
         assertTrue(UpdateChecker.isNewerVersion("0.3.0", "0.3.1"))
         assertTrue(UpdateChecker.isNewerVersion("0.3.0", "v0.4.0"))
         assertTrue(UpdateChecker.isNewerVersion("0.4.0", "v0.5.0"))
+        assertTrue(UpdateChecker.isNewerVersion("0.5.0", "v0.6.0"))
+        assertFalse(UpdateChecker.isNewerVersion("0.6.0", "v0.6.0"))
+        assertFalse(UpdateChecker.isNewerVersion("0.6.0", "v0.5.0"))
         assertFalse(UpdateChecker.isNewerVersion("0.5.0", "v0.5.0"))
         assertFalse(UpdateChecker.isNewerVersion("0.5.0", "v0.4.0"))
         assertTrue(UpdateChecker.isNewerVersion("0.3.0", "1.0.0"))
@@ -76,13 +79,13 @@ class UpdateCheckerTest {
     fun parseReleaseJson_prefersNamedAndroidApkAndFiltersEvilAssets() {
         val json = """
             {
-              "tag_name": "v0.5.0",
-              "html_url": "https://github.com/Zerrant2/VeloxDesk/releases/tag/v0.5.0",
+              "tag_name": "v0.6.0",
+              "html_url": "https://github.com/Zerrant2/VeloxDesk/releases/tag/v0.6.0",
               "body": "Android release notes",
               "assets": [
                 {
                   "name": "veloxdesk.exe",
-                  "browser_download_url": "https://github.com/Zerrant2/VeloxDesk/releases/download/v0.5.0/veloxdesk.exe"
+                  "browser_download_url": "https://github.com/Zerrant2/VeloxDesk/releases/download/v0.6.0/veloxdesk.exe"
                 },
                 {
                   "name": "evil.apk",
@@ -90,11 +93,11 @@ class UpdateCheckerTest {
                 },
                 {
                   "name": "other-viewer.apk",
-                  "browser_download_url": "https://github.com/Zerrant2/VeloxDesk/releases/download/v0.5.0/other-viewer.apk"
+                  "browser_download_url": "https://github.com/Zerrant2/VeloxDesk/releases/download/v0.6.0/other-viewer.apk"
                 },
                 {
                   "name": "veloxdesk-android.apk",
-                  "browser_download_url": "https://github.com/Zerrant2/VeloxDesk/releases/download/v0.5.0/veloxdesk-android.apk"
+                  "browser_download_url": "https://github.com/Zerrant2/VeloxDesk/releases/download/v0.6.0/veloxdesk-android.apk"
                 }
               ]
             }
@@ -102,11 +105,11 @@ class UpdateCheckerTest {
 
         val release = UpdateChecker.parseReleaseJson(json)
         assertNotNull(release)
-        assertEquals("v0.5.0", release!!.tagName)
-        assertEquals("0.5.0", release.version)
+        assertEquals("v0.6.0", release!!.tagName)
+        assertEquals("0.6.0", release.version)
         assertEquals("veloxdesk-android.apk", release.apkName)
         assertEquals(
-            "https://github.com/Zerrant2/VeloxDesk/releases/download/v0.5.0/veloxdesk-android.apk",
+            "https://github.com/Zerrant2/VeloxDesk/releases/download/v0.6.0/veloxdesk-android.apk",
             release.apkUrl,
         )
         assertEquals("Android release notes", release.notes)

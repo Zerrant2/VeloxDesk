@@ -34,7 +34,8 @@ mod net {
     use tokio::sync::{mpsc, watch};
     use tokio::time::{interval, timeout};
     use veloxdesk_audio::{
-        AcousticEchoCanceller, AecConfig, AecReferenceFeed, AudioJitterBuffer, JitterConfig, OpusDecoder, OpusEncoder,
+        AcousticEchoCanceller, AecConfig, AecReferenceFeed, AudioJitterBuffer, DenoiseConfig, JitterConfig,
+        NoiseSuppressor, OpusDecoder, OpusEncoder,
     };
     use veloxdesk_core_traits::audio::{
         AudioCaptureConfig, AudioCodecId, AudioEncoder, AudioEncoderConfig, AudioFormat, EncodedAudio,
@@ -47,7 +48,7 @@ mod net {
     use veloxdesk_protocol::control::{
         AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, ChatAck, ChatMessage, Close,
         Envelope, GamepadState, Hello, InputEvent, KeyframeRequest, Ping, PrivacyMode, SessionConfig,
-        SwitchDisplay, SystemPowerRequest, VideoCodecCap, VideoConfig, envelope::Msg,
+        SessionModeUpdate, SwitchDisplay, SystemPowerRequest, VideoCodecCap, VideoConfig, envelope::Msg,
     };
     use veloxdesk_protocol::media::MediaKind;
     use veloxdesk_protocol::{PROTOCOL_VERSION, StreamKind};
@@ -539,6 +540,7 @@ mod net {
             initial_enabled: bool,
             aec_feed: AecReferenceFeed,
             aec_enabled: Arc<AtomicBool>,
+            ns_enabled: Arc<AtomicBool>,
         ) -> Self {
             let enabled = Arc::new(AtomicBool::new(initial_enabled));
             let stop = Arc::new(AtomicBool::new(false));
@@ -546,7 +548,7 @@ mod net {
             let stop_bg = stop.clone();
             let join = std::thread::Builder::new()
                 .name("viewer-mic".into())
-                .spawn(move || mic_capture_loop(ch, enabled_bg, stop_bg, aec_feed, aec_enabled))
+                .spawn(move || mic_capture_loop(ch, enabled_bg, stop_bg, aec_feed, aec_enabled, ns_enabled))
                 .ok();
             Self { enabled, stop, join }
         }
@@ -572,17 +574,57 @@ mod net {
         }
     }
 
+    /// Viewer microphone DSP chain: `Capture -> NoiseSuppressor (if enabled) -> NLMS AEC (if enabled)`.
+    #[allow(clippy::too_many_arguments)]
+    fn process_mic_dsp(
+        samples: &mut [f32],
+        ns_enabled: bool,
+        was_ns_on: &mut bool,
+        denoiser: &mut Option<NoiseSuppressor>,
+        aec_enabled: bool,
+        was_aec_on: &mut bool,
+        aec: &mut Option<AcousticEchoCanceller>,
+        aec_feed: &AecReferenceFeed,
+    ) {
+        if let Some(ns) = denoiser.as_mut() {
+            if ns_enabled {
+                if !*was_ns_on {
+                    ns.reset();
+                }
+                ns.process(samples);
+            } else if *was_ns_on {
+                ns.reset();
+            }
+        }
+        *was_ns_on = ns_enabled;
+
+        if let Some(canceller) = aec.as_mut() {
+            if aec_enabled {
+                if !*was_aec_on {
+                    canceller.reset();
+                }
+                canceller.process_capture_with_feed(samples, aec_feed);
+            } else if *was_aec_on {
+                canceller.reset();
+            }
+        }
+        *was_aec_on = aec_enabled;
+    }
+
     fn mic_capture_loop(
         ch: Arc<dyn TransportChannel>,
         enabled: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         aec_feed: AecReferenceFeed,
         aec_enabled: Arc<AtomicBool>,
+        ns_enabled: Arc<AtomicBool>,
     ) {
         let mut sender = AudioSender::new(ch, 1);
         let mut cap: Option<Box<dyn veloxdesk_core_traits::AudioCapture>> = None;
         let mut enc: Option<OpusEncoder> = None;
+        let mut denoiser: Option<NoiseSuppressor> = None;
         let mut aec: Option<AcousticEchoCanceller> = None;
+        let mut was_ns_on = ns_enabled.load(Ordering::Relaxed);
         let mut was_aec_on = aec_enabled.load(Ordering::Relaxed);
 
         while !stop.load(Ordering::Relaxed) {
@@ -591,6 +633,7 @@ mod net {
                     c.stop();
                 }
                 enc = None;
+                denoiser = None;
                 aec = None;
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
@@ -623,6 +666,11 @@ mod net {
                                 tracing::info!(backend = c.backend(), ?fmt, "viewer microphone streaming enabled");
                                 cap = Some(c);
                                 enc = Some(e);
+                                denoiser = Some(NoiseSuppressor::new(DenoiseConfig {
+                                    sample_rate: fmt.sample_rate,
+                                    channels: fmt.channels,
+                                    ..DenoiseConfig::default()
+                                }));
                                 aec = Some(AcousticEchoCanceller::new(AecConfig {
                                     sample_rate: fmt.sample_rate,
                                     channels: fmt.channels,
@@ -645,18 +693,18 @@ mod net {
             let (Some(c), Some(e)) = (cap.as_mut(), enc.as_mut()) else { continue };
             match c.read(Duration::from_millis(20)) {
                 Ok(Some(mut pcm)) => {
+                    let ns_on = ns_enabled.load(Ordering::Relaxed);
                     let aec_on = aec_enabled.load(Ordering::Relaxed);
-                    if let Some(canceller) = aec.as_mut() {
-                        if aec_on {
-                            if !was_aec_on {
-                                canceller.reset();
-                            }
-                            canceller.process_capture_with_feed(&mut pcm.samples, &aec_feed);
-                        } else if was_aec_on {
-                            canceller.reset();
-                        }
-                    }
-                    was_aec_on = aec_on;
+                    process_mic_dsp(
+                        &mut pcm.samples,
+                        ns_on,
+                        &mut was_ns_on,
+                        &mut denoiser,
+                        aec_on,
+                        &mut was_aec_on,
+                        &mut aec,
+                        &aec_feed,
+                    );
                     if let Ok(pkts) = e.encode(&pcm) {
                         for pkt in pkts {
                             let _ = sender.send(&pkt);
@@ -877,17 +925,25 @@ mod net {
             }
         };
 
-        // 5b. Audio playback thread, optional microphone thread (with NLMS AEC), and physical gamepad poller (M3/v0.5.0).
+        // 5b. Audio playback thread, optional microphone thread (NoiseSuppressor -> NLMS AEC), and physical gamepad poller (M3/v0.5.0/v0.6.0).
         let aec_feed = AecReferenceFeed::new(48_000 * 2);
         let aec_enabled = Arc::new(AtomicBool::new(opts.echo_cancellation));
-        let audio_out = AudioPlaybackHandle::spawn(
+        let ns_enabled = Arc::new(AtomicBool::new(opts.noise_suppression));
+        let mut audio_enabled_now = opts.audio_enabled;
+        let mut audio_out = AudioPlaybackHandle::spawn(
             initial_cfg.audio.as_ref(),
-            opts.audio_enabled,
+            audio_enabled_now,
             shared.clone(),
             aec_feed.clone(),
             aec_enabled.clone(),
         );
-        let mic = MicCaptureHandle::spawn(ch.clone(), opts.mic_enabled, aec_feed.clone(), aec_enabled.clone());
+        let mic = MicCaptureHandle::spawn(
+            ch.clone(),
+            opts.mic_enabled,
+            aec_feed.clone(),
+            aec_enabled.clone(),
+            ns_enabled.clone(),
+        );
         let (gp_tx, mut gp_rx) = mpsc::unbounded_channel::<GamepadState>();
         let gamepads = GamepadPoller::start(gp_tx, shared.active_gamepads.clone());
         let gp_ch = ch.clone();
@@ -926,6 +982,21 @@ mod net {
             decoder.configure(v.clone());
         }
         let _ = proxy.send_event(UserEvent::Session(SessionEvent::Config(Box::new(initial_cfg))));
+
+        // If the user configured a non-Auto Opus audio frame latency, send an initial
+        // SessionModeUpdate right after SessionConfig so the host adapts immediately.
+        if opts.audio_frame_duration_us > 0 {
+            let _ = ctrl_out_tx.send(
+                Msg::SessionModeUpdate(SessionModeUpdate {
+                    mode: opts.mode as i32,
+                    max_bitrate_kbps: opts.max_bitrate_kbps,
+                    max_fps: opts.viewer_refresh_hz,
+                    audio_frame_duration_us: opts.audio_frame_duration_us,
+                    prefer_yuv444: opts.yuv444,
+                })
+                .into(),
+            );
+        }
 
         // Immediate Ping #1 so ClockSync converges before the first HUD publish.
         let mut ping_seq: u32 = 1;
@@ -1014,7 +1085,24 @@ mod net {
                                     decoder.configure(v.clone());
                                 }
                                 if let Some(a) = &cfg.audio {
+                                    let changed = active_audio_cfg.as_ref().is_none_or(|prev| {
+                                        prev.sample_rate != a.sample_rate
+                                            || prev.channels != a.channels
+                                            || prev.frame_duration_us != a.frame_duration_us
+                                    });
                                     active_audio_cfg = Some(a.clone());
+                                    if changed {
+                                        if let Some(prev) = audio_out.take() {
+                                            prev.stop();
+                                        }
+                                        audio_out = AudioPlaybackHandle::spawn(
+                                            Some(a),
+                                            audio_enabled_now,
+                                            shared.clone(),
+                                            aec_feed.clone(),
+                                            aec_enabled.clone(),
+                                        );
+                                    }
                                 }
                                 let _ = proxy.send_event(UserEvent::Session(SessionEvent::Config(Box::new(cfg))));
                             }
@@ -1025,6 +1113,23 @@ mod net {
                                 let _ = proxy.send_event(UserEvent::Session(SessionEvent::VideoConfig(Box::new(v))));
                             }
                             Some(Msg::AudioConfig(a)) => {
+                                let changed = active_audio_cfg.as_ref().is_none_or(|prev| {
+                                    prev.sample_rate != a.sample_rate
+                                        || prev.channels != a.channels
+                                        || prev.frame_duration_us != a.frame_duration_us
+                                });
+                                if changed {
+                                    if let Some(prev) = audio_out.take() {
+                                        prev.stop();
+                                    }
+                                    audio_out = AudioPlaybackHandle::spawn(
+                                        Some(&a),
+                                        audio_enabled_now,
+                                        shared.clone(),
+                                        aec_feed.clone(),
+                                        aec_enabled.clone(),
+                                    );
+                                }
                                 active_audio_cfg = Some(a);
                             }
                             Some(Msg::Permissions(p)) => {
@@ -1114,6 +1219,7 @@ mod net {
                             );
                         }
                         Some(SessionCommand::SetAudio(on)) => {
+                            audio_enabled_now = on;
                             if let Some(ao) = &audio_out {
                                 ao.set_enabled(on);
                             }
@@ -1124,6 +1230,12 @@ mod net {
                         Some(SessionCommand::SetEchoCancellation(on)) => {
                             aec_enabled.store(on, Ordering::Relaxed);
                             aec_feed.clear();
+                        }
+                        Some(SessionCommand::SetNoiseSuppression(on)) => {
+                            ns_enabled.store(on, Ordering::Relaxed);
+                        }
+                        Some(SessionCommand::UpdateSessionMode(upd)) => {
+                            let _ = ctrl_out_tx.send(Msg::SessionModeUpdate(upd).into());
                         }
                         Some(SessionCommand::SetClipboardSync(on)) => {
                             if on {
@@ -1813,5 +1925,78 @@ mod net {
             }
         });
         tx
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use veloxdesk_core_traits::audio::AudioFrame;
+
+        #[test]
+        fn mic_dsp_chain_denoise_aec_and_opus_encode() {
+            let fmt = AudioFormat::STEREO_48K;
+            let mut denoiser = Some(NoiseSuppressor::new(DenoiseConfig {
+                sample_rate: fmt.sample_rate,
+                channels: fmt.channels,
+                ..DenoiseConfig::default()
+            }));
+            let mut aec = Some(AcousticEchoCanceller::new(AecConfig {
+                sample_rate: fmt.sample_rate,
+                channels: fmt.channels,
+                ..AecConfig::default()
+            }));
+            let feed = AecReferenceFeed::new(48_000 * 2);
+            let mut enc = OpusEncoder::new(&AudioEncoderConfig {
+                format: fmt,
+                bitrate_kbps: 64,
+                frame_duration: Duration::from_millis(5),
+                low_delay: true,
+            })
+            .expect("opus encoder");
+
+            let spc = 240usize; // 5 ms @ 48 kHz
+            let far_ref = vec![0.25f32; spc * 2];
+            feed.push(&far_ref);
+
+            let mut was_ns = false;
+            let mut was_aec = false;
+            let mut samples = vec![0.1f32; spc * 2];
+            samples[0] = f32::NAN;
+
+            // Both enabled -> sanitizes NaN, runs NoiseSuppressor -> AEC -> Opus encode cleanly.
+            process_mic_dsp(
+                &mut samples,
+                true,
+                &mut was_ns,
+                &mut denoiser,
+                true,
+                &mut was_aec,
+                &mut aec,
+                &feed,
+            );
+            assert!(was_ns && was_aec);
+            assert!(samples.iter().all(|s| s.is_finite()));
+
+            let pkts = enc
+                .encode(&AudioFrame { format: fmt, samples: samples.clone(), capture_ts: Timestamp::now() })
+                .expect("opus encode after DSP");
+            assert_eq!(pkts.len(), 1);
+            assert!(!pkts[0].data.is_empty());
+
+            // Live toggle OFF resets both stages cleanly and passes samples through.
+            let mut bypass = vec![0.3f32; spc * 2];
+            process_mic_dsp(
+                &mut bypass,
+                false,
+                &mut was_ns,
+                &mut denoiser,
+                false,
+                &mut was_aec,
+                &mut aec,
+                &feed,
+            );
+            assert!(!was_ns && !was_aec);
+            assert_eq!(bypass[0], 0.3);
+        }
     }
 }

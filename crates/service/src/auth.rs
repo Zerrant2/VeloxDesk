@@ -223,6 +223,7 @@ struct AuthInner {
     trusted_peers: Vec<TrustedPeer>,
     permanent_password_hash: Option<PasswordHash>,
     require_accept_override: Option<bool>,
+    default_permissions_override: Option<Permissions>,
     on_otp_rotated: Option<OtpRotatedCallback>,
     on_trusted_peer_added: Option<TrustedPeerCallback>,
 }
@@ -245,6 +246,7 @@ impl HostAuthState {
                 trusted_peers: cfg.trusted_peers.clone(),
                 permanent_password_hash: cfg.permanent_password_hash.clone(),
                 require_accept_override: None,
+                default_permissions_override: None,
                 on_otp_rotated: None,
                 on_trusted_peer_added: None,
             }),
@@ -272,6 +274,16 @@ impl HostAuthState {
     /// Effective `require_accept` flag, honoring any runtime override set via [`Self::set_require_accept`].
     pub fn effective_require_accept(&self, default: bool) -> bool {
         self.lock().require_accept_override.unwrap_or(default)
+    }
+
+    /// Dynamically update default host session permissions (applied live on next incoming connection) (v0.6.0).
+    pub fn set_default_permissions(&self, perms: Permissions) {
+        self.lock().default_permissions_override = Some(perms);
+    }
+
+    /// Runtime default permissions override, if configured via [`Self::set_default_permissions`] (v0.6.0).
+    pub fn default_permissions_override(&self) -> Option<Permissions> {
+        self.lock().default_permissions_override.clone()
     }
 
     /// Install an optional callback invoked whenever the OTP rotates (manually or after login).
@@ -425,20 +437,15 @@ async fn reject_auth(
     CoreError::AccessDenied(reason.into())
 }
 
-fn default_session_permissions(cfg: &HostConfig) -> Permissions {
-    Permissions {
-        view: true,
-        input: cfg.allow_input,
-        clipboard: true,
-        file_transfer: true,
-        audio: cfg.audio_enabled,
-        tunnel: true,
-        terminal: true,
-        restart: false,
-        privacy_mode: true,
-        allow_chat: true,
-        allow_power: false,
+fn default_session_permissions(cfg: &HostConfig, state: Option<&HostAuthState>) -> Permissions {
+    if let Some(override_perms) = state.and_then(HostAuthState::default_permissions_override) {
+        return override_perms;
     }
+    let mut p = cfg.default_permissions.clone();
+    p.view = true;
+    p.input &= cfg.allow_input;
+    p.audio &= cfg.audio_enabled;
+    p
 }
 
 /// Verify peer identity and execute the M1/M2 authentication handshake after receiving `Hello`.
@@ -479,7 +486,7 @@ pub(crate) async fn authenticate(
 
     // 2. M1 open mode: skip AuthChallenge and auto-accept with configured permissions.
     if cfg.auth.is_open() {
-        let perms = default_session_permissions(cfg);
+        let perms = default_session_permissions(cfg, cfg.auth.shared_state.as_deref());
         writer
             .send(
                 &Msg::AuthResult(AuthResult {
@@ -637,7 +644,7 @@ pub(crate) async fn authenticate(
         }
         p
     } else {
-        let default_permissions = default_session_permissions(cfg);
+        let default_permissions = default_session_permissions(cfg, Some(&state));
         if require_accept {
             let Some(handler) = &cfg.auth.approval_handler else {
                 return Err(

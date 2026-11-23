@@ -12,7 +12,7 @@ use veloxdesk_core_traits::metrics::{HudSnapshot, LatencySamples};
 use veloxdesk_core_traits::render::VideoRenderer;
 use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
-use veloxdesk_protocol::control::{SessionConfig, SystemPowerAction, VideoCodec};
+use veloxdesk_protocol::control::{SessionConfig, SessionModeUpdate, SystemPowerAction, VideoCodec};
 use veloxdesk_render::hud::{HudLabels, hud_line, is_toggle_shortcut};
 use veloxdesk_render::pattern::nv12_test_frame;
 use veloxdesk_render::winit::application::ApplicationHandler;
@@ -237,6 +237,50 @@ fn local_sender_name() -> String {
 
 fn unix_now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+fn resolve_recordings_dir(configured: &str) -> PathBuf {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        veloxdesk_recorder::default_recordings_dir()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+fn open_recordings_folder(configured: &str) {
+    let dir = resolve_recordings_dir(configured);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(path = %dir.display(), "failed to create recordings folder: {e}");
+    }
+    #[cfg(windows)]
+    let res = std::process::Command::new("explorer.exe").arg(&dir).spawn();
+    #[cfg(target_os = "macos")]
+    let res = std::process::Command::new("open").arg(&dir).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let res = std::process::Command::new("xdg-open").arg(&dir).spawn();
+    if let Err(e) = res {
+        tracing::warn!(path = %dir.display(), "failed to open recordings folder in file manager: {e}");
+    }
+}
+
+fn build_session_mode_update_from(settings: &Settings) -> SessionModeUpdate {
+    let prof = settings.active();
+    SessionModeUpdate {
+        mode: settings.mode.to_wire() as i32,
+        max_bitrate_kbps: prof.quality.bitrate_kbps(),
+        max_fps: prof.fps_cap.fps(),
+        audio_frame_duration_us: prof.audio_frame_latency.to_wire_us(),
+        prefer_yuv444: prof.yuv444,
+    }
+}
+
+fn should_arm_auto_reconnect(settings: &Settings, action: Option<SystemPowerAction>) -> bool {
+    settings.auto_reconnect
+        && matches!(
+            action,
+            Some(SystemPowerAction::Reboot | SystemPowerAction::RebootSafeMode)
+        )
 }
 
 /// Preserved connection parameters for automatic reconnect after a remote reboot (v0.5.0).
@@ -625,7 +669,10 @@ impl App {
             permanent_password_hash: self.settings.permanent_password_hash.clone(),
             trusted_peers: self.settings.trusted_peers.clone(),
             require_accept: self.settings.require_accept,
-            echo_cancellation: self.settings.effective_echo_cancellation(),
+            default_permissions: self.settings.host_default_permissions(),
+            echo_cancellation: self.settings.host_echo_exclusion,
+            mic_noise_suppression: self.settings.active().noise_suppression,
+            privacy_mode: self.settings.host_privacy_mode,
         };
         match EmbeddedHostHandle::start(
             rendezvous,
@@ -769,7 +816,9 @@ impl App {
             prefer_gpu_decode,
             audio_enabled: prof.audio_enabled,
             mic_enabled: prof.mic_enabled,
-            echo_cancellation: self.settings.effective_echo_cancellation(),
+            echo_cancellation: prof.echo_cancellation,
+            noise_suppression: prof.noise_suppression,
+            audio_frame_duration_us: prof.audio_frame_latency.to_wire_us(),
             clipboard_sync: prof.clipboard_sync,
             initial_tunnels: saved.tunnels,
             hdr_10bit: prof.hdr_10bit,
@@ -946,6 +995,12 @@ impl App {
         map_video_to_host(config, self.surface.as_ref().and_then(|s| s.video_size()), vx, vy)
     }
 
+    fn send_session_mode_update(&self) {
+        if let State::Session { handle, .. } = &self.state {
+            handle.send(SessionCommand::UpdateSessionMode(build_session_mode_update_from(&self.settings)));
+        }
+    }
+
     fn apply_toolbar(&mut self, a: ToolbarAction, event_loop: &ActiveEventLoop) {
         match a {
             ToolbarAction::SetLanguage(_) => {
@@ -964,7 +1019,7 @@ impl App {
                 }
             }
             ToolbarAction::SetMode(m) => {
-                tracing::info!(mode = m.label(), "mode changed; applying active profile settings");
+                tracing::info!(mode = m.label(), "mode changed; applying active profile settings live");
                 self.settings.set_mode(m);
                 let prof = *self.settings.active();
                 if m == Mode::Desktop || !prof.relative_mouse_in_gaming {
@@ -983,10 +1038,11 @@ impl App {
                     s.window().request_redraw();
                 }
                 if let State::Session { handle, .. } = &self.state {
-                    handle.send(SessionCommand::SetMaxBitrate(prof.quality.bitrate_kbps()));
+                    handle.send(SessionCommand::UpdateSessionMode(build_session_mode_update_from(&self.settings)));
                     handle.send(SessionCommand::SetAudio(prof.audio_enabled));
                     handle.send(SessionCommand::SetMic(prof.mic_enabled));
-                    handle.send(SessionCommand::SetEchoCancellation(self.settings.effective_echo_cancellation()));
+                    handle.send(SessionCommand::SetEchoCancellation(prof.echo_cancellation));
+                    handle.send(SessionCommand::SetNoiseSuppression(prof.noise_suppression));
                     handle.send(SessionCommand::SetClipboardSync(prof.clipboard_sync));
                 }
                 self.save_settings();
@@ -1000,10 +1056,17 @@ impl App {
                 if let State::Session { handle, .. } = &self.state {
                     handle.send(SessionCommand::SetMaxBitrate(q.bitrate_kbps()));
                 }
+                self.send_session_mode_update();
                 self.save_settings();
             }
             ToolbarAction::SetFpsCap(f) => {
-                tracing::info!(fps = f.fps(), "target FPS cap updated (applies on reconnect)");
+                tracing::info!(fps = f.fps(), "target FPS cap updated live");
+                self.send_session_mode_update();
+                self.save_settings();
+            }
+            ToolbarAction::SetYuv444(on) => {
+                tracing::info!(yuv444 = on, "YUV 4:4:4 preference updated live");
+                self.send_session_mode_update();
                 self.save_settings();
             }
             ToolbarAction::SetAudio(on) => {
@@ -1019,10 +1082,22 @@ impl App {
                 self.save_settings();
             }
             ToolbarAction::SetEchoCancellation(on) => {
-                self.settings.echo_cancellation = on;
+                self.settings.active_mut().echo_cancellation = on;
                 if let State::Session { handle, .. } = &self.state {
-                    handle.send(SessionCommand::SetEchoCancellation(self.settings.effective_echo_cancellation()));
+                    handle.send(SessionCommand::SetEchoCancellation(on));
                 }
+                self.save_settings();
+            }
+            ToolbarAction::SetNoiseSuppression(on) => {
+                self.settings.active_mut().noise_suppression = on;
+                if let State::Session { handle, .. } = &self.state {
+                    handle.send(SessionCommand::SetNoiseSuppression(on));
+                }
+                self.save_settings();
+            }
+            ToolbarAction::SetAudioFrameLatency(lat) => {
+                tracing::info!(latency = ?lat, wire_us = lat.to_wire_us(), "Opus audio frame latency updated live");
+                self.send_session_mode_update();
                 self.save_settings();
             }
             ToolbarAction::SetClipboardSync(on) => {
@@ -1074,11 +1149,7 @@ impl App {
                     if active {
                         handle.send(SessionCommand::StopRecording);
                     } else {
-                        let dir = if self.settings.recordings_dir.trim().is_empty() {
-                            veloxdesk_recorder::default_recordings_dir()
-                        } else {
-                            PathBuf::from(self.settings.recordings_dir.trim())
-                        };
+                        let dir = resolve_recordings_dir(&self.settings.recordings_dir);
                         let peer_label = if !self.session_info.host_name.trim().is_empty() {
                             self.session_info.host_name.clone()
                         } else {
@@ -1091,6 +1162,9 @@ impl App {
                         handle.send(SessionCommand::StartRecording { output_path });
                     }
                 }
+            }
+            ToolbarAction::OpenRecordingsFolder => {
+                open_recordings_folder(&self.settings.recordings_dir);
             }
             ToolbarAction::SystemPower(action) => {
                 if let State::Session { handle, .. } = &self.state {
@@ -1196,6 +1270,15 @@ impl App {
                 if let Some(s) = &self.surface {
                     s.window().request_redraw();
                 }
+            }
+            ToolbarAction::UpdateHostPolicy => {
+                self.save_settings();
+                if let Some(h) = &self.embedded_host {
+                    h.set_default_permissions(self.settings.host_default_permissions());
+                    h.set_echo_cancellation(self.settings.host_echo_exclusion);
+                    h.set_privacy_mode_kind(self.settings.host_privacy_mode);
+                }
+                self.request_redraw();
             }
             ToolbarAction::Disconnect => {
                 self.auto_reconnect_armed = false;
@@ -1772,7 +1855,7 @@ impl App {
                 let action = SystemPowerAction::try_from(res.action).ok();
                 if res.ok {
                     tracing::info!(?action, "remote host accepted power action");
-                    if matches!(action, Some(SystemPowerAction::Reboot | SystemPowerAction::RebootSafeMode)) {
+                    if should_arm_auto_reconnect(&self.settings, action) {
                         self.auto_reconnect_armed = true;
                     }
                 } else {
@@ -1852,7 +1935,8 @@ impl App {
             SessionEvent::Decoder { name, hardware } => self.decoder = (name, hardware),
             SessionEvent::Closed(reason) => {
                 tracing::info!("session closed: {reason}");
-                if self.auto_reconnect_armed
+                if self.settings.auto_reconnect
+                    && self.auto_reconnect_armed
                     && let Some(saved) = self.last_connect.clone()
                 {
                     self.auto_reconnect_armed = false;
@@ -1931,8 +2015,9 @@ impl App {
                 tracing::debug!(peer = %peer_device_id, id, "embedded host chat message acked");
                 self.host_chat.mark_acked(id);
             }
-            EmbeddedHostEvent::ApprovalRequested { info, default_permissions, reply } => {
-                self.accept_prompt = Some((AcceptPrompt::new(info, default_permissions), reply));
+            EmbeddedHostEvent::ApprovalRequested { info, reply } => {
+                let perms = self.settings.host_default_permissions();
+                self.accept_prompt = Some((AcceptPrompt::new(info, perms), reply));
                 if let Some(s) = &self.surface {
                     let w = s.window();
                     w.set_minimized(false);
@@ -2710,5 +2795,42 @@ mod tests {
         assert!(!rc.is_expired(t0 + Duration::from_secs(299)));
         assert!(rc.is_expired(t0 + Duration::from_secs(300)));
         assert!(!rc.should_retry_now(t0 + Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn v060_session_mode_update_recordings_dir_and_auto_reconnect_gate() {
+        use veloxdesk_protocol::control::SessionMode;
+        use veloxdesk_ui::AudioFrameLatency;
+
+        // Default Desktop profile -> SessionModeUpdate
+        let mut s = Settings::default();
+        let desktop_upd = build_session_mode_update_from(&s);
+        assert_eq!(desktop_upd.mode, SessionMode::Desktop as i32);
+        assert_eq!(desktop_upd.max_bitrate_kbps, 20_000);
+        assert_eq!(desktop_upd.max_fps, 60);
+        assert_eq!(desktop_upd.audio_frame_duration_us, 0);
+        assert!(desktop_upd.prefer_yuv444);
+
+        // Gaming profile with explicit 2.5 ms Opus latency -> SessionModeUpdate
+        s.set_mode(Mode::Gaming);
+        s.gaming.audio_frame_latency = AudioFrameLatency::Ms2_5;
+        let gaming_upd = build_session_mode_update_from(&s);
+        assert_eq!(gaming_upd.mode, SessionMode::Gaming as i32);
+        assert_eq!(gaming_upd.max_bitrate_kbps, 50_000);
+        assert_eq!(gaming_upd.max_fps, 120);
+        assert_eq!(gaming_upd.audio_frame_duration_us, 2_500);
+        assert!(!gaming_upd.prefer_yuv444);
+
+        // Recordings dir resolution
+        assert_eq!(resolve_recordings_dir("   "), veloxdesk_recorder::default_recordings_dir());
+        assert_eq!(resolve_recordings_dir("  D:\\Recordings  "), PathBuf::from("D:\\Recordings"));
+
+        // Auto-reconnect gate respects `settings.auto_reconnect`
+        assert!(should_arm_auto_reconnect(&s, Some(SystemPowerAction::Reboot)));
+        assert!(should_arm_auto_reconnect(&s, Some(SystemPowerAction::RebootSafeMode)));
+        assert!(!should_arm_auto_reconnect(&s, Some(SystemPowerAction::LockScreen)));
+        s.auto_reconnect = false;
+        assert!(!should_arm_auto_reconnect(&s, Some(SystemPowerAction::Reboot)));
+        assert!(!should_arm_auto_reconnect(&s, Some(SystemPowerAction::RebootSafeMode)));
     }
 }

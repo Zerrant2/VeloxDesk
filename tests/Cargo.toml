@@ -14,23 +14,21 @@ net = []
 # Host↔viewer session smoke test (needs transport + service + codec).
 full = ["net"]
 
-[dependencies]
+[dev-dependencies]
 anyhow.workspace = true
 bytes.workspace = true
-prost.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "time", "sync", "macros"] }
-veloxdesk-core-traits = { workspace = true }
-veloxdesk-protocol = { workspace = true }
-
-[dev-dependencies]
 egui = { workspace = true }
+prost.workspace = true
 serde_json = "1"
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "time", "sync", "macros"] }
 veloxdesk-benches = { path = "../benches" }
 veloxdesk-audio = { workspace = true }
 veloxdesk-clipboard = { workspace = true }
 veloxdesk-codec = { workspace = true }
+veloxdesk-core-traits = { workspace = true }
 veloxdesk-crypto = { workspace = true }
 veloxdesk-file-transfer = { workspace = true }
+veloxdesk-protocol = { workspace = true }
 veloxdesk-recorder = { workspace = true }
 veloxdesk-render = { workspace = true }
 veloxdesk-server-rendezvous = { workspace = true }
@@ -75,6 +73,10 @@ required-features = ["full"]
 
 [[test]]
 name = "v050_polish"
+required-features = ["full"]
+
+[[test]]
+name = "v060_modes_settings"
 required-features = ["full"]
 
 [lints]

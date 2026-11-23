@@ -11,6 +11,7 @@
 //! * **Codec**: Pure-Rust `rusty-opus` (RFC 6716 / RFC 8251, runtime AVX2/NEON SIMD).
 
 pub mod aec;
+pub mod denoise;
 pub mod jitter;
 pub mod opus;
 pub mod pcm;
@@ -22,6 +23,7 @@ pub mod wasapi;
 pub mod linux;
 
 pub use aec::{AcousticEchoCanceller, AecConfig, AecReferenceFeed};
+pub use denoise::{DenoiseConfig, NoiseSuppressor};
 pub use jitter::{AudioJitterBuffer, JitterConfig, JitterPop, JitterStats};
 pub use opus::{OpusDecoder, OpusEncoder};
 

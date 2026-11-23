@@ -9,9 +9,9 @@ use veloxdesk_protocol::control::{
     envelope::Msg, AudioConfig, AuthChallenge, AuthResponse, AuthResult, BitrateUpdate, ChatAck, ChatMessage,
     ClipboardData, Close, CursorPosition, CursorShape, DisplayList, Envelope, FileAck, FileChunk, FileListing,
     FileRequest, FrameTimingReport, Hello, InputEvent, KeyframeRequest, Nack, Permissions, Ping, Pong, PrivacyMode,
-    PrivacyModeResult, ReceiverReport, Rumble, SessionConfig, SwitchDisplay, SystemPowerAction, SystemPowerRequest,
-    SystemPowerResult, TerminalData, TerminalExit, TerminalOpen, TerminalResize, TunnelOpen, TunnelResult,
-    VideoCodecCap, VideoConfig,
+    PrivacyModeResult, ReceiverReport, Rumble, SessionConfig, SessionMode, SessionModeUpdate, SwitchDisplay,
+    SystemPowerAction, SystemPowerRequest, SystemPowerResult, TerminalData, TerminalExit, TerminalOpen,
+    TerminalResize, TunnelOpen, TunnelResult, VideoCodecCap, VideoConfig,
 };
 use veloxdesk_protocol::framing::{decode_frame, encode_frame, frame_to_bytes, stream_preamble, MAX_FRAME_LEN};
 use veloxdesk_protocol::media::{flags, MediaHeader, MediaKind, WireCodec, MEDIA_HEADER_LEN};
@@ -577,4 +577,150 @@ fn permissions_v040_and_v050_backward_and_forward_compat() {
         }
         other => panic!("expected v0.4.0 Permissions inside Envelope, got {other:?}"),
     }
+}
+
+// ───────────────────── v0.6.0 compatibility (tag 50) ─────────────────────
+
+/// Model of a v0.5.0 `Envelope` decoder that knows tags 1..=49, NOT v0.6.0 tag 50.
+#[derive(Clone, PartialEq, Message)]
+struct EnvelopeV050 {
+    #[prost(oneof = "env_v050::Msg", tags = "1, 6, 43, 45, 46, 47, 48, 49")]
+    msg: Option<env_v050::Msg>,
+}
+mod env_v050 {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Msg {
+        #[prost(message, tag = "1")]
+        Hello(veloxdesk_protocol::control::Hello),
+        #[prost(message, tag = "6")]
+        Ping(veloxdesk_protocol::control::Ping),
+        #[prost(message, tag = "43")]
+        Permissions(veloxdesk_protocol::control::Permissions),
+        #[prost(message, tag = "45")]
+        DisplayList(veloxdesk_protocol::control::DisplayList),
+        #[prost(message, tag = "46")]
+        ChatMessage(veloxdesk_protocol::control::ChatMessage),
+        #[prost(message, tag = "47")]
+        ChatAck(veloxdesk_protocol::control::ChatAck),
+        #[prost(message, tag = "48")]
+        SystemPowerRequest(veloxdesk_protocol::control::SystemPowerRequest),
+        #[prost(message, tag = "49")]
+        SystemPowerResult(veloxdesk_protocol::control::SystemPowerResult),
+    }
+}
+
+/// Verify v0.6.0 tag 50 (`SessionModeUpdate`) exact wire tag, inner field tags, framing roundtrip,
+/// and clean forward-compatibility (`msg: None`) on older v0.5.0 / v0.4.0 / v0 decoders.
+#[test]
+fn v060_envelope_tag_50_session_mode_update_roundtrip_and_older_decoder_compat() {
+    let cases = vec![
+        SessionModeUpdate {
+            mode: SessionMode::Desktop as i32,
+            max_bitrate_kbps: 0,
+            max_fps: 0,
+            audio_frame_duration_us: 0,
+            prefer_yuv444: false,
+        },
+        SessionModeUpdate {
+            mode: SessionMode::Desktop as i32,
+            max_bitrate_kbps: 12_000,
+            max_fps: 60,
+            audio_frame_duration_us: 10_000,
+            prefer_yuv444: true,
+        },
+        SessionModeUpdate {
+            mode: SessionMode::Gaming as i32,
+            max_bitrate_kbps: 50_000,
+            max_fps: 120,
+            audio_frame_duration_us: 5_000,
+            prefer_yuv444: false,
+        },
+        SessionModeUpdate {
+            mode: SessionMode::Gaming as i32,
+            max_bitrate_kbps: 80_000,
+            max_fps: 240,
+            audio_frame_duration_us: 2_500,
+            prefer_yuv444: true,
+        },
+    ];
+
+    // Freeze individual inner protobuf field tags 1..=5 on SessionModeUpdate.
+    assert_eq!(
+        SessionModeUpdate { mode: SessionMode::Gaming as i32, ..Default::default() }.encode_to_vec(),
+        vec![1 << 3, 1],
+        "SessionModeUpdate.mode must be tag 1"
+    );
+    assert_eq!(
+        SessionModeUpdate { max_bitrate_kbps: 5, ..Default::default() }.encode_to_vec(),
+        vec![2 << 3, 5],
+        "SessionModeUpdate.max_bitrate_kbps must be tag 2"
+    );
+    assert_eq!(
+        SessionModeUpdate { max_fps: 60, ..Default::default() }.encode_to_vec(),
+        vec![3 << 3, 60],
+        "SessionModeUpdate.max_fps must be tag 3"
+    );
+    assert_eq!(
+        SessionModeUpdate { audio_frame_duration_us: 10, ..Default::default() }.encode_to_vec(),
+        vec![4 << 3, 10],
+        "SessionModeUpdate.audio_frame_duration_us must be tag 4"
+    );
+    assert_eq!(
+        SessionModeUpdate { prefer_yuv444: true, ..Default::default() }.encode_to_vec(),
+        vec![5 << 3, 1],
+        "SessionModeUpdate.prefer_yuv444 must be tag 5"
+    );
+
+    let mut framed_wire = BytesMut::new();
+    let mut expected = Vec::with_capacity(cases.len());
+
+    // Golden varint key prefix for tag 50, wire type 2: (50 << 3) | 2 = 402 = [0x92, 0x03].
+    let expected_key_prefix = [0x92u8, 0x03u8];
+
+    for update in cases {
+        let env: Envelope = Msg::SessionModeUpdate(update).into();
+        let bytes = env.encode_to_vec();
+
+        let (wire_tag, wire_type) = decode_first_field_key(&bytes);
+        assert_eq!(wire_type, 2, "tag 50 must use length-delimited wire type 2");
+        assert_eq!(wire_tag, 50, "SessionModeUpdate must remain Envelope tag 50");
+        assert_eq!(&bytes[..2], &expected_key_prefix, "golden key prefix mismatch for tag 50");
+
+        // Current v0.6.0 decoder roundtrips cleanly.
+        assert_eq!(Envelope::decode(bytes.as_slice()).expect("v0.6.0 decode"), env);
+
+        // Older v0.5.0, v0.4.0, and v0 decoders ignore tag 50 cleanly (`msg: None`).
+        let old_v050 = EnvelopeV050::decode(bytes.as_slice())
+            .expect("v0.5.0 decoder must not fail on v0.6.0 tag 50");
+        assert!(old_v050.msg.is_none(), "v0.5.0 decoder must decode tag 50 as msg: None");
+
+        let old_v040 = EnvelopeV040::decode(bytes.as_slice())
+            .expect("v0.4.0 decoder must not fail on v0.6.0 tag 50");
+        assert!(old_v040.msg.is_none(), "v0.4.0 decoder must decode tag 50 as msg: None");
+
+        let old_v0 = EnvelopeV0::decode(bytes.as_slice())
+            .expect("v0 decoder must not fail on v0.6.0 tag 50");
+        assert!(old_v0.msg.is_none(), "v0 decoder must decode tag 50 as msg: None");
+
+        encode_frame(&env, &mut framed_wire).unwrap();
+        expected.push(env);
+    }
+
+    // Stream framing byte-by-byte roundtrip.
+    let all = framed_wire.freeze();
+    let mut partial = BytesMut::new();
+    let mut decoded = Vec::new();
+    for &b in all.iter() {
+        partial.extend_from_slice(&[b]);
+        while let Some(env) = decode_frame::<Envelope>(&mut partial).unwrap() {
+            decoded.push(env);
+        }
+    }
+    assert_eq!(decoded, expected);
+    assert!(partial.is_empty());
+
+    // Sanity check: v0.5.0 decoder still decodes tags 46..=49 cleanly.
+    let chat_env: Envelope = Msg::ChatAck(ChatAck { id: 7 }).into();
+    let v050_chat = EnvelopeV050::decode(chat_env.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(v050_chat.msg, Some(env_v050::Msg::ChatAck(ChatAck { id: 7 })));
 }

@@ -39,3 +39,4 @@ pub use host::{
 pub use ipc::{DEFAULT_IPC_PORT, IpcClient, IpcHandler, IpcRequest, IpcResponse, IpcServer};
 pub use power::{PowerExecutor, RecordedPowerAction, SimulatedPowerExecutor, SystemPowerExecutor};
 pub use session::{SessionHooks, SessionSummary, run_session, run_session_until, run_session_with_hooks};
+pub use veloxdesk_virtual_display::PrivacyModeKind;

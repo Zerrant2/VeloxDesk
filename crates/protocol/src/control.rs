@@ -845,6 +845,26 @@ pub struct SystemPowerResult {
     pub error: String,
 }
 
+/// Viewer → host live session mode and stream profile update (v0.6.0, Envelope tag 50).
+/// Zero numeric fields mean "keep host default / unchanged".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionModeUpdate {
+    #[prost(enumeration = "SessionMode", tag = "1")]
+    pub mode: i32,
+    /// Requested max video bitrate in kbps (0 = keep current / host default).
+    #[prost(uint32, tag = "2")]
+    pub max_bitrate_kbps: u32,
+    /// Requested max FPS cap (0 = keep current / host default).
+    #[prost(uint32, tag = "3")]
+    pub max_fps: u32,
+    /// Requested Opus audio frame duration in µs (0 = Auto: 5000 Gaming / 10000 Desktop).
+    #[prost(uint32, tag = "4")]
+    pub audio_frame_duration_us: u32,
+    /// Prefer YUV 4:4:4 full chroma when supported by encoder/decoder.
+    #[prost(bool, tag = "5")]
+    pub prefer_yuv444: bool,
+}
+
 // ───────────────────────────── envelope ─────────────────────────────
 
 /// Top-level control message. Unknown oneof tags decode as `msg: None` (ignore them).
@@ -852,7 +872,7 @@ pub struct SystemPowerResult {
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Msg",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50"
     )]
     pub msg: Option<envelope::Msg>,
 }
@@ -943,6 +963,9 @@ pub mod envelope {
         SystemPowerRequest(super::SystemPowerRequest),
         #[prost(message, tag = "49")]
         SystemPowerResult(super::SystemPowerResult),
+        // v0.6.0 live mode/profile update 50..
+        #[prost(message, tag = "50")]
+        SessionModeUpdate(super::SessionModeUpdate),
     }
 }
 
@@ -1018,5 +1041,19 @@ mod tests {
         assert!(inter.allow_chat && !inter.allow_power);
         let encoded = inter.encode_to_vec();
         assert_eq!(Permissions::decode(encoded.as_slice()).unwrap(), inter);
+    }
+
+    #[test]
+    fn v060_session_mode_update_roundtrip() {
+        let env: Envelope = envelope::Msg::SessionModeUpdate(SessionModeUpdate {
+            mode: SessionMode::Gaming as i32,
+            max_bitrate_kbps: 50_000,
+            max_fps: 120,
+            audio_frame_duration_us: 5_000,
+            prefer_yuv444: false,
+        })
+        .into();
+        let bytes = env.encode_to_vec();
+        assert_eq!(Envelope::decode(bytes.as_slice()).unwrap(), env);
     }
 }

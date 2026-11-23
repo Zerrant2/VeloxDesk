@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use veloxdesk_core_traits::render::{PresentMode, ScaleMode};
-use veloxdesk_protocol::control::SessionMode;
+use veloxdesk_protocol::control::{Permissions, SessionMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Language {
@@ -277,6 +277,98 @@ impl PasswordMode {
     }
 }
 
+/// Opus audio frame duration preference for low-latency audio streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AudioFrameLatency {
+    /// Automatic: 5 ms in Gaming mode, 10 ms in Desktop mode.
+    #[default]
+    Auto,
+    /// Ultra-low 2.5 ms Opus frames.
+    Ms2_5,
+    /// Low-latency 5 ms Opus frames.
+    Ms5,
+    /// Balanced 10 ms Opus frames.
+    Ms10,
+    /// Bandwidth-efficient 20 ms Opus frames.
+    Ms20,
+}
+
+impl AudioFrameLatency {
+    pub const ALL: [AudioFrameLatency; 5] = [
+        AudioFrameLatency::Auto,
+        AudioFrameLatency::Ms2_5,
+        AudioFrameLatency::Ms5,
+        AudioFrameLatency::Ms10,
+        AudioFrameLatency::Ms20,
+    ];
+
+    /// Wire representation in microseconds (`0` for `Auto`, else `2500`/`5000`/`10000`/`20000`).
+    pub const fn to_wire_us(self) -> u32 {
+        match self {
+            AudioFrameLatency::Auto => 0,
+            AudioFrameLatency::Ms2_5 => 2_500,
+            AudioFrameLatency::Ms5 => 5_000,
+            AudioFrameLatency::Ms10 => 10_000,
+            AudioFrameLatency::Ms20 => 20_000,
+        }
+    }
+
+    /// Effective Opus frame duration in microseconds for `mode` (`Auto` resolves to 5 ms Gaming / 10 ms Desktop).
+    pub const fn effective_us(self, mode: Mode) -> u32 {
+        match self {
+            AudioFrameLatency::Auto => match mode {
+                Mode::Gaming => 5_000,
+                Mode::Desktop => 10_000,
+            },
+            AudioFrameLatency::Ms2_5 => 2_500,
+            AudioFrameLatency::Ms5 => 5_000,
+            AudioFrameLatency::Ms10 => 10_000,
+            AudioFrameLatency::Ms20 => 20_000,
+        }
+    }
+
+    pub fn label_for(self, lang: Language) -> &'static str {
+        let t = crate::i18n::tr(lang);
+        match self {
+            AudioFrameLatency::Auto => t.audio_latency_auto,
+            AudioFrameLatency::Ms2_5 => t.audio_latency_2_5ms,
+            AudioFrameLatency::Ms5 => t.audio_latency_5ms,
+            AudioFrameLatency::Ms10 => t.audio_latency_10ms,
+            AudioFrameLatency::Ms20 => t.audio_latency_20ms,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.label_for(Language::En)
+    }
+}
+
+/// Windows physical display blanking strategy used by Host Privacy Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HostPrivacyMode {
+    /// Fullscreen topmost curtain overlay with `WDA_EXCLUDEFROMCAPTURE` (works without VDD).
+    #[default]
+    CurtainOverlay,
+    /// Curtain overlay plus `SC_MONITORPOWER` monitor power-off when a Virtual Display (VDD) is active.
+    VddMonitorOff,
+}
+
+impl HostPrivacyMode {
+    pub const ALL: [HostPrivacyMode; 2] = [HostPrivacyMode::CurtainOverlay, HostPrivacyMode::VddMonitorOff];
+
+    pub fn label_for(self, lang: Language) -> &'static str {
+        let t = crate::i18n::tr(lang);
+        match self {
+            HostPrivacyMode::CurtainOverlay => t.privacy_mode_curtain,
+            HostPrivacyMode::VddMonitorOff => t.privacy_mode_vdd,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.label_for(Language::En)
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -347,23 +439,54 @@ pub struct StreamSettings {
     pub mic_enabled: bool,
     /// Synchronize clipboard (text, images, file lists) with the remote host.
     pub clipboard_sync: bool,
+    /// Enable adaptive NLMS acoustic echo cancellation (AEC) on viewer microphone.
+    #[serde(default = "default_true")]
+    pub echo_cancellation: bool,
+    /// Enable pure-Rust microphone background noise suppression & VAD gate.
+    #[serde(default = "default_true")]
+    pub noise_suppression: bool,
+    /// Preferred Opus audio frame duration (`Auto` = 5 ms Gaming / 10 ms Desktop).
+    #[serde(default)]
+    pub audio_frame_latency: AudioFrameLatency,
 }
 
 impl StreamSettings {
     pub fn default_for(mode: Mode) -> Self {
-        Self {
-            quality: Quality::Balanced,
-            fps_cap: FpsCap::Fps120,
-            present: Present::Mailbox,
-            scale: Scale::Fit,
-            show_hud: false,
-            prefer_hw_decode: true,
-            relative_mouse_in_gaming: matches!(mode, Mode::Gaming),
-            hdr_10bit: false,
-            yuv444: false,
-            audio_enabled: true,
-            mic_enabled: false,
-            clipboard_sync: true,
+        match mode {
+            Mode::Desktop => Self {
+                quality: Quality::Balanced,
+                fps_cap: FpsCap::Fps60,
+                present: Present::Fifo,
+                scale: Scale::Fit,
+                show_hud: false,
+                prefer_hw_decode: true,
+                relative_mouse_in_gaming: false,
+                hdr_10bit: false,
+                yuv444: true,
+                audio_enabled: true,
+                mic_enabled: false,
+                clipboard_sync: true,
+                echo_cancellation: true,
+                noise_suppression: true,
+                audio_frame_latency: AudioFrameLatency::Auto,
+            },
+            Mode::Gaming => Self {
+                quality: Quality::High,
+                fps_cap: FpsCap::Fps120,
+                present: Present::Mailbox,
+                scale: Scale::Fit,
+                show_hud: true,
+                prefer_hw_decode: true,
+                relative_mouse_in_gaming: true,
+                hdr_10bit: false,
+                yuv444: false,
+                audio_enabled: true,
+                mic_enabled: false,
+                clipboard_sync: true,
+                echo_cancellation: true,
+                noise_suppression: true,
+                audio_frame_latency: AudioFrameLatency::Auto,
+            },
         }
     }
 }
@@ -392,12 +515,39 @@ pub struct Settings {
     pub permanent_password_hash: Option<String>,
     /// Persisted trusted viewer devices allowed passwordless Ed25519 reconnect.
     pub trusted_peers: Vec<SavedTrustedPeer>,
-    /// Enable echo cancellation (Windows process loopback exclusion + NLMS AEC; forced on in Gaming mode).
-    #[serde(default = "default_true")]
-    pub echo_cancellation: bool,
     /// Custom folder for saved `.mkv` session recordings (empty = default `Videos\VeloxDesk`).
     #[serde(default)]
     pub recordings_dir: String,
+    /// Automatically retry reconnecting after a remote host reboot (up to 5 minutes).
+    #[serde(default = "default_true")]
+    pub auto_reconnect: bool,
+    /// Default host permission: allow remote keyboard and mouse input.
+    #[serde(default = "default_true")]
+    pub host_allow_input: bool,
+    /// Default host permission: allow clipboard synchronization.
+    #[serde(default = "default_true")]
+    pub host_allow_clipboard: bool,
+    /// Default host permission: allow file transfer.
+    #[serde(default = "default_true")]
+    pub host_allow_file_transfer: bool,
+    /// Default host permission: allow remote audio and microphone streaming.
+    #[serde(default = "default_true")]
+    pub host_allow_audio: bool,
+    /// Default host permission: allow in-session text chat.
+    #[serde(default = "default_true")]
+    pub host_allow_chat: bool,
+    /// Default host permission: allow remote terminal and TCP port forwarding tunnels.
+    #[serde(default = "default_true")]
+    pub host_allow_terminal_tunnel: bool,
+    /// Default host permission: allow remote host power actions (reboot/lock/sleep).
+    #[serde(default)]
+    pub host_allow_power: bool,
+    /// Exclude VeloxDesk's own playback from host loopback audio capture (Windows Process Loopback Exclusion).
+    #[serde(default = "default_true")]
+    pub host_echo_exclusion: bool,
+    /// Windows physical monitor blanking strategy for Host Privacy Mode.
+    #[serde(default)]
+    pub host_privacy_mode: HostPrivacyMode,
 }
 
 impl Default for Settings {
@@ -414,8 +564,17 @@ impl Default for Settings {
             password_mode: PasswordMode::default(),
             permanent_password_hash: None,
             trusted_peers: Vec::new(),
-            echo_cancellation: true,
             recordings_dir: String::new(),
+            auto_reconnect: true,
+            host_allow_input: true,
+            host_allow_clipboard: true,
+            host_allow_file_transfer: true,
+            host_allow_audio: true,
+            host_allow_chat: true,
+            host_allow_terminal_tunnel: true,
+            host_allow_power: false,
+            host_echo_exclusion: true,
+            host_privacy_mode: HostPrivacyMode::CurtainOverlay,
         }
     }
 }
@@ -435,6 +594,9 @@ struct RawStreamSettings {
     audio_enabled: Option<bool>,
     mic_enabled: Option<bool>,
     clipboard_sync: Option<bool>,
+    echo_cancellation: Option<bool>,
+    noise_suppression: Option<bool>,
+    audio_frame_latency: Option<AudioFrameLatency>,
 }
 
 impl RawStreamSettings {
@@ -475,6 +637,15 @@ impl RawStreamSettings {
         if let Some(v) = self.clipboard_sync {
             dst.clipboard_sync = v;
         }
+        if let Some(v) = self.echo_cancellation {
+            dst.echo_cancellation = v;
+        }
+        if let Some(v) = self.noise_suppression {
+            dst.noise_suppression = v;
+        }
+        if let Some(v) = self.audio_frame_latency {
+            dst.audio_frame_latency = v;
+        }
     }
 }
 
@@ -492,8 +663,18 @@ struct RawSettings {
     password_mode: Option<PasswordMode>,
     permanent_password_hash: Option<String>,
     trusted_peers: Option<Vec<SavedTrustedPeer>>,
-    echo_cancellation: Option<bool>,
     recordings_dir: Option<String>,
+    auto_reconnect: Option<bool>,
+    host_allow_input: Option<bool>,
+    host_allow_clipboard: Option<bool>,
+    host_allow_file_transfer: Option<bool>,
+    host_allow_audio: Option<bool>,
+    host_allow_chat: Option<bool>,
+    host_allow_terminal_tunnel: Option<bool>,
+    host_allow_power: Option<bool>,
+    host_echo_exclusion: Option<bool>,
+    host_privacy_mode: Option<HostPrivacyMode>,
+    /// Captures pre-R4 flat stream fields and v0.5.0 top-level `echo_cancellation`.
     #[serde(flatten)]
     legacy: RawStreamSettings,
 }
@@ -506,8 +687,11 @@ impl<'de> Deserialize<'de> for Settings {
         let mut gaming = StreamSettings::default_for(Mode::Gaming);
 
         let legacy_rel_mouse = raw.legacy.relative_mouse_in_gaming;
+        let legacy_top_aec = raw.legacy.echo_cancellation;
         let has_desktop = raw.desktop.is_some();
         let has_gaming = raw.gaming.is_some();
+        let desktop_had_aec = raw.desktop.as_ref().is_some_and(|d| d.echo_cancellation.is_some());
+        let gaming_had_aec = raw.gaming.as_ref().is_some_and(|g| g.echo_cancellation.is_some());
 
         if let Some(d) = raw.desktop {
             d.apply_to(&mut desktop);
@@ -523,12 +707,17 @@ impl<'de> Deserialize<'de> for Settings {
         if !has_gaming && let Some(rel) = legacy_rel_mouse {
             gaming.relative_mouse_in_gaming = rel;
         }
+        // Backward-compat migration from v0.5.0 top-level `echo_cancellation`.
+        if let Some(aec) = legacy_top_aec {
+            if !desktop_had_aec {
+                desktop.echo_cancellation = aec;
+            }
+            if !gaming_had_aec {
+                gaming.echo_cancellation = aec;
+            }
+        }
 
-        let echo_cancellation = if mode == Mode::Gaming {
-            true
-        } else {
-            raw.echo_cancellation.unwrap_or(true)
-        };
+        let host_echo_exclusion = raw.host_echo_exclusion.or(legacy_top_aec).unwrap_or(true);
 
         Ok(Self {
             language: raw.language.unwrap_or_default(),
@@ -542,23 +731,51 @@ impl<'de> Deserialize<'de> for Settings {
             password_mode: raw.password_mode.unwrap_or_default(),
             permanent_password_hash: raw.permanent_password_hash.filter(|s| !s.trim().is_empty()),
             trusted_peers: raw.trusted_peers.unwrap_or_default(),
-            echo_cancellation,
             recordings_dir: raw.recordings_dir.unwrap_or_default(),
+            auto_reconnect: raw.auto_reconnect.unwrap_or(true),
+            host_allow_input: raw.host_allow_input.unwrap_or(true),
+            host_allow_clipboard: raw.host_allow_clipboard.unwrap_or(true),
+            host_allow_file_transfer: raw.host_allow_file_transfer.unwrap_or(true),
+            host_allow_audio: raw.host_allow_audio.unwrap_or(true),
+            host_allow_chat: raw.host_allow_chat.unwrap_or(true),
+            host_allow_terminal_tunnel: raw.host_allow_terminal_tunnel.unwrap_or(true),
+            host_allow_power: raw.host_allow_power.unwrap_or(false),
+            host_echo_exclusion,
+            host_privacy_mode: raw.host_privacy_mode.unwrap_or_default(),
         })
     }
 }
 
 impl Settings {
-    /// Whether echo cancellation is effectively active (always `true` in Gaming mode).
+    /// Whether echo cancellation is active for the currently selected session profile.
     pub fn effective_echo_cancellation(&self) -> bool {
-        self.echo_cancellation || self.mode == Mode::Gaming
+        self.active().echo_cancellation
     }
 
-    /// Switch the active session mode, forcing `echo_cancellation = true` when selecting Gaming.
+    /// Switch the active session mode.
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
-        if mode == Mode::Gaming {
-            self.echo_cancellation = true;
+    }
+
+    /// Reset the specified profile (`Desktop` or `Gaming`) back to its built-in defaults.
+    pub fn reset_profile_defaults(&mut self, mode: Mode) {
+        *self.profile_mut(mode) = StreamSettings::default_for(mode);
+    }
+
+    /// Build the default host [`Permissions`] from the user's Host Access & Security toggles.
+    pub fn host_default_permissions(&self) -> Permissions {
+        Permissions {
+            view: true,
+            input: self.host_allow_input,
+            clipboard: self.host_allow_clipboard,
+            file_transfer: self.host_allow_file_transfer,
+            audio: self.host_allow_audio,
+            tunnel: self.host_allow_terminal_tunnel,
+            terminal: self.host_allow_terminal_tunnel,
+            restart: self.host_allow_power,
+            privacy_mode: true,
+            allow_chat: self.host_allow_chat,
+            allow_power: self.host_allow_power,
         }
     }
     /// Whether a permanent host password hash is currently configured.
@@ -749,6 +966,9 @@ mod tests {
                 audio_enabled: false,
                 mic_enabled: false,
                 clipboard_sync: false,
+                echo_cancellation: false,
+                noise_suppression: false,
+                audio_frame_latency: AudioFrameLatency::Ms20,
             },
             gaming: StreamSettings {
                 quality: Quality::Ultra,
@@ -763,6 +983,9 @@ mod tests {
                 audio_enabled: true,
                 mic_enabled: true,
                 clipboard_sync: true,
+                echo_cancellation: true,
+                noise_suppression: true,
+                audio_frame_latency: AudioFrameLatency::Ms2_5,
             },
             ..Default::default()
         };
@@ -789,13 +1012,14 @@ mod tests {
     fn legacy_flat_json_migration_and_defaults() {
         let empty: Settings = serde_json::from_str("{}").unwrap();
         assert!(empty.require_accept);
-        assert_eq!(empty.desktop.fps_cap, FpsCap::Fps120);
+        assert_eq!(empty.desktop.fps_cap, FpsCap::Fps60);
+        assert_eq!(empty.gaming.fps_cap, FpsCap::Fps120);
         assert!(!empty.desktop.relative_mouse_in_gaming);
         assert!(empty.gaming.relative_mouse_in_gaming);
 
         let flat_desktop: Settings = serde_json::from_str(r#"{"show_hud": true, "future": 1}"#).unwrap();
         assert!(flat_desktop.desktop.show_hud);
-        assert!(!flat_desktop.gaming.show_hud);
+        assert!(flat_desktop.gaming.show_hud);
         assert!(flat_desktop.require_accept);
 
         let flat_gaming: Settings =
@@ -810,8 +1034,8 @@ mod tests {
         let flat_rel_false: Settings = serde_json::from_str(r#"{"relative_mouse_in_gaming": false}"#).unwrap();
         assert!(!flat_rel_false.gaming.relative_mouse_in_gaming);
 
-        let partial_nested: Settings = serde_json::from_str(r#"{"gaming": {"quality": "High"}}"#).unwrap();
-        assert_eq!(partial_nested.gaming.quality, Quality::High);
+        let partial_nested: Settings = serde_json::from_str(r#"{"gaming": {"quality": "Ultra"}}"#).unwrap();
+        assert_eq!(partial_nested.gaming.quality, Quality::Ultra);
         assert!(partial_nested.gaming.relative_mouse_in_gaming);
     }
 
@@ -919,7 +1143,8 @@ mod tests {
     #[test]
     fn v050_echo_cancellation_recordings_dir_and_trusted_peer_compat() {
         let def = Settings::default();
-        assert!(def.echo_cancellation);
+        assert!(def.desktop.echo_cancellation);
+        assert!(def.gaming.echo_cancellation);
         assert!(def.effective_echo_cancellation());
         assert!(def.recordings_dir.is_empty());
 
@@ -928,23 +1153,121 @@ mod tests {
             r#"{"mode":"Desktop","trusted_peers":[{"public_key_hex":"aa","device_id":"123456789","name":"Peer","fingerprint":"fp"}]}"#,
         )
         .unwrap();
-        assert!(legacy.echo_cancellation);
+        assert!(legacy.desktop.echo_cancellation);
+        assert!(legacy.gaming.echo_cancellation);
+        assert!(legacy.host_echo_exclusion);
         assert!(legacy.recordings_dir.is_empty());
         assert_eq!(legacy.trusted_peers.len(), 1);
         assert!(legacy.trusted_peers[0].allow_chat);
         assert!(!legacy.trusted_peers[0].allow_power);
 
-        // Gaming mode forces echo_cancellation = true.
-        let mut s = Settings { echo_cancellation: false, recordings_dir: "D:\\Captures".into(), ..Default::default() };
-        assert!(!s.effective_echo_cancellation());
-        s.set_mode(Mode::Gaming);
-        assert!(s.echo_cancellation);
-        assert!(s.effective_echo_cancellation());
+        // v0.5.0 top-level `echo_cancellation: false` migrates seamlessly into both profiles & host_echo_exclusion.
+        let v050_json: Settings = serde_json::from_str(
+            r#"{"mode":"Gaming","echo_cancellation":false,"recordings_dir":"C:\\Rec","desktop":{"quality":"Low"}}"#,
+        )
+        .unwrap();
+        assert!(!v050_json.desktop.echo_cancellation);
+        assert!(!v050_json.gaming.echo_cancellation);
+        assert!(!v050_json.host_echo_exclusion);
+        assert!(!v050_json.effective_echo_cancellation());
+        assert_eq!(v050_json.desktop.quality, Quality::Low);
+        assert_eq!(v050_json.recordings_dir, "C:\\Rec");
 
-        // JSON with Gaming mode and echo_cancellation=false still forces true on deserialize.
-        let gaming_json: Settings =
-            serde_json::from_str(r#"{"mode":"Gaming","echo_cancellation":false,"recordings_dir":"C:\\Rec"}"#).unwrap();
-        assert!(gaming_json.echo_cancellation);
-        assert_eq!(gaming_json.recordings_dir, "C:\\Rec");
+        // v0.6.0 echo_cancellation is independently toggleable per profile (no longer forced on in Gaming).
+        let mut s = Settings::default();
+        s.gaming.echo_cancellation = false;
+        s.set_mode(Mode::Gaming);
+        assert!(!s.gaming.echo_cancellation);
+        assert!(!s.effective_echo_cancellation());
+        assert!(s.desktop.echo_cancellation);
+    }
+
+    #[test]
+    fn v060_deep_profile_defaults_audio_latency_reset_and_host_policy() {
+        let desktop = StreamSettings::default_for(Mode::Desktop);
+        assert_eq!(desktop.quality, Quality::Balanced);
+        assert_eq!(desktop.fps_cap, FpsCap::Fps60);
+        assert_eq!(desktop.present, Present::Fifo);
+        assert!(!desktop.show_hud);
+        assert!(!desktop.relative_mouse_in_gaming);
+        assert!(desktop.yuv444);
+        assert!(desktop.audio_enabled);
+        assert!(!desktop.mic_enabled);
+        assert!(desktop.clipboard_sync);
+        assert!(desktop.echo_cancellation);
+        assert!(desktop.noise_suppression);
+        assert_eq!(desktop.audio_frame_latency, AudioFrameLatency::Auto);
+
+        let gaming = StreamSettings::default_for(Mode::Gaming);
+        assert_eq!(gaming.quality, Quality::High);
+        assert_eq!(gaming.fps_cap, FpsCap::Fps120);
+        assert_eq!(gaming.present, Present::Mailbox);
+        assert!(gaming.show_hud);
+        assert!(gaming.relative_mouse_in_gaming);
+        assert!(!gaming.yuv444);
+        assert!(gaming.audio_enabled);
+        assert!(!gaming.mic_enabled);
+        assert!(gaming.clipboard_sync);
+        assert!(gaming.echo_cancellation);
+        assert!(gaming.noise_suppression);
+        assert_eq!(gaming.audio_frame_latency, AudioFrameLatency::Auto);
+
+        // AudioFrameLatency wire and effective durations.
+        assert_eq!(AudioFrameLatency::Auto.to_wire_us(), 0);
+        assert_eq!(AudioFrameLatency::Auto.effective_us(Mode::Gaming), 5_000);
+        assert_eq!(AudioFrameLatency::Auto.effective_us(Mode::Desktop), 10_000);
+        assert_eq!(AudioFrameLatency::Ms2_5.to_wire_us(), 2_500);
+        assert_eq!(AudioFrameLatency::Ms5.to_wire_us(), 5_000);
+        assert_eq!(AudioFrameLatency::Ms10.to_wire_us(), 10_000);
+        assert_eq!(AudioFrameLatency::Ms20.to_wire_us(), 20_000);
+        assert_eq!(AudioFrameLatency::Ms2_5.effective_us(Mode::Desktop), 2_500);
+        assert_eq!(AudioFrameLatency::Ms20.effective_us(Mode::Gaming), 20_000);
+
+        // reset_profile_defaults restores only the requested profile.
+        let mut s = Settings::default();
+        s.desktop.quality = Quality::Ultra;
+        s.desktop.noise_suppression = false;
+        s.desktop.audio_frame_latency = AudioFrameLatency::Ms20;
+        s.gaming.quality = Quality::Low;
+        s.gaming.echo_cancellation = false;
+        s.reset_profile_defaults(Mode::Desktop);
+        assert_eq!(s.desktop, StreamSettings::default_for(Mode::Desktop));
+        assert_eq!(s.gaming.quality, Quality::Low);
+        assert!(!s.gaming.echo_cancellation);
+        s.reset_profile_defaults(Mode::Gaming);
+        assert_eq!(s.gaming, StreamSettings::default_for(Mode::Gaming));
+
+        // Host policy defaults match Permissions::interactive_default() and roundtrip via JSON.
+        let mut def = Settings::default();
+        assert!(def.auto_reconnect);
+        assert!(def.host_echo_exclusion);
+        assert_eq!(def.host_privacy_mode, HostPrivacyMode::CurtainOverlay);
+        assert_eq!(def.host_default_permissions(), Permissions::interactive_default());
+
+        def.auto_reconnect = false;
+        def.host_allow_input = false;
+        def.host_allow_clipboard = false;
+        def.host_allow_file_transfer = false;
+        def.host_allow_audio = false;
+        def.host_allow_chat = false;
+        def.host_allow_terminal_tunnel = false;
+        def.host_allow_power = true;
+        def.host_echo_exclusion = false;
+        def.host_privacy_mode = HostPrivacyMode::VddMonitorOff;
+        let perms = def.host_default_permissions();
+        assert!(perms.view);
+        assert!(!perms.input);
+        assert!(!perms.clipboard);
+        assert!(!perms.file_transfer);
+        assert!(!perms.audio);
+        assert!(!perms.allow_chat);
+        assert!(!perms.terminal);
+        assert!(!perms.tunnel);
+        assert!(perms.allow_power);
+        assert!(perms.restart);
+
+        let json = serde_json::to_string_pretty(&def).unwrap();
+        let reloaded: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded, def);
     }
 }

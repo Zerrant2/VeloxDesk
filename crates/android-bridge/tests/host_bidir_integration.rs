@@ -32,8 +32,8 @@ use veloxdesk_transport::{
 use veloxdesk_android::SecretString;
 use veloxdesk_android::constants;
 use veloxdesk_android::host::{
-    AndroidHostConfig, AndroidHostEngine, HostCallbacks, HostPasswordMode, SavedTrustedPeerJson, encode_hex_pubkey_32,
-    hash_password_phc, input_kind,
+    AndroidHostConfig, AndroidHostEngine, HostCallbacks, HostDefaultPermissions, HostPasswordMode,
+    SavedTrustedPeerJson, encode_hex_pubkey_32, hash_password_phc, input_kind,
 };
 use veloxdesk_android::session::{ConnectConfig, HandleTable, SessionCallbacks, load_or_create_identity};
 use veloxdesk_android::stats::HudMetrics;
@@ -325,6 +325,7 @@ async fn pc_viewer_to_android_host_auth_modes_video_rotation_input_and_clipboard
             permanent_hash_phc: perm_phc.clone(),
             require_accept: false,
             trusted_peers_json: String::new(),
+            default_permissions: HostDefaultPermissions::default(),
         },
         rec.clone(),
     )
@@ -545,6 +546,7 @@ async fn android_host_supersedes_same_peer_and_rejects_other_peer_busy() {
             permanent_hash_phc: perm_phc,
             require_accept: false,
             trusted_peers_json: String::new(),
+            default_permissions: HostDefaultPermissions::default(),
         },
         rec.clone(),
     )
@@ -662,6 +664,7 @@ fn phone_to_phone_live_quic_loopback() {
             permanent_hash_phc: String::new(),
             require_accept: true,
             trusted_peers_json: String::new(),
+            default_permissions: HostDefaultPermissions::default(),
         },
         host_rec.clone(),
     )
@@ -791,6 +794,7 @@ async fn phone_to_phone_via_rendezvous_device_id() {
             permanent_hash_phc: String::new(),
             require_accept: false,
             trusted_peers_json: String::new(),
+            default_permissions: HostDefaultPermissions::default(),
         },
         host_rec.clone(),
     )
@@ -866,6 +870,7 @@ fn bidirectional_chat_viewer_and_host_with_acks() {
             permanent_hash_phc: String::new(),
             require_accept: false,
             trusted_peers_json: String::new(),
+            default_permissions: HostDefaultPermissions::default(),
         },
         host_rec.clone(),
     )
@@ -984,6 +989,7 @@ async fn host_gates_chat_when_allow_chat_is_false() {
             permanent_hash_phc: String::new(),
             require_accept: false,
             trusted_peers_json: trusted_json,
+            default_permissions: HostDefaultPermissions::default(),
         },
         rec.clone(),
     )

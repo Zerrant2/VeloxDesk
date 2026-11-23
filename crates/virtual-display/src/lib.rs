@@ -11,7 +11,7 @@ pub mod privacy;
 use std::sync::Arc;
 
 pub use display::{SimulatedVirtualDisplayManager, VirtualDisplayInfo, VirtualDisplayManager, VirtualDisplaySpec};
-pub use privacy::{PrivacyController, PrivacyGuard, SimulatedPrivacyController};
+pub use privacy::{PrivacyController, PrivacyGuard, PrivacyModeKind, SimulatedPrivacyController};
 
 /// Create the platform [`VirtualDisplayManager`].
 pub fn create_virtual_display_manager() -> Box<dyn VirtualDisplayManager> {
@@ -148,6 +148,41 @@ mod tests {
         assert!(!ctrl.is_enabled());
         ctrl.disable().expect("disable 2");
         assert!(!ctrl.is_enabled());
+    }
+
+    #[test]
+    fn privacy_mode_kind_switching_and_state_reporting() {
+        let sim = SimulatedPrivacyController::new();
+        assert_eq!(sim.mode(), PrivacyModeKind::CurtainOverlay);
+        sim.set_mode(PrivacyModeKind::VddMonitorOff);
+        assert_eq!(sim.mode(), PrivacyModeKind::VddMonitorOff);
+        sim.set_mode(PrivacyModeKind::CurtainOverlay);
+        assert_eq!(sim.mode(), PrivacyModeKind::CurtainOverlay);
+
+        // Through trait object Arc<dyn PrivacyController>.
+        let dyn_ctrl: Arc<dyn PrivacyController> = Arc::new(SimulatedPrivacyController::new());
+        assert_eq!(dyn_ctrl.mode(), PrivacyModeKind::CurtainOverlay);
+        dyn_ctrl.set_mode(PrivacyModeKind::VddMonitorOff);
+        assert_eq!(dyn_ctrl.mode(), PrivacyModeKind::VddMonitorOff);
+
+        #[cfg(windows)]
+        {
+            let win_ctrl = privacy::win::WindowsPrivacyController::new();
+            assert_eq!(win_ctrl.mode(), PrivacyModeKind::CurtainOverlay);
+            assert!(!win_ctrl.is_vdd_active());
+
+            win_ctrl.set_mode(PrivacyModeKind::VddMonitorOff);
+            assert_eq!(win_ctrl.mode(), PrivacyModeKind::VddMonitorOff);
+            assert!(win_ctrl.is_vdd_active());
+
+            win_ctrl.set_mode(PrivacyModeKind::CurtainOverlay);
+            assert_eq!(win_ctrl.mode(), PrivacyModeKind::CurtainOverlay);
+            assert!(!win_ctrl.is_vdd_active());
+
+            let built = privacy::win::WindowsPrivacyController::new().with_mode(PrivacyModeKind::VddMonitorOff);
+            assert_eq!(built.mode(), PrivacyModeKind::VddMonitorOff);
+            assert!(built.is_vdd_active());
+        }
     }
 
     #[cfg(windows)]

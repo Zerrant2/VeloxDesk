@@ -7,9 +7,9 @@
 use std::net::SocketAddr;
 
 use veloxdesk_protocol::control::{ChatMessage, Permissions};
-use veloxdesk_ui::{AcceptDecision, IncomingSessionInfo, PasswordMode, SavedTrustedPeer};
+use veloxdesk_ui::{AcceptDecision, HostPrivacyMode, IncomingSessionInfo, PasswordMode, SavedTrustedPeer};
 
-/// Initial host authentication settings supplied when starting the embedded host.
+/// Initial host authentication and policy settings supplied when starting the embedded host.
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "net"), allow(dead_code))]
 pub struct EmbeddedHostAuthOpts {
@@ -17,7 +17,10 @@ pub struct EmbeddedHostAuthOpts {
     pub permanent_password_hash: Option<String>,
     pub trusted_peers: Vec<SavedTrustedPeer>,
     pub require_accept: bool,
+    pub default_permissions: Permissions,
     pub echo_cancellation: bool,
+    pub mic_noise_suppression: bool,
+    pub privacy_mode: HostPrivacyMode,
 }
 
 /// Events posted from the embedded background host thread to the winit event loop.
@@ -58,7 +61,6 @@ pub enum EmbeddedHostEvent {
     },
     ApprovalRequested {
         info: IncomingSessionInfo,
-        default_permissions: Permissions,
         reply: tokio::sync::oneshot::Sender<AcceptDecision>,
     },
     Stopped,
@@ -142,6 +144,12 @@ impl EmbeddedHostHandle {
 
     pub fn remove_trusted_peer(&self, _public_key_hex: String) {}
 
+    pub fn set_default_permissions(&self, _perms: Permissions) {}
+
+    pub fn set_echo_cancellation(&self, _enabled: bool) {}
+
+    pub fn set_privacy_mode_kind(&self, _mode: HostPrivacyMode) {}
+
     pub fn send_chat(&self, _text: String, _sender_name: String) {}
 
     pub fn stop(&self) {}
@@ -160,12 +168,21 @@ mod net {
     use veloxdesk_render::winit::event_loop::EventLoopProxy;
     use veloxdesk_service::{
         ApprovalDecision, ApprovalHandler, ApprovalRequest, HostAuthConfig, HostBackends, HostConfig, HostStatusEvent,
-        RunningHost, TrustedPeer,
+        PrivacyModeKind, RunningHost, TrustedPeer,
     };
-    use veloxdesk_ui::{AcceptDecision, IncomingSessionInfo, Language, PasswordMode, SavedTrustedPeer, i18n::tr};
+    use veloxdesk_ui::{
+        AcceptDecision, HostPrivacyMode, IncomingSessionInfo, Language, PasswordMode, SavedTrustedPeer, i18n::tr,
+    };
 
     use super::{EmbeddedHostAuthOpts, EmbeddedHostEvent, encode_hex_pubkey_32, parse_hex_pubkey_32};
     use crate::app::UserEvent;
+
+    fn map_privacy_mode(mode: HostPrivacyMode) -> PrivacyModeKind {
+        match mode {
+            HostPrivacyMode::CurtainOverlay => PrivacyModeKind::CurtainOverlay,
+            HostPrivacyMode::VddMonitorOff => PrivacyModeKind::VddMonitorOff,
+        }
+    }
 
     fn current_lang(flag: &AtomicU8) -> Language {
         Language::from_u8(flag.load(Ordering::Relaxed))
@@ -213,6 +230,9 @@ mod net {
         SetPermanentPasswordHash(Option<PasswordHash>),
         SetOtpEnabled(bool),
         RemoveTrustedPeer([u8; 32]),
+        SetDefaultPermissions(Permissions),
+        SetEchoCancellation(bool),
+        SetPrivacyMode(HostPrivacyMode),
         SendChat { text: String, sender_name: String },
         Stop,
     }
@@ -255,7 +275,6 @@ mod net {
                     if proxy
                         .send_event(UserEvent::Host(EmbeddedHostEvent::ApprovalRequested {
                             info,
-                            default_permissions: req.default_permissions,
                             reply: tx,
                         }))
                         .is_err()
@@ -311,6 +330,9 @@ mod net {
             let cfg = HostConfig {
                 rendezvous,
                 echo_cancellation: auth.echo_cancellation,
+                mic_noise_suppression: auth.mic_noise_suppression,
+                default_permissions: auth.default_permissions,
+                privacy_mode_kind: map_privacy_mode(auth.privacy_mode),
                 auth: HostAuthConfig {
                     auto_otp,
                     permanent_password_hash: effective_perm_hash,
@@ -364,6 +386,18 @@ mod net {
             } else {
                 tracing::warn!(key = %public_key_hex, "cannot revoke malformed trusted peer key");
             }
+        }
+
+        pub fn set_default_permissions(&self, perms: Permissions) {
+            let _ = self.cmd_tx.send(HostCmd::SetDefaultPermissions(perms));
+        }
+
+        pub fn set_echo_cancellation(&self, enabled: bool) {
+            let _ = self.cmd_tx.send(HostCmd::SetEchoCancellation(enabled));
+        }
+
+        pub fn set_privacy_mode_kind(&self, mode: HostPrivacyMode) {
+            let _ = self.cmd_tx.send(HostCmd::SetPrivacyMode(mode));
         }
 
         pub fn send_chat(&self, text: String, sender_name: String) {
@@ -434,6 +468,9 @@ mod net {
                 let _ = ev_proxy.send_event(UserEvent::Host(mapped));
             });
 
+            let init_perms = cfg.default_permissions.clone();
+            let init_echo = cfg.echo_cancellation;
+            let init_privacy = cfg.privacy_mode_kind;
             let running = match RunningHost::start(cfg, id, HostBackends::system(), Some(on_event)).await {
                 Ok(h) => h,
                 Err(e) => {
@@ -443,6 +480,9 @@ mod net {
                     return;
                 }
             };
+            running.set_default_permissions(init_perms);
+            running.set_echo_cancellation(init_echo);
+            running.set_privacy_mode_kind(init_privacy);
 
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -483,6 +523,15 @@ mod net {
                     }
                     HostCmd::RemoveTrustedPeer(pk) => {
                         let _ = running.auth_state().remove_trusted_peer(&pk);
+                    }
+                    HostCmd::SetDefaultPermissions(perms) => {
+                        running.set_default_permissions(perms);
+                    }
+                    HostCmd::SetEchoCancellation(enabled) => {
+                        running.set_echo_cancellation(enabled);
+                    }
+                    HostCmd::SetPrivacyMode(mode) => {
+                        running.set_privacy_mode_kind(map_privacy_mode(mode));
                     }
                     HostCmd::SendChat { text, sender_name } => {
                         match running.send_chat(text.clone(), sender_name.clone()) {

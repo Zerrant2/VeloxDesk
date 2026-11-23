@@ -8,7 +8,10 @@ use crate::auth::format_fingerprint;
 use crate::connect::{UpdateUiState, format_device_id};
 use crate::i18n::tr;
 use crate::power::{PowerConfirmDialog, PowerConfirmOutcome, power_action_label};
-use crate::settings::{FpsCap, Language, Mode, PasswordMode, Present, Quality, Scale, Settings, ThemePreference};
+use crate::settings::{
+    AudioFrameLatency, FpsCap, HostPrivacyMode, Language, Mode, PasswordMode, Present, Quality, Scale, Settings,
+    ThemePreference,
+};
 
 /// What the toolbar / settings window asks the application to do.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,11 +22,14 @@ pub enum ToolbarAction {
     SwitchDisplay(u32),
     SetQuality(Quality),
     SetFpsCap(FpsCap),
+    SetYuv444(bool),
     SetPresent(Present),
     SetScale(Scale),
     SetAudio(bool),
     SetMic(bool),
     SetEchoCancellation(bool),
+    SetNoiseSuppression(bool),
+    SetAudioFrameLatency(AudioFrameLatency),
     SetClipboardSync(bool),
     SetPrivacyMode(bool),
     SetHud(bool),
@@ -32,6 +38,7 @@ pub enum ToolbarAction {
     ToggleTunnels,
     ToggleChat,
     ToggleRecording,
+    OpenRecordingsFolder,
     SystemPower(SystemPowerAction),
     TogglePointerLock,
     ToggleHud,
@@ -47,11 +54,15 @@ pub enum ToolbarAction {
     ClearPermanentPassword,
     SetRequireAccept(bool),
     RemoveTrustedPeer(String),
+    UpdateHostPolicy,
     Disconnect,
 }
 
 /// Alias for [`ToolbarAction`] for callers referring to session toolbar actions.
 pub type SessionAction = ToolbarAction;
+
+/// Alias for [`ToolbarAction`] for callers referring to settings window actions.
+pub type SettingsAction = ToolbarAction;
 
 /// Format recording elapsed duration in milliseconds as `MM:SS` (or `H:MM:SS` once >= 1 hour).
 pub fn format_recording_elapsed(elapsed_ms: u64) -> String {
@@ -552,16 +563,17 @@ pub fn settings_window_with_security(
     egui::Window::new(t.settings_title)
         .id(egui::Id::unique("veloxdesk-settings"))
         .open(open)
+        .default_height(600.0)
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("veloxdesk-settings-scroll")
-                .max_height(600.0)
+                .max_height(580.0)
                 .show(ui, |ui| {
                     egui::Grid::new("veloxdesk-settings")
                         .num_columns(2)
-                        .spacing([16.0, 6.0])
+                        .spacing([16.0, 5.0])
                         .show(ui, |ui| {
                     ui.label(t.settings_language_label).on_hover_text(t.tip_language);
                     ui.horizontal(|ui| {
@@ -592,9 +604,6 @@ pub fn settings_window_with_security(
                             .on_hover_text(t.tip_default_mode)
                             .changed();
                         if d_changed || g_changed {
-                            if settings.mode == Mode::Gaming {
-                                settings.echo_cancellation = true;
-                            }
                             editing_mode = settings.mode;
                         }
                     });
@@ -606,11 +615,16 @@ pub fn settings_window_with_security(
                             ui.selectable_value(&mut editing_mode, m, m.label_for(lang))
                                 .on_hover_text(t.tip_editing_profile);
                         }
+                        if ui
+                            .button(t.settings_reset_profile_btn)
+                            .on_hover_text(t.tip_reset_profile)
+                            .clicked()
+                        {
+                            settings.reset_profile_defaults(editing_mode);
+                        }
                     });
                     ui.end_row();
 
-                    let gaming_locked_aec = settings.mode == Mode::Gaming || editing_mode == Mode::Gaming;
-                    let mut aec_value = settings.echo_cancellation;
                     let prof = settings.profile_mut(editing_mode);
 
                     ui.label(t.settings_quality).on_hover_text(t.tip_quality);
@@ -643,28 +657,6 @@ pub fn settings_window_with_security(
                             .on_hover_text(t.tip_hdr_10bit);
                         ui.checkbox(&mut prof.yuv444, t.settings_yuv444)
                             .on_hover_text(t.tip_yuv444);
-                    });
-                    ui.end_row();
-
-                    ui.label(t.settings_audio).on_hover_text(t.tip_audio);
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut prof.audio_enabled, t.settings_remote_audio)
-                            .on_hover_text(t.tip_remote_audio);
-                        ui.checkbox(&mut prof.mic_enabled, t.settings_microphone)
-                            .on_hover_text(t.tip_microphone);
-                        let aec_tip = if gaming_locked_aec {
-                            t.tip_echo_cancellation_gaming
-                        } else {
-                            t.tip_echo_cancellation
-                        };
-                        if gaming_locked_aec {
-                            let mut always_on = true;
-                            ui.add_enabled(false, egui::Checkbox::new(&mut always_on, t.settings_echo_cancellation))
-                                .on_disabled_hover_text(aec_tip);
-                        } else {
-                            ui.checkbox(&mut aec_value, t.settings_echo_cancellation)
-                                .on_hover_text(aec_tip);
-                        }
                     });
                     ui.end_row();
 
@@ -711,80 +703,151 @@ pub fn settings_window_with_security(
                     ui.checkbox(&mut prof.clipboard_sync, t.settings_clipboard_sync)
                         .on_hover_text(t.tip_clipboard);
                     ui.end_row();
+                });
 
-                    if !gaming_locked_aec {
-                        settings.echo_cancellation = aec_value;
-                    }
+                    // v0.6.0 Audio & Voice section
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new(t.settings_audio_heading).strong());
+                    ui.add_space(2.0);
+                    egui::Grid::new("veloxdesk-settings-audio")
+                        .num_columns(2)
+                        .spacing([16.0, 5.0])
+                        .show(ui, |ui| {
+                            let prof = settings.profile_mut(editing_mode);
+                            ui.label(t.settings_audio).on_hover_text(t.tip_audio);
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut prof.audio_enabled, t.settings_remote_audio)
+                                    .on_hover_text(t.tip_remote_audio);
+                                ui.checkbox(&mut prof.mic_enabled, t.settings_microphone)
+                                    .on_hover_text(t.tip_microphone);
+                            });
+                            ui.end_row();
 
-                    ui.label(t.settings_rendezvous_server).on_hover_text(t.tip_rendezvous_server);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut settings.rendezvous_server)
-                            .hint_text("127.0.0.1:21116")
-                            .desired_width(200.0),
-                    )
-                    .on_hover_text(t.tip_rendezvous_server);
-                    ui.end_row();
+                            ui.label(t.settings_echo_cancellation).on_hover_text(t.tip_echo_cancellation);
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut prof.echo_cancellation, t.settings_echo_cancellation_cb)
+                                    .on_hover_text(t.tip_echo_cancellation);
+                                ui.checkbox(&mut prof.noise_suppression, t.settings_noise_suppression)
+                                    .on_hover_text(t.tip_noise_suppression);
+                            });
+                            ui.end_row();
 
-                    ui.label(t.settings_recordings_dir).on_hover_text(t.tip_recordings_dir);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut settings.recordings_dir)
-                            .hint_text(t.settings_recordings_dir_hint)
-                            .desired_width(200.0),
-                    )
-                    .on_hover_text(t.tip_recordings_dir);
-                    ui.end_row();
+                            ui.label(t.settings_audio_frame_latency)
+                                .on_hover_text(t.tip_audio_frame_latency);
+                            egui::ComboBox::from_id_salt("set-audio-latency")
+                                .selected_text(prof.audio_frame_latency.label_for(lang))
+                                .show_ui(ui, |ui| {
+                                    for lat in AudioFrameLatency::ALL {
+                                        ui.selectable_value(
+                                            &mut prof.audio_frame_latency,
+                                            lat,
+                                            lat.label_for(lang),
+                                        );
+                                    }
+                                })
+                                .response
+                                .on_hover_text(t.tip_audio_frame_latency);
+                            ui.end_row();
+                        });
 
-                    let version_text = build_display
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
-                    ui.label(t.settings_version_label).on_hover_text(t.tip_version);
-                    ui.label(egui::RichText::new(version_text).monospace())
-                        .on_hover_text(t.tip_version);
-                    ui.end_row();
-
-                    ui.label(t.settings_updates_label).on_hover_text(t.tip_updates);
-                    ui.horizontal(|ui| {
-                        let pal = crate::theme::palette_for(ui);
-                        let checking = matches!(
-                            update_state,
-                            Some(UpdateUiState::Checking | UpdateUiState::Downloading { .. })
-                        );
-                        if ui
-                            .add_enabled(!checking, egui::Button::new(t.update_check_btn))
-                            .on_hover_text(t.tip_updates)
-                            .clicked()
-                        {
-                            out.push(ToolbarAction::CheckForUpdates);
-                        }
-                        if let Some(st) = update_state {
-                            match st {
-                                UpdateUiState::Idle => {}
-                                UpdateUiState::Checking => {
-                                    ui.spinner();
-                                    ui.weak(t.update_checking);
+                    // v0.6.0 Recording & Session section
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new(t.settings_recording_heading).strong());
+                    ui.add_space(2.0);
+                    egui::Grid::new("veloxdesk-settings-recording")
+                        .num_columns(2)
+                        .spacing([16.0, 5.0])
+                        .show(ui, |ui| {
+                            ui.label(t.settings_recordings_dir).on_hover_text(t.tip_recordings_dir);
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut settings.recordings_dir)
+                                        .hint_text(t.settings_recordings_dir_hint)
+                                        .desired_width(200.0),
+                                )
+                                .on_hover_text(t.tip_recordings_dir);
+                                if ui
+                                    .button(t.settings_open_folder_btn)
+                                    .on_hover_text(t.tip_open_folder)
+                                    .clicked()
+                                {
+                                    out.push(SettingsAction::OpenRecordingsFolder);
                                 }
-                                UpdateUiState::UpToDate => {
-                                    ui.colored_label(pal.success, t.update_up_to_date);
+                            });
+                            ui.end_row();
+
+                            ui.label(t.settings_auto_reconnect).on_hover_text(t.tip_auto_reconnect);
+                            ui.checkbox(&mut settings.auto_reconnect, t.settings_auto_reconnect_cb)
+                                .on_hover_text(t.tip_auto_reconnect);
+                            ui.end_row();
+
+                            ui.label(t.settings_rendezvous_server)
+                                .on_hover_text(t.tip_rendezvous_server);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut settings.rendezvous_server)
+                                    .hint_text("127.0.0.1:21116")
+                                    .desired_width(200.0),
+                            )
+                            .on_hover_text(t.tip_rendezvous_server);
+                            ui.end_row();
+
+                            let version_text = build_display
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+                            ui.label(t.settings_version_label).on_hover_text(t.tip_version);
+                            ui.label(egui::RichText::new(version_text).monospace())
+                                .on_hover_text(t.tip_version);
+                            ui.end_row();
+
+                            ui.label(t.settings_updates_label).on_hover_text(t.tip_updates);
+                            ui.horizontal(|ui| {
+                                let pal = crate::theme::palette_for(ui);
+                                let checking = matches!(
+                                    update_state,
+                                    Some(UpdateUiState::Checking | UpdateUiState::Downloading { .. })
+                                );
+                                if ui
+                                    .add_enabled(!checking, egui::Button::new(t.update_check_btn))
+                                    .on_hover_text(t.tip_updates)
+                                    .clicked()
+                                {
+                                    out.push(ToolbarAction::CheckForUpdates);
                                 }
-                                UpdateUiState::Available { latest, .. } => {
-                                    ui.colored_label(pal.info, t.fmt_update_available_short(latest));
-                                    if ui.button(t.update_now_btn).on_hover_text(t.tip_updates).clicked() {
-                                        out.push(ToolbarAction::StartUpdate);
+                                if let Some(st) = update_state {
+                                    match st {
+                                        UpdateUiState::Idle => {}
+                                        UpdateUiState::Checking => {
+                                            ui.spinner();
+                                            ui.weak(t.update_checking);
+                                        }
+                                        UpdateUiState::UpToDate => {
+                                            ui.colored_label(pal.success, t.update_up_to_date);
+                                        }
+                                        UpdateUiState::Available { latest, .. } => {
+                                            ui.colored_label(pal.info, t.fmt_update_available_short(latest));
+                                            if ui.button(t.update_now_btn).on_hover_text(t.tip_updates).clicked() {
+                                                out.push(ToolbarAction::StartUpdate);
+                                            }
+                                        }
+                                        UpdateUiState::Downloading { status, .. } => {
+                                            ui.spinner();
+                                            ui.weak(if status.is_empty() {
+                                                t.update_downloading
+                                            } else {
+                                                status.as_str()
+                                            });
+                                        }
+                                        UpdateUiState::Error(e) => {
+                                            ui.colored_label(pal.danger, t.fmt_update_error(e));
+                                        }
                                     }
                                 }
-                                UpdateUiState::Downloading { status, .. } => {
-                                    ui.spinner();
-                                    ui.weak(if status.is_empty() { t.update_downloading } else { status.as_str() });
-                                }
-                                UpdateUiState::Error(e) => {
-                                    ui.colored_label(pal.danger, t.fmt_update_error(e));
-                                }
-                            }
-                        }
-                    });
-                    ui.end_row();
-                });
+                            });
+                            ui.end_row();
+                        });
 
                     // v0.3.0 Host Access & Security section
                     ui.add_space(10.0);
@@ -875,6 +938,57 @@ pub fn settings_window_with_security(
                                 .on_hover_text(t.tip_settings_require_accept);
                             ui.end_row();
 
+                            ui.label(t.settings_host_permissions)
+                                .on_hover_text(t.tip_host_permissions);
+                            ui.vertical(|ui| {
+                                egui::Grid::new("veloxdesk-settings-host-perms")
+                                    .num_columns(2)
+                                    .spacing([14.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.checkbox(&mut settings.host_allow_input, t.host_perm_input)
+                                            .on_hover_text(t.tip_host_permissions);
+                                        ui.checkbox(&mut settings.host_allow_clipboard, t.host_perm_clipboard)
+                                            .on_hover_text(t.tip_host_permissions);
+                                        ui.end_row();
+                                        ui.checkbox(&mut settings.host_allow_file_transfer, t.host_perm_file_transfer)
+                                            .on_hover_text(t.tip_host_permissions);
+                                        ui.checkbox(&mut settings.host_allow_audio, t.host_perm_audio)
+                                            .on_hover_text(t.tip_host_permissions);
+                                        ui.end_row();
+                                        ui.checkbox(&mut settings.host_allow_chat, t.host_perm_chat)
+                                            .on_hover_text(t.tip_host_permissions);
+                                        ui.checkbox(
+                                            &mut settings.host_allow_terminal_tunnel,
+                                            t.host_perm_terminal_tunnel,
+                                        )
+                                        .on_hover_text(t.tip_host_permissions);
+                                        ui.end_row();
+                                        ui.checkbox(&mut settings.host_allow_power, t.host_perm_power)
+                                            .on_hover_text(t.tip_host_permissions);
+                                        ui.end_row();
+                                    });
+                            });
+                            ui.end_row();
+
+                            ui.label(t.settings_host_echo_exclusion)
+                                .on_hover_text(t.tip_host_echo_exclusion);
+                            ui.checkbox(&mut settings.host_echo_exclusion, t.settings_host_echo_exclusion_cb)
+                                .on_hover_text(t.tip_host_echo_exclusion);
+                            ui.end_row();
+
+                            ui.label(t.settings_host_privacy_mode)
+                                .on_hover_text(t.tip_host_privacy_mode);
+                            egui::ComboBox::from_id_salt("set-host-privacy-mode")
+                                .selected_text(settings.host_privacy_mode.label_for(lang))
+                                .show_ui(ui, |ui| {
+                                    for pm in HostPrivacyMode::ALL {
+                                        ui.selectable_value(&mut settings.host_privacy_mode, pm, pm.label_for(lang));
+                                    }
+                                })
+                                .response
+                                .on_hover_text(t.tip_host_privacy_mode);
+                            ui.end_row();
+
                             ui.label(t.settings_trusted_devices).on_hover_text(t.tip_trusted_devices);
                             ui.vertical(|ui| {
                                 if settings.trusted_peers.is_empty() {
@@ -944,8 +1058,17 @@ pub fn settings_window_with_security(
         if settings.require_accept != before.require_accept {
             out.push(ToolbarAction::SetRequireAccept(settings.require_accept));
         }
-        if settings.echo_cancellation != before.echo_cancellation && settings.mode == before.mode {
-            out.push(ToolbarAction::SetEchoCancellation(settings.echo_cancellation));
+        let host_policy_changed = settings.host_allow_input != before.host_allow_input
+            || settings.host_allow_clipboard != before.host_allow_clipboard
+            || settings.host_allow_file_transfer != before.host_allow_file_transfer
+            || settings.host_allow_audio != before.host_allow_audio
+            || settings.host_allow_chat != before.host_allow_chat
+            || settings.host_allow_terminal_tunnel != before.host_allow_terminal_tunnel
+            || settings.host_allow_power != before.host_allow_power
+            || settings.host_echo_exclusion != before.host_echo_exclusion
+            || settings.host_privacy_mode != before.host_privacy_mode;
+        if host_policy_changed {
+            out.push(SettingsAction::UpdateHostPolicy);
         }
         if settings.mode != before.mode {
             out.push(ToolbarAction::SetMode(settings.mode));
@@ -964,11 +1087,23 @@ pub fn settings_window_with_security(
             if cur.fps_cap != prev.fps_cap {
                 out.push(ToolbarAction::SetFpsCap(cur.fps_cap));
             }
+            if cur.yuv444 != prev.yuv444 {
+                out.push(ToolbarAction::SetYuv444(cur.yuv444));
+            }
             if cur.audio_enabled != prev.audio_enabled {
                 out.push(ToolbarAction::SetAudio(cur.audio_enabled));
             }
             if cur.mic_enabled != prev.mic_enabled {
                 out.push(ToolbarAction::SetMic(cur.mic_enabled));
+            }
+            if cur.echo_cancellation != prev.echo_cancellation {
+                out.push(ToolbarAction::SetEchoCancellation(cur.echo_cancellation));
+            }
+            if cur.noise_suppression != prev.noise_suppression {
+                out.push(ToolbarAction::SetNoiseSuppression(cur.noise_suppression));
+            }
+            if cur.audio_frame_latency != prev.audio_frame_latency {
+                out.push(ToolbarAction::SetAudioFrameLatency(cur.audio_frame_latency));
             }
             if cur.clipboard_sync != prev.clipboard_sync {
                 out.push(ToolbarAction::SetClipboardSync(cur.clipboard_sync));
@@ -1299,6 +1434,14 @@ mod tests {
             ("tip_echo_cancellation", en.tip_echo_cancellation, ru.tip_echo_cancellation),
             ("tip_echo_cancellation_gaming", en.tip_echo_cancellation_gaming, ru.tip_echo_cancellation_gaming),
             ("tip_recordings_dir", en.tip_recordings_dir, ru.tip_recordings_dir),
+            ("tip_reset_profile", en.tip_reset_profile, ru.tip_reset_profile),
+            ("tip_noise_suppression", en.tip_noise_suppression, ru.tip_noise_suppression),
+            ("tip_audio_frame_latency", en.tip_audio_frame_latency, ru.tip_audio_frame_latency),
+            ("tip_open_folder", en.tip_open_folder, ru.tip_open_folder),
+            ("tip_auto_reconnect", en.tip_auto_reconnect, ru.tip_auto_reconnect),
+            ("tip_host_permissions", en.tip_host_permissions, ru.tip_host_permissions),
+            ("tip_host_echo_exclusion", en.tip_host_echo_exclusion, ru.tip_host_echo_exclusion),
+            ("tip_host_privacy_mode", en.tip_host_privacy_mode, ru.tip_host_privacy_mode),
         ];
         for (name, e, r) in pairs {
             assert!(!e.trim().is_empty(), "{name} EN empty");
@@ -1592,5 +1735,163 @@ mod tests {
         }
         assert_eq!(emitted, vec![ToolbarAction::SystemPower(SystemPowerAction::Reboot)]);
         assert!(tb.power_confirm.is_none());
+    }
+
+    #[test]
+    fn settings_window_reset_profile_open_folder_gaming_aec_and_host_policy_actions() {
+        let dir = std::env::temp_dir().join(format!("veloxdesk-settings-v060-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let make_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            events,
+            ..Default::default()
+        };
+
+        // 1. Gaming mode: AEC and Noise Suppression are both user-toggleable; Reset profile restores defaults.
+        {
+            let ctx = egui::Context::default();
+            let mut settings = Settings { mode: Mode::Gaming, ..Default::default() };
+            settings.gaming.quality = Quality::Low;
+            settings.gaming.yuv444 = true;
+            settings.gaming.audio_frame_latency = AudioFrameLatency::Ms20;
+            settings.desktop.quality = Quality::Ultra;
+            let mut open = true;
+
+            let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                let _ = settings_window_at(ui.ctx(), &mut open, &mut settings, Some(&path));
+            });
+            out.textures_delta.clear();
+            out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                let _ = settings_window_at(ui.ctx(), &mut open, &mut settings, Some(&path));
+            });
+            out.textures_delta.clear();
+
+            // Toggle AEC OFF in Gaming mode (no longer locked).
+            let aec_pos = out
+                .shapes
+                .iter()
+                .find_map(|c| find_text_rect(&c.shape, tr(Language::En).settings_echo_cancellation_cb))
+                .expect("AEC checkbox in Gaming mode")
+                .center();
+            let mut aec_actions = Vec::new();
+            click_at(&ctx, aec_pos, |c| {
+                let a = settings_window_at(c, &mut open, &mut settings, Some(&path));
+                if !a.is_empty() {
+                    aec_actions = a;
+                }
+            });
+            assert!(!settings.gaming.echo_cancellation);
+            assert_eq!(aec_actions, vec![ToolbarAction::SetEchoCancellation(false)]);
+
+            // Toggle Noise Suppression OFF in Gaming mode.
+            let ns_pos = out
+                .shapes
+                .iter()
+                .find_map(|c| find_text_rect(&c.shape, tr(Language::En).settings_noise_suppression))
+                .expect("Noise suppression checkbox")
+                .center();
+            let mut ns_actions = Vec::new();
+            click_at(&ctx, ns_pos, |c| {
+                let a = settings_window_at(c, &mut open, &mut settings, Some(&path));
+                if !a.is_empty() {
+                    ns_actions = a;
+                }
+            });
+            assert!(!settings.gaming.noise_suppression);
+            assert_eq!(ns_actions, vec![ToolbarAction::SetNoiseSuppression(false)]);
+
+            // Click "Reset profile defaults" -> restores Gaming defaults without touching Desktop.
+            let reset_pos = out
+                .shapes
+                .iter()
+                .find_map(|c| find_text_rect(&c.shape, tr(Language::En).settings_reset_profile_btn))
+                .expect("Reset profile defaults button")
+                .center();
+            let mut reset_actions = Vec::new();
+            click_at(&ctx, reset_pos, |c| {
+                let a = settings_window_at(c, &mut open, &mut settings, Some(&path));
+                if !a.is_empty() {
+                    reset_actions = a;
+                }
+            });
+            assert_eq!(settings.gaming, crate::settings::StreamSettings::default_for(Mode::Gaming));
+            assert_eq!(settings.desktop.quality, Quality::Ultra);
+            assert!(reset_actions.contains(&ToolbarAction::SetQuality(Quality::High)));
+            assert!(reset_actions.contains(&ToolbarAction::SetYuv444(false)));
+            assert!(reset_actions.contains(&ToolbarAction::SetEchoCancellation(true)));
+            assert!(reset_actions.contains(&ToolbarAction::SetNoiseSuppression(true)));
+            assert!(reset_actions.contains(&ToolbarAction::SetAudioFrameLatency(AudioFrameLatency::Auto)));
+
+            // Click "Open folder" -> emits SettingsAction::OpenRecordingsFolder.
+            let folder_pos = out
+                .shapes
+                .iter()
+                .find_map(|c| find_text_rect(&c.shape, tr(Language::En).settings_open_folder_btn))
+                .expect("Open folder button")
+                .center();
+            let mut folder_actions = Vec::new();
+            click_at(&ctx, folder_pos, |c| {
+                let a = settings_window_at(c, &mut open, &mut settings, Some(&path));
+                if !a.is_empty() {
+                    folder_actions = a;
+                }
+            });
+            assert_eq!(folder_actions, vec![SettingsAction::OpenRecordingsFolder]);
+        }
+
+        // 2. Host policy toggle emits SettingsAction::UpdateHostPolicy.
+        {
+            let ctx = egui::Context::default();
+            let mut settings = Settings::default();
+            let mut open = true;
+            let mut last_shapes = Vec::new();
+            let mut win_center = egui::pos2(300.0, 300.0);
+            for step in 0..5 {
+                let events = if step >= 2 {
+                    vec![
+                        egui::Event::PointerMoved(win_center),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -600.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Trackpad,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let mut out = ctx.run_ui(make_input(events), |ui| {
+                    let _ = settings_window_at(ui.ctx(), &mut open, &mut settings, Some(&path));
+                });
+                out.textures_delta.clear();
+                if step == 1
+                    && let Some(r) = out
+                        .shapes
+                        .iter()
+                        .find_map(|c| find_text_rect(&c.shape, tr(Language::En).settings_quality))
+                {
+                    win_center = r.center();
+                }
+                last_shapes = out.shapes;
+            }
+            let power_pos = last_shapes
+                .iter()
+                .find_map(|c| find_text_rect(&c.shape, tr(Language::En).host_perm_power))
+                .expect("Remote Power / Reboot checkbox in Host Access & Security")
+                .center();
+            let mut policy_actions = Vec::new();
+            click_at(&ctx, power_pos, |c| {
+                let a = settings_window_at(c, &mut open, &mut settings, Some(&path));
+                if !a.is_empty() {
+                    policy_actions = a;
+                }
+            });
+            assert!(settings.host_allow_power);
+            assert!(settings.host_default_permissions().allow_power);
+            assert_eq!(policy_actions, vec![SettingsAction::UpdateHostPolicy]);
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

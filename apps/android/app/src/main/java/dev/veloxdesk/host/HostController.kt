@@ -33,6 +33,10 @@ data class HostStartConfig(
     val passwordMode: HostPasswordMode = HostPasswordMode.ONE_TIME,
     val permanentHashPhc: String = "",
     val requireAccept: Boolean = true,
+    val allowInput: Boolean = true,
+    val allowClipboard: Boolean = true,
+    val allowAudio: Boolean = true,
+    val allowChat: Boolean = true,
     val trustedPeers: List<HostSavedTrustedPeer> = emptyList(),
 )
 
@@ -349,6 +353,28 @@ object HostController {
         }
     }
 
+    fun setDefaultPermissions(
+        allowInput: Boolean,
+        allowClipboard: Boolean,
+        allowAudio: Boolean,
+        allowChat: Boolean,
+    ) {
+        val handle = nativeHandle
+        if (handle != 0L && VeloxNative.isLoaded) {
+            try {
+                VeloxNative.nativeHostSetDefaultPermissions(
+                    handle = handle,
+                    allowInput = allowInput,
+                    allowClipboard = allowClipboard,
+                    allowAudio = allowAudio,
+                    allowChat = allowChat,
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "nativeHostSetDefaultPermissions failed: ${t.message}")
+            }
+        }
+    }
+
     /**
      * Defense-in-depth auth invariant matching Desktop v0.3.0:
      * - `ONE_TIME` never passes a permanent hash to the host engine.
@@ -507,6 +533,17 @@ object HostController {
                 return false
             }
             nativeHandle = handle
+            try {
+                VeloxNative.nativeHostSetDefaultPermissions(
+                    handle = handle,
+                    allowInput = config.allowInput,
+                    allowClipboard = config.allowClipboard,
+                    allowAudio = config.allowAudio,
+                    allowChat = config.allowChat,
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "nativeHostSetDefaultPermissions on start failed: ${t.message}")
+            }
 
             val enc = ScreenCaptureEncoder(
                 mediaProjection = projection,

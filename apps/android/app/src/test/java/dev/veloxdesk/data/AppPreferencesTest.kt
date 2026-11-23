@@ -1,5 +1,6 @@
 package dev.veloxdesk.data
 
+import android.content.SharedPreferences
 import dev.veloxdesk.bridge.BridgeConstants
 import dev.veloxdesk.bridge.HostPasswordMode
 import dev.veloxdesk.bridge.HostSavedTrustedPeer
@@ -63,6 +64,13 @@ class AppPreferencesTest {
         assertTrue(desktop.audioEnabled)
         assertTrue(desktop.clipboardEnabled)
         assertFalse(desktop.showHudOnConnect)
+        assertTrue(desktop.preferYuv444)
+        assertFalse(desktop.micEnabled)
+        assertTrue(desktop.echoCancellation)
+        assertTrue(desktop.noiseSuppression)
+        assertEquals(StreamProfile.AUDIO_FRAME_LATENCY_AUTO, desktop.audioFrameLatencyMs)
+        assertEquals(10_000, desktop.effectiveAudioFrameUs(StreamMode.DESKTOP))
+        assertEquals(0, desktop.protocolAudioFrameUs())
 
         val gaming = StreamProfile.defaultGaming()
         assertEquals(50_000, gaming.bitrateKbps)
@@ -72,6 +80,114 @@ class AppPreferencesTest {
         assertTrue(gaming.audioEnabled)
         assertTrue(gaming.clipboardEnabled)
         assertTrue(gaming.showHudOnConnect)
+        assertFalse(gaming.preferYuv444)
+        assertFalse(gaming.micEnabled)
+        assertTrue(gaming.echoCancellation)
+        assertTrue(gaming.noiseSuppression)
+        assertEquals(StreamProfile.AUDIO_FRAME_LATENCY_AUTO, gaming.audioFrameLatencyMs)
+        assertEquals(5_000, gaming.effectiveAudioFrameUs(StreamMode.GAMING))
+        assertEquals(0, gaming.protocolAudioFrameUs())
+    }
+
+    @Test
+    fun audioFrameLatency_normalizationAndWireMicroseconds() {
+        assertEquals(0, StreamProfile.normalizeAudioFrameLatencyMs(0))
+        assertEquals(2, StreamProfile.normalizeAudioFrameLatencyMs(2))
+        assertEquals(5, StreamProfile.normalizeAudioFrameLatencyMs(5))
+        assertEquals(10, StreamProfile.normalizeAudioFrameLatencyMs(10))
+        assertEquals(20, StreamProfile.normalizeAudioFrameLatencyMs(20))
+        assertEquals(0, StreamProfile.normalizeAudioFrameLatencyMs(-1))
+        assertEquals(0, StreamProfile.normalizeAudioFrameLatencyMs(7))
+        assertEquals(0, StreamProfile.normalizeAudioFrameLatencyMs(99))
+
+        val base = StreamProfile.defaultDesktop()
+        assertEquals(2_500, base.copy(audioFrameLatencyMs = 2).protocolAudioFrameUs())
+        assertEquals(5_000, base.copy(audioFrameLatencyMs = 5).protocolAudioFrameUs())
+        assertEquals(10_000, base.copy(audioFrameLatencyMs = 10).protocolAudioFrameUs())
+        assertEquals(20_000, base.copy(audioFrameLatencyMs = 20).protocolAudioFrameUs())
+        assertEquals(2_500, base.copy(audioFrameLatencyMs = 2).effectiveAudioFrameUs(BridgeConstants.MODE_DESKTOP))
+    }
+
+    @Test
+    fun resetProfileDefaults_andNewAudioAndHostPrefsRoundTripPersistence() {
+        val backing = InMemorySharedPreferences()
+        val prefs = AppPreferences(backing)
+
+        // Verify fresh defaults
+        val initial = prefs.settings.value
+        assertEquals(StreamProfile.defaultDesktop(), initial.desktopProfile)
+        assertEquals(StreamProfile.defaultGaming(), initial.gamingProfile)
+        assertTrue(initial.hostAllowInput)
+        assertTrue(initial.hostAllowClipboard)
+        assertTrue(initial.hostAllowAudio)
+        assertTrue(initial.hostAllowChat)
+
+        // Customize both profiles and host default permissions
+        prefs.updateProfile(BridgeConstants.MODE_DESKTOP) {
+            it.copy(
+                bitrateKbps = BitratePreset.LOW.kbps,
+                fpsCap = 120,
+                showHudOnConnect = true,
+                preferYuv444 = false,
+                micEnabled = true,
+                echoCancellation = false,
+                noiseSuppression = false,
+                audioFrameLatencyMs = 20,
+            )
+        }
+        prefs.updateProfile(BridgeConstants.MODE_GAMING) {
+            it.copy(
+                bitrateKbps = BitratePreset.ULTRA.kbps,
+                fpsCap = 60,
+                showHudOnConnect = false,
+                preferYuv444 = true,
+                micEnabled = true,
+                echoCancellation = false,
+                noiseSuppression = true,
+                audioFrameLatencyMs = 2,
+            )
+        }
+        prefs.setHostAllowInput(false)
+        prefs.setHostAllowClipboard(false)
+        prefs.setHostAllowAudio(false)
+        prefs.setHostAllowChat(false)
+
+        // Reload from backing SharedPreferences and verify complete roundtrip
+        val reloaded = AppPreferences(backing).settings.value
+        assertEquals(BitratePreset.LOW.kbps, reloaded.desktopProfile.bitrateKbps)
+        assertEquals(120, reloaded.desktopProfile.fpsCap)
+        assertTrue(reloaded.desktopProfile.showHudOnConnect)
+        assertFalse(reloaded.desktopProfile.preferYuv444)
+        assertTrue(reloaded.desktopProfile.micEnabled)
+        assertFalse(reloaded.desktopProfile.echoCancellation)
+        assertFalse(reloaded.desktopProfile.noiseSuppression)
+        assertEquals(20, reloaded.desktopProfile.audioFrameLatencyMs)
+
+        assertEquals(BitratePreset.ULTRA.kbps, reloaded.gamingProfile.bitrateKbps)
+        assertEquals(60, reloaded.gamingProfile.fpsCap)
+        assertFalse(reloaded.gamingProfile.showHudOnConnect)
+        assertTrue(reloaded.gamingProfile.preferYuv444)
+        assertTrue(reloaded.gamingProfile.micEnabled)
+        assertFalse(reloaded.gamingProfile.echoCancellation)
+        assertTrue(reloaded.gamingProfile.noiseSuppression)
+        assertEquals(2, reloaded.gamingProfile.audioFrameLatencyMs)
+
+        assertFalse(reloaded.hostAllowInput)
+        assertFalse(reloaded.hostAllowClipboard)
+        assertFalse(reloaded.hostAllowAudio)
+        assertFalse(reloaded.hostAllowChat)
+
+        // Reset Desktop defaults -> Gaming remains customized
+        prefs.resetProfileDefaults(StreamMode.DESKTOP)
+        val afterDesktopReset = AppPreferences(backing).settings.value
+        assertEquals(StreamProfile.defaultDesktop(), afterDesktopReset.desktopProfile)
+        assertEquals(BitratePreset.ULTRA.kbps, afterDesktopReset.gamingProfile.bitrateKbps)
+        assertEquals(2, afterDesktopReset.gamingProfile.audioFrameLatencyMs)
+
+        // Reset Gaming defaults -> Gaming restored to defaults
+        prefs.resetProfileDefaults(StreamMode.GAMING)
+        val afterGamingReset = AppPreferences(backing).settings.value
+        assertEquals(StreamProfile.defaultGaming(), afterGamingReset.gamingProfile)
     }
 
     @Test
@@ -214,5 +330,98 @@ class AppPreferencesTest {
         val afterRemove = AppPreferences.removeTrustedPeer(list, "AA11BB22")
         assertEquals(1, afterRemove.size)
         assertEquals("cc33dd44", afterRemove[0].publicKeyHex)
+    }
+
+    private class InMemorySharedPreferences : SharedPreferences {
+        private val map = LinkedHashMap<String, Any?>()
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(map)
+
+        override fun getString(key: String?, defValue: String?): String? =
+            (map[key] as? String) ?: defValue
+
+        @Suppress("UNCHECKED_CAST")
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+            (map[key] as? Set<String>)?.toMutableSet() ?: defValues
+
+        override fun getInt(key: String?, defValue: Int): Int =
+            (map[key] as? Int) ?: defValue
+
+        override fun getLong(key: String?, defValue: Long): Long =
+            (map[key] as? Long) ?: defValue
+
+        override fun getFloat(key: String?, defValue: Float): Float =
+            (map[key] as? Float) ?: defValue
+
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean =
+            (map[key] as? Boolean) ?: defValue
+
+        override fun contains(key: String?): Boolean = map.containsKey(key)
+
+        override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+            private val pending = LinkedHashMap<String, Any?>()
+            private val removals = LinkedHashSet<String>()
+            private var clearAll = false
+
+            override fun putString(key: String?, value: String?): SharedPreferences.Editor = apply {
+                if (key != null) {
+                    if (value == null) removals.add(key) else pending[key] = value
+                }
+            }
+
+            override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor = apply {
+                if (key != null) {
+                    if (values == null) removals.add(key) else pending[key] = LinkedHashSet(values)
+                }
+            }
+
+            override fun putInt(key: String?, value: Int): SharedPreferences.Editor = apply {
+                if (key != null) pending[key] = value
+            }
+
+            override fun putLong(key: String?, value: Long): SharedPreferences.Editor = apply {
+                if (key != null) pending[key] = value
+            }
+
+            override fun putFloat(key: String?, value: Float): SharedPreferences.Editor = apply {
+                if (key != null) pending[key] = value
+            }
+
+            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = apply {
+                if (key != null) pending[key] = value
+            }
+
+            override fun remove(key: String?): SharedPreferences.Editor = apply {
+                if (key != null) {
+                    removals.add(key)
+                    pending.remove(key)
+                }
+            }
+
+            override fun clear(): SharedPreferences.Editor = apply {
+                clearAll = true
+                pending.clear()
+                removals.clear()
+            }
+
+            override fun commit(): Boolean {
+                apply()
+                return true
+            }
+
+            override fun apply() {
+                if (clearAll) map.clear()
+                for (r in removals) map.remove(r)
+                map.putAll(pending)
+            }
+        }
+
+        override fun registerOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) {}
+
+        override fun unregisterOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) {}
     }
 }

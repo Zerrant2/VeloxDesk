@@ -36,12 +36,12 @@ pub use power::{
     power_action_label, power_action_warning,
 };
 pub use session::{
-    SessionAction, SessionInfo, SessionToolbar, ToolbarAction, format_recording_elapsed, format_recording_size,
-    settings_window, settings_window_at, settings_window_full, settings_window_with_security,
+    SessionAction, SessionInfo, SessionToolbar, SettingsAction, ToolbarAction, format_recording_elapsed,
+    format_recording_size, settings_window, settings_window_at, settings_window_full, settings_window_with_security,
 };
 pub use settings::{
-    FpsCap, Language, Mode, PasswordMode, Present, Quality, SavedTrustedPeer, Scale, Settings, StreamSettings,
-    ThemePreference,
+    AudioFrameLatency, FpsCap, HostPrivacyMode, Language, Mode, PasswordMode, Present, Quality, SavedTrustedPeer,
+    Scale, Settings, StreamSettings, ThemePreference,
 };
 pub use terminal::{TerminalAction, TerminalWindow, strip_ansi};
 pub use tunnels::{ActiveTunnel, TunnelAction, TunnelSpec, TunnelsWindow, parse_tunnel_spec, parse_tunnel_spec_i18n};

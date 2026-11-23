@@ -213,6 +213,26 @@ pub trait HostCallbacks: Send + Sync + 'static {
     fn on_stopped(&self);
 }
 
+/// Default permissions granted to incoming viewers on the Android Host (v0.6.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostDefaultPermissions {
+    pub allow_input: bool,
+    pub allow_clipboard: bool,
+    pub allow_audio: bool,
+    pub allow_chat: bool,
+}
+
+impl Default for HostDefaultPermissions {
+    fn default() -> Self {
+        Self {
+            allow_input: true,
+            allow_clipboard: true,
+            allow_audio: true,
+            allow_chat: true,
+        }
+    }
+}
+
 /// Startup configuration for [`AndroidHostEngine`].
 #[derive(Clone, Debug)]
 pub struct AndroidHostConfig {
@@ -228,6 +248,7 @@ pub struct AndroidHostConfig {
     pub permanent_hash_phc: String,
     pub require_accept: bool,
     pub trusted_peers_json: String,
+    pub default_permissions: HostDefaultPermissions,
 }
 
 #[derive(Debug, Clone)]
@@ -608,7 +629,13 @@ impl HostAudioState {
     }
 }
 
-fn resample_linear_interleaved(src: &[f32], src_rate: u32, dst_rate: u32, channels: usize, dst: &mut Vec<f32>) {
+pub(crate) fn resample_linear_interleaved(
+    src: &[f32],
+    src_rate: u32,
+    dst_rate: u32,
+    channels: usize,
+    dst: &mut Vec<f32>,
+) {
     dst.clear();
     if src.is_empty() || src_rate == 0 || dst_rate == 0 || channels == 0 {
         return;
@@ -637,8 +664,11 @@ fn resample_linear_interleaved(src: &[f32], src_rate: u32, dst_rate: u32, channe
 struct ActiveSessionBridge {
     session_id: u64,
     mode: i32,
-    allow_audio: bool,
-    allow_chat: bool,
+    viewer_accepts_opus: bool,
+    allow_input: AtomicBool,
+    allow_clipboard: AtomicBool,
+    allow_audio: AtomicBool,
+    allow_chat: AtomicBool,
     bitrate_kbps: AtomicU32,
     frame_id: AtomicU32,
     next_chat_id: AtomicU64,
@@ -649,11 +679,12 @@ struct ActiveSessionBridge {
 }
 
 impl ActiveSessionBridge {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_id: u64,
         mode: i32,
-        allow_audio: bool,
-        allow_chat: bool,
+        viewer_accepts_opus: bool,
+        perms: &Permissions,
         initial_bitrate_kbps: u32,
         ch: Arc<dyn TransportChannel>,
         ctrl_out: mpsc::UnboundedSender<Envelope>,
@@ -663,8 +694,11 @@ impl ActiveSessionBridge {
         Self {
             session_id,
             mode,
-            allow_audio,
-            allow_chat,
+            viewer_accepts_opus,
+            allow_input: AtomicBool::new(perms.input),
+            allow_clipboard: AtomicBool::new(perms.clipboard),
+            allow_audio: AtomicBool::new(perms.audio && viewer_accepts_opus),
+            allow_chat: AtomicBool::new(perms.allow_chat),
             bitrate_kbps: AtomicU32::new(initial_bitrate_kbps),
             frame_id: AtomicU32::new(1),
             next_chat_id: AtomicU64::new(1),
@@ -673,6 +707,14 @@ impl ActiveSessionBridge {
             ctrl_out,
             clip_out: Mutex::new(None),
         }
+    }
+
+    fn apply_live_permissions(&self, perms: HostDefaultPermissions) {
+        self.allow_input.store(perms.allow_input, Ordering::Relaxed);
+        self.allow_clipboard.store(perms.allow_clipboard, Ordering::Relaxed);
+        self.allow_audio
+            .store(perms.allow_audio && self.viewer_accepts_opus, Ordering::Relaxed);
+        self.allow_chat.store(perms.allow_chat, Ordering::Relaxed);
     }
 
     fn build_session_config(&self, display: &DisplayState) -> SessionConfig {
@@ -691,7 +733,7 @@ impl ActiveSessionBridge {
             fec_parity_percent: parity,
             stream_id: 0,
         };
-        let audio = self.allow_audio.then_some(AudioConfig {
+        let audio = self.allow_audio.load(Ordering::Relaxed).then_some(AudioConfig {
             codec: AudioCodec::Opus as i32,
             sample_rate: 48_000,
             channels: 2,
@@ -749,7 +791,7 @@ impl ActiveSessionBridge {
     }
 
     fn push_audio_pcm(&self, pcm16: &[i16], sample_rate: u32, channels: u16) {
-        if !self.allow_audio || pcm16.is_empty() {
+        if !self.allow_audio.load(Ordering::Relaxed) || pcm16.is_empty() {
             return;
         }
         self.audio_state.lock().push_pcm16(pcm16, sample_rate, channels);
@@ -762,13 +804,16 @@ impl ActiveSessionBridge {
     }
 
     fn send_clipboard_text(&self, text: String) {
+        if !self.allow_clipboard.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(tx) = self.clip_out.lock().as_ref() {
             let _ = tx.send(text);
         }
     }
 
     fn send_chat(&self, sender_name: String, text: String) -> u64 {
-        if !self.allow_chat || text.is_empty() {
+        if !self.allow_chat.load(Ordering::Relaxed) || text.is_empty() {
             return 0;
         }
         let id = self.next_chat_id.fetch_add(1, Ordering::Relaxed);
@@ -780,6 +825,7 @@ impl ActiveSessionBridge {
 struct HostShared {
     auth: AndroidHostAuthState,
     approvals: PendingApprovals,
+    default_permissions: RwLock<HostDefaultPermissions>,
     display: RwLock<DisplayState>,
     active_session: RwLock<Option<Arc<ActiveSessionBridge>>>,
     callbacks: Arc<dyn HostCallbacks>,
@@ -828,6 +874,7 @@ impl AndroidHostEngine {
                 callbacks.clone(),
             ),
             approvals: PendingApprovals::new(),
+            default_permissions: RwLock::new(cfg.default_permissions),
             display: RwLock::new(DisplayState { name: device_name, width, height, fps }),
             active_session: RwLock::new(None),
             callbacks: callbacks.clone(),
@@ -888,6 +935,19 @@ impl AndroidHostEngine {
     /// Update password mode, permanent PHC hash, and interactive approval policy live.
     pub fn update_auth(&self, mode: HostPasswordMode, permanent_hash_phc: &str, require_accept: bool) {
         self.shared.auth.update_auth(mode, permanent_hash_phc, require_accept);
+    }
+
+    /// Read the current default permissions granted to incoming sessions.
+    pub fn default_permissions(&self) -> HostDefaultPermissions {
+        *self.shared.default_permissions.read()
+    }
+
+    /// Update default host permissions live for both upcoming and currently active sessions.
+    pub fn set_default_permissions(&self, perms: HostDefaultPermissions) {
+        *self.shared.default_permissions.write() = perms;
+        if let Some(session) = self.shared.active_session.read().clone() {
+            session.apply_live_permissions(perms);
+        }
     }
 
     /// Revoke a trusted peer by its 64-char hex Ed25519 public key.
@@ -1526,6 +1586,7 @@ async fn authenticate(
         if !decision.accepted {
             return Err(reject_auth(writer, ch_ref, "connection rejected by host user").await);
         }
+        let defaults = *shared.default_permissions.read();
         let granted = Permissions {
             view: true,
             input: decision.allow_input,
@@ -1536,7 +1597,7 @@ async fn authenticate(
             terminal: false,
             restart: false,
             privacy_mode: false,
-            allow_chat: true,
+            allow_chat: defaults.allow_chat,
             allow_power: false,
         };
         if decision.remember_peer
@@ -1550,17 +1611,18 @@ async fn authenticate(
         }
         granted
     } else {
+        let defaults = *shared.default_permissions.read();
         Permissions {
             view: true,
-            input: true,
-            clipboard: true,
+            input: defaults.allow_input,
+            clipboard: defaults.allow_clipboard,
             file_transfer: false,
-            audio: true,
+            audio: defaults.allow_audio,
             tunnel: false,
             terminal: false,
             restart: false,
             privacy_mode: false,
-            allow_chat: true,
+            allow_chat: defaults.allow_chat,
             allow_power: false,
         }
     };
@@ -1640,7 +1702,6 @@ async fn run_session(
     let peer_name = if hello.device_name.is_empty() { auth.peer_device_id.clone() } else { hello.device_name.clone() };
     let viewer_accepts_opus =
         hello.audio_codecs.is_empty() || hello.audio_codecs.contains(&(AudioCodec::Opus as i32));
-    let allow_audio = auth.permissions.audio && viewer_accepts_opus;
 
     // 3. Negotiate initial bitrate / FPS and send SessionConfig.
     let display = shared.display.read().clone();
@@ -1656,8 +1717,8 @@ async fn run_session(
     let bridge = Arc::new(ActiveSessionBridge::new(
         sid,
         hello.mode,
-        allow_audio,
-        auth.permissions.allow_chat,
+        viewer_accepts_opus,
+        &auth.permissions,
         requested_bitrate_kbps,
         ch.clone(),
         ctrl_out.clone(),
@@ -1737,7 +1798,7 @@ async fn run_session(
                     Some(Msg::ReceiverReport(rr)) => {
                         let total = rr.packets_received + rr.packets_lost;
                         let loss = if total == 0 { 0.0 } else { rr.packets_lost as f64 / total as f64 };
-                        if allow_audio {
+                        if bridge.allow_audio.load(Ordering::Relaxed) {
                             bridge.audio_state.lock().set_redundant(loss > 0.02);
                         }
                         if let Some(d) = abr.on_report(&rr, Timestamp::now()) {
@@ -1769,14 +1830,25 @@ async fn run_session(
                             shared.callbacks.on_bitrate_changed(viewer_cap);
                         }
                     }
+                    Some(Msg::SessionModeUpdate(u)) => {
+                        if u.max_bitrate_kbps > 0 {
+                            viewer_cap = u.max_bitrate_kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
+                            abr = AbrController::new(viewer_cap, MIN_BITRATE_KBPS.min(viewer_cap), viewer_cap);
+                            bridge.bitrate_kbps.store(viewer_cap, Ordering::Relaxed);
+                            if viewer_cap != last_bitrate_notified {
+                                last_bitrate_notified = viewer_cap;
+                                shared.callbacks.on_bitrate_changed(viewer_cap);
+                            }
+                        }
+                    }
                     Some(Msg::Input(ev)) => {
-                        if auth.permissions.input {
+                        if bridge.allow_input.load(Ordering::Relaxed) {
                             dispatch_input_event(&ev, &shared.callbacks);
                         }
                     }
                     Some(Msg::ChatMessage(chat)) => {
                         handle_host_chat_message(
-                            auth.permissions.allow_chat,
+                            bridge.allow_chat.load(Ordering::Relaxed),
                             &auth.peer_device_id,
                             &chat,
                             &ctrl_out,
@@ -1785,7 +1857,7 @@ async fn run_session(
                     }
                     Some(Msg::ChatAck(ack)) => {
                         handle_host_chat_ack(
-                            auth.permissions.allow_chat,
+                            bridge.allow_chat.load(Ordering::Relaxed),
                             &auth.peer_device_id,
                             &ack,
                             &shared.callbacks,
@@ -1842,15 +1914,18 @@ async fn accept_extra_streams(
         let (kind, send_opt, recv) = incoming;
         match kind {
             StreamKind::Input => {
-                if !perms.input {
+                if !perms.input && !bridge.allow_input.load(Ordering::Relaxed) {
                     tracing::debug!("AndroidHost: ignoring Input stream (input permission denied)");
                     continue;
                 }
                 let cb = callbacks.clone();
+                let b = bridge.clone();
                 let mut reader = ControlReceiver::new(recv);
                 readers.spawn(async move {
                     while let Ok(env) = reader.recv().await {
-                        if let Some(Msg::Input(ev)) = env.msg {
+                        if let Some(Msg::Input(ev)) = env.msg
+                            && b.allow_input.load(Ordering::Relaxed)
+                        {
                             dispatch_input_event(&ev, &cb);
                         }
                     }
@@ -1858,18 +1933,28 @@ async fn accept_extra_streams(
             }
             StreamKind::Clipboard => {
                 let Some(send) = send_opt else { continue };
-                if !perms.clipboard {
+                if !perms.clipboard && !bridge.allow_clipboard.load(Ordering::Relaxed) {
                     readers.spawn(deny_stream_with_close(send, "clipboard permission denied"));
                     continue;
                 }
                 let (clip_tx, clip_rx) = mpsc::unbounded_channel::<String>();
                 *bridge.clip_out.lock() = Some(clip_tx);
                 let cb = callbacks.clone();
+                let b = bridge.clone();
                 let stop_rx = stop.clone();
                 readers.spawn(async move {
-                    if let Err(e) =
-                        run_android_clipboard_stream(send, recv, clip_rx, move |text| cb.on_clipboard_text(text), stop_rx)
-                            .await
+                    if let Err(e) = run_android_clipboard_stream(
+                        send,
+                        recv,
+                        clip_rx,
+                        move |text| {
+                            if b.allow_clipboard.load(Ordering::Relaxed) {
+                                cb.on_clipboard_text(text);
+                            }
+                        },
+                        stop_rx,
+                    )
+                    .await
                     {
                         tracing::debug!("AndroidHost clipboard stream ended: {e}");
                     }
@@ -2133,5 +2218,67 @@ mod tests {
             }]
         );
         assert_eq!(rec.acks.lock().as_slice(), &[("123456789".into(), 3)]);
+    }
+
+    #[test]
+    fn host_default_permissions_defaults_and_live_update() {
+        let defaults = HostDefaultPermissions::default();
+        assert!(defaults.allow_input);
+        assert!(defaults.allow_clipboard);
+        assert!(defaults.allow_audio);
+        assert!(defaults.allow_chat);
+
+        let dir = std::env::temp_dir().join(format!(
+            "veloxdesk-host-perms-test-{}-{}",
+            std::process::id(),
+            Timestamp::now().as_micros()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let engine = AndroidHostEngine::start(
+            AndroidHostConfig {
+                files_dir: dir.clone(),
+                bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+                rendezvous_addr: String::new(),
+                device_name: "TestAndroidHost".into(),
+                width: 720,
+                height: 1280,
+                fps: 30,
+                password_mode: HostPasswordMode::OneTime,
+                permanent_hash_phc: String::new(),
+                require_accept: false,
+                trusted_peers_json: String::new(),
+                default_permissions: HostDefaultPermissions {
+                    allow_input: true,
+                    allow_clipboard: false,
+                    allow_audio: true,
+                    allow_chat: true,
+                },
+            },
+            Arc::new(NoopHostCallbacks),
+        )
+        .expect("start host engine");
+
+        assert_eq!(
+            engine.default_permissions(),
+            HostDefaultPermissions {
+                allow_input: true,
+                allow_clipboard: false,
+                allow_audio: true,
+                allow_chat: true,
+            }
+        );
+
+        let updated = HostDefaultPermissions {
+            allow_input: false,
+            allow_clipboard: true,
+            allow_audio: false,
+            allow_chat: false,
+        };
+        engine.set_default_permissions(updated);
+        assert_eq!(engine.default_permissions(), updated);
+
+        engine.stop_and_join();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

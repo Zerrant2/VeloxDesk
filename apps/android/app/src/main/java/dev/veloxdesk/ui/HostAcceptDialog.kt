@@ -51,13 +51,16 @@ import dev.veloxdesk.ui.theme.VeloxTheme
 @Composable
 fun HostAcceptDialog(
     request: HostApprovalRequest,
+    defaultAllowInput: Boolean = true,
+    defaultAllowClipboard: Boolean = true,
+    defaultAllowAudio: Boolean = true,
     onAccept: (rememberPeer: Boolean, allowInput: Boolean, allowClipboard: Boolean, allowAudio: Boolean) -> Unit,
     onReject: () -> Unit,
 ) {
     val colors = VeloxTheme.colors
-    var allowInput by remember(request.requestId) { mutableStateOf(true) }
-    var allowClipboard by remember(request.requestId) { mutableStateOf(true) }
-    var allowAudio by remember(request.requestId) { mutableStateOf(true) }
+    var allowInput by remember(request.requestId) { mutableStateOf(defaultAllowInput) }
+    var allowClipboard by remember(request.requestId) { mutableStateOf(defaultAllowClipboard) }
+    var allowAudio by remember(request.requestId) { mutableStateOf(defaultAllowAudio) }
     var rememberPeer by remember(request.requestId) { mutableStateOf(false) }
 
     val callerName = request.peerName.trim().ifEmpty { str(R.string.host_peer_unknown) }

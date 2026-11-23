@@ -18,10 +18,10 @@ use std::process::Command;
 
 use veloxdesk_protocol::control::{DisplayInfo, FileEntry, Permissions};
 use veloxdesk_ui::{
-    AcceptPrompt, ActiveTunnel, ConnectAction, ConnectScreen, FileManagerWindow, FpsCap, IncomingSessionInfo, Language,
-    Mode, PasswordPrompt, Present, Quality, Scale, SessionInfo, SessionToolbar, Settings, StreamSettings,
-    TailscaleInfo, TailscalePeer, TerminalWindow, ToolbarAction, TunnelsWindow, UpdateUiState, settings_window_full,
-    tr,
+    AcceptPrompt, ActiveTunnel, AudioFrameLatency, ConnectAction, ConnectScreen, FileManagerWindow, FpsCap,
+    IncomingSessionInfo, Language, Mode, PasswordPrompt, Present, Quality, Scale, SessionInfo, SessionToolbar,
+    Settings, StreamSettings, TailscaleInfo, TailscalePeer, TerminalWindow, ToolbarAction, TunnelsWindow,
+    UpdateUiState, settings_window_full, tr,
 };
 
 fn workspace_root() -> PathBuf {
@@ -632,6 +632,9 @@ fn r4_desktop_and_gaming_profiles_independent_and_persist() {
         audio_enabled: false,
         mic_enabled: false,
         clipboard_sync: true,
+        echo_cancellation: false,
+        noise_suppression: false,
+        audio_frame_latency: AudioFrameLatency::Ms20,
     };
     let gaming_cfg = StreamSettings {
         quality: Quality::Ultra,
@@ -646,6 +649,9 @@ fn r4_desktop_and_gaming_profiles_independent_and_persist() {
         audio_enabled: true,
         mic_enabled: true,
         clipboard_sync: false,
+        echo_cancellation: true,
+        noise_suppression: true,
+        audio_frame_latency: AudioFrameLatency::Ms2_5,
     };
 
     // Every single field differs between desktop_cfg and gaming_cfg.
@@ -661,6 +667,9 @@ fn r4_desktop_and_gaming_profiles_independent_and_persist() {
     assert_ne!(desktop_cfg.audio_enabled, gaming_cfg.audio_enabled);
     assert_ne!(desktop_cfg.mic_enabled, gaming_cfg.mic_enabled);
     assert_ne!(desktop_cfg.clipboard_sync, gaming_cfg.clipboard_sync);
+    assert_ne!(desktop_cfg.echo_cancellation, gaming_cfg.echo_cancellation);
+    assert_ne!(desktop_cfg.noise_suppression, gaming_cfg.noise_suppression);
+    assert_ne!(desktop_cfg.audio_frame_latency, gaming_cfg.audio_frame_latency);
 
     let mut settings = Settings {
         language: Language::Ru,

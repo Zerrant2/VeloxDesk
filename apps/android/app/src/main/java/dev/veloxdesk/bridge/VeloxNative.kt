@@ -75,10 +75,35 @@ object VeloxNative {
     external fun nativeSetMaxBitrate(handle: Long, bitrateKbps: Int)
 
     @JvmStatic
+    external fun nativeUpdateSessionMode(
+        handle: Long,
+        mode: Int,
+        maxBitrateKbps: Int,
+        maxFps: Int,
+        audioFrameUs: Int,
+        preferYuv444: Boolean,
+    )
+
+    @JvmStatic
     external fun nativeSwitchDisplay(handle: Long, displayIndex: Int)
 
     @JvmStatic
     external fun nativeSetAudioEnabled(handle: Long, enabled: Boolean)
+
+    @JvmStatic
+    external fun nativeSetAudioProcessing(
+        handle: Long,
+        echoCancellation: Boolean,
+        noiseSuppression: Boolean,
+    )
+
+    @JvmStatic
+    external fun nativePushMicPcm(
+        handle: Long,
+        pcm16: ShortArray,
+        sampleRate: Int,
+        channels: Int,
+    )
 
     @JvmStatic
     external fun nativeSetClipboardEnabled(handle: Long, enabled: Boolean)
@@ -177,6 +202,15 @@ object VeloxNative {
         passwordMode: Int,
         permanentHashPhc: String,
         requireAccept: Boolean,
+    )
+
+    @JvmStatic
+    external fun nativeHostSetDefaultPermissions(
+        handle: Long,
+        allowInput: Boolean,
+        allowClipboard: Boolean,
+        allowAudio: Boolean,
+        allowChat: Boolean,
     )
 
     @JvmStatic

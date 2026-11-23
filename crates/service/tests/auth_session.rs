@@ -576,3 +576,102 @@ async fn live_password_mode_switches_and_security_guard_and_peer_revocation() {
         assert!(host.await.unwrap().is_err());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_default_permissions_override_applies_to_open_password_and_approval() {
+    let host_id = DeviceIdentity::generate();
+    let viewer_id = DeviceIdentity::generate();
+    let injected = Arc::new(AtomicUsize::new(0));
+
+    // 1. Open mode honors live HostAuthState::set_default_permissions.
+    let open_state = HostAuthState::from_config(&HostAuthConfig::open());
+    let custom_open = Permissions {
+        view: true,
+        input: false,
+        clipboard: false,
+        file_transfer: false,
+        audio: true,
+        tunnel: false,
+        terminal: false,
+        restart: false,
+        privacy_mode: false,
+        allow_chat: true,
+        allow_power: true,
+    };
+    open_state.set_default_permissions(custom_open.clone());
+    let mut open_auth = HostAuthConfig::open();
+    open_auth.shared_state = Some(open_state);
+    let open_cfg = Arc::new(HostConfig { auth: open_auth, audio_enabled: false, ..Default::default() });
+    {
+        let (hch, vch) = mem_pair(Some(viewer_id.public_key()));
+        let host = tokio::spawn(run_session(hch, open_cfg, test_backends(injected.clone())));
+        let (s, r) = vch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut w, mut r) = (EnvelopeWriter::new(s), EnvelopeReader::new(r));
+        w.send(&Msg::Hello(viewer_hello(&viewer_id)).into()).await.unwrap();
+        let Msg::AuthResult(res) = recv_msg(&mut r).await else { panic!("expected AuthResult") };
+        assert!(res.ok);
+        assert_eq!(res.permissions.as_ref(), Some(&custom_open));
+        let Msg::SessionConfig(_) = recv_msg(&mut r).await else { panic!("expected SessionConfig") };
+        w.send(&Msg::Close(Close::default()).into()).await.unwrap();
+        host.await.unwrap().unwrap();
+    }
+
+    // 2. Permanent password login honors live override AND passes it as ApprovalRequest.default_permissions.
+    let hash = PasswordHash::hash_with("v060-secret", Argon2Params { m_cost_kib: 1024, t_cost: 1, p_cost: 1 }).unwrap();
+    let mut pw_auth = HostAuthConfig::with_permanent_password(hash);
+    pw_auth.host_public_key = Some(host_id.public_key());
+    let pw_state = HostAuthState::from_config(&pw_auth);
+    pw_auth.shared_state = Some(pw_state.clone());
+
+    let seen_default = Arc::new(std::sync::Mutex::new(None::<Permissions>));
+    let seen_c = seen_default.clone();
+    pw_auth.require_accept = true;
+    pw_auth.approval_handler = Some(Arc::new(move |req| {
+        let seen_c = seen_c.clone();
+        Box::pin(async move {
+            *seen_c.lock().unwrap() = Some(req.default_permissions.clone());
+            ApprovalDecision::accept(req.default_permissions)
+        })
+    }));
+
+    let live_perms = Permissions {
+        view: true,
+        input: true,
+        clipboard: false,
+        file_transfer: true,
+        audio: false,
+        tunnel: false,
+        terminal: true,
+        restart: false,
+        privacy_mode: true,
+        allow_chat: false,
+        allow_power: true,
+    };
+    pw_state.set_default_permissions(live_perms.clone());
+    let pw_cfg = Arc::new(HostConfig { auth: pw_auth, ..Default::default() });
+    {
+        let (hch, vch) = mem_pair(Some(viewer_id.public_key()));
+        let host = tokio::spawn(run_session(hch, pw_cfg, test_backends(injected)));
+        let (s, r) = vch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut w, mut r) = (EnvelopeWriter::new(s), EnvelopeReader::new(r));
+        w.send(&Msg::Hello(viewer_hello(&viewer_id)).into()).await.unwrap();
+        let Msg::AuthChallenge(ch) = recv_msg(&mut r).await else { panic!("expected AuthChallenge") };
+        let key = derive_password_key(
+            "v060-secret",
+            &ch.salt,
+            Argon2Params { m_cost_kib: ch.argon2_m_cost_kib, t_cost: ch.argon2_t_cost, p_cost: ch.argon2_p_cost },
+        )
+        .unwrap();
+        let proof = password_proof(&key, &ch.nonce);
+        w.send(&Msg::AuthResponse(AuthResponse { method: AuthMethod::PermanentPassword as i32, proof: proof.to_vec() }).into())
+            .await
+            .unwrap();
+        let Msg::AuthResult(res) = recv_msg(&mut r).await else { panic!("expected AuthResult") };
+        assert!(res.ok);
+        assert_eq!(res.permissions.as_ref(), Some(&live_perms));
+        assert_eq!(seen_default.lock().unwrap().as_ref(), Some(&live_perms));
+        let Msg::SessionConfig(_) = recv_msg(&mut r).await else { panic!("expected SessionConfig") };
+        w.send(&Msg::Close(Close::default()).into()).await.unwrap();
+        host.await.unwrap().unwrap();
+    }
+}

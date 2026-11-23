@@ -55,16 +55,29 @@ pub enum VideoEvent {
     Fatal(String),
 }
 
+/// Live profile update applied without disconnecting the video pipeline (v0.6.0).
+#[derive(Debug, Clone, Copy)]
+pub struct VideoProfileUpdate {
+    pub max_fps: u32,
+    pub bitrate_kbps: u32,
+    pub parity_percent: u8,
+    pub draw_cursor: bool,
+    pub idle_fps: u32,
+    pub chroma: ChromaFormat,
+}
+
 pub(crate) enum EncodeCmd {
     Keyframe,
     /// Clear cached last frame (display switched or capture reinitialized) and force IDR on next frame.
     ResetLast,
     Rate(RateDecision),
+    UpdateProfile(VideoProfileUpdate),
     Nack(Nack),
 }
 
 enum CaptureCmd {
     SwitchDisplay(u32),
+    UpdateProfile { max_fps: u32, draw_cursor: bool },
 }
 
 /// Handle owned by the session.
@@ -116,6 +129,14 @@ impl VideoPipeline {
 
     pub fn apply_rate(&self, d: RateDecision) {
         self.slot.command(EncodeCmd::Rate(d));
+    }
+
+    pub fn update_profile(&self, upd: VideoProfileUpdate) {
+        let _ = self.cap_tx.send(CaptureCmd::UpdateProfile {
+            max_fps: upd.max_fps,
+            draw_cursor: upd.draw_cursor,
+        });
+        self.slot.command(EncodeCmd::UpdateProfile(upd));
     }
 
     pub fn nack(&self, n: Nack) {
@@ -183,8 +204,8 @@ impl CaptureLoop {
         Ok((cap, cfg))
     }
 
-    fn run(self) {
-        let interval = Duration::from_micros(1_000_000 / self.params.max_fps.max(1) as u64);
+    fn run(mut self) {
+        let mut interval = Duration::from_micros(1_000_000 / self.params.max_fps.max(1) as u64);
         let mut want = self.params.display;
         let (mut cap, mut cfg) = match self.open(want) {
             Ok(v) => v,
@@ -216,6 +237,21 @@ impl CaptureLoop {
                         }
                     }
                     self.slot.command(EncodeCmd::ResetLast);
+                }
+                Ok(CaptureCmd::UpdateProfile { max_fps, draw_cursor }) => {
+                    let max_fps = max_fps.max(1);
+                    let cursor_changed = self.params.draw_cursor != draw_cursor;
+                    self.params.max_fps = max_fps;
+                    self.params.draw_cursor = draw_cursor;
+                    interval = Duration::from_micros(1_000_000 / max_fps as u64);
+                    cfg.max_fps = max_fps;
+                    cfg.draw_cursor = draw_cursor;
+                    if cursor_changed {
+                        cap.stop();
+                        if let Err(e) = cap.start(&cfg) {
+                            tracing::warn!("capture restart for draw_cursor={draw_cursor} failed: {e}");
+                        }
+                    }
                 }
                 Err(TryRecvError::Disconnected) => break,
                 Err(TryRecvError::Empty) => {}
@@ -316,7 +352,7 @@ impl EncodeLoop {
     fn run(mut self) {
         self.bitrate_kbps = self.params.bitrate_kbps;
         self.sink.set_parity_percent(self.params.parity_percent);
-        let idle = (self.params.idle_fps > 0).then(|| Duration::from_micros(1_000_000 / self.params.idle_fps as u64));
+        let mut idle = (self.params.idle_fps > 0).then(|| Duration::from_micros(1_000_000 / self.params.idle_fps as u64));
         let mut force_kf = true;
         let mut last_encode = Instant::now();
         loop {
@@ -348,6 +384,34 @@ impl EncodeLoop {
                             if let Err(e) = enc.update(upd) {
                                 tracing::warn!("encoder bitrate update failed: {e}");
                             }
+                        }
+                    }
+                }
+                Wake::Cmd(EncodeCmd::UpdateProfile(upd)) => {
+                    let max_fps = upd.max_fps.max(1);
+                    let fps_changed = self.params.max_fps != max_fps;
+                    let chroma_changed = self.params.chroma != upd.chroma;
+                    let bitrate_changed = self.bitrate_kbps != upd.bitrate_kbps;
+                    self.params.max_fps = max_fps;
+                    self.params.parity_percent = upd.parity_percent;
+                    self.params.idle_fps = upd.idle_fps;
+                    self.params.chroma = upd.chroma;
+                    self.bitrate_kbps = upd.bitrate_kbps;
+                    self.sink.set_parity_percent(upd.parity_percent);
+                    idle = (self.params.idle_fps > 0)
+                        .then(|| Duration::from_micros(1_000_000 / self.params.idle_fps as u64));
+                    if chroma_changed {
+                        self.encoder = None;
+                        force_kf = true;
+                    } else if (bitrate_changed || fps_changed)
+                        && let Some(enc) = self.encoder.as_mut()
+                    {
+                        let enc_upd = EncoderUpdate {
+                            bitrate_kbps: bitrate_changed.then_some(upd.bitrate_kbps),
+                            fps: fps_changed.then_some(max_fps),
+                        };
+                        if let Err(e) = enc.update(enc_upd) {
+                            tracing::warn!("encoder profile update failed: {e}");
                         }
                     }
                 }

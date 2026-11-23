@@ -94,6 +94,10 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     private val activeHandle = AtomicLong(0L)
     private val sessionGen = AtomicLong(0L)
     private val firstFrameSeen = AtomicBoolean(false)
+    private val initialModeUpdateSent = AtomicBoolean(false)
+
+    @Volatile
+    private var activeProfile: StreamProfile = StreamProfile.defaultDesktop()
 
     private val cursorCacheLock = Any()
     private val cursorShapeCache = object : LinkedHashMap<Long, CursorShapeBitmap>(
@@ -269,6 +273,8 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         val normalizedTarget = AppPreferences.normalizeTarget(target)
         val gen = sessionGen.incrementAndGet()
         firstFrameSeen.set(false)
+        initialModeUpdateSent.set(false)
+        activeProfile = profile
         synchronized(cursorCacheLock) { cursorShapeCache.clear() }
         onSessionConnectedRecord = onConnectedHost
 
@@ -347,6 +353,13 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         activeHandle.set(handle)
+        runCatching {
+            VeloxNative.nativeSetAudioProcessing(
+                handle = handle,
+                echoCancellation = profile.echoCancellation,
+                noiseSuppression = profile.noiseSuppression,
+            )
+        }
     }
 
     private fun createSessionCallback(
@@ -452,6 +465,22 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             }
             mainHandler.post {
                 onSessionConnectedRecord?.invoke(target, hostName, requestedMode)
+            }
+            if (initialModeUpdateSent.compareAndSet(false, true)) {
+                val h = activeHandle.get()
+                val prof = activeProfile
+                if (h != 0L && VeloxNative.isLoaded) {
+                    runCatching {
+                        VeloxNative.nativeUpdateSessionMode(
+                            handle = h,
+                            mode = requestedMode,
+                            maxBitrateKbps = prof.bitrateKbps,
+                            maxFps = prof.fpsCap,
+                            audioFrameUs = prof.protocolAudioFrameUs(),
+                            preferYuv444 = prof.preferYuv444,
+                        )
+                    }
+                }
             }
         }
 
@@ -868,6 +897,37 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             VeloxNative.nativeSetMaxBitrate(h, bitrateKbps)
         }
         _uiState.update { it.copy(bitrateKbps = bitrateKbps) }
+    }
+
+    fun updateSessionMode(mode: Int, profile: StreamProfile) {
+        activeProfile = profile
+        val h = activeHandle.get()
+        if (h != 0L && VeloxNative.isLoaded) {
+            runCatching {
+                VeloxNative.nativeUpdateSessionMode(
+                    handle = h,
+                    mode = mode,
+                    maxBitrateKbps = profile.bitrateKbps,
+                    maxFps = profile.fpsCap,
+                    audioFrameUs = profile.protocolAudioFrameUs(),
+                    preferYuv444 = profile.preferYuv444,
+                )
+            }
+        }
+        _uiState.update { it.copy(mode = mode, bitrateKbps = profile.bitrateKbps) }
+    }
+
+    fun updateAudioProcessing(echoCancellation: Boolean, noiseSuppression: Boolean) {
+        activeProfile = activeProfile.copy(
+            echoCancellation = echoCancellation,
+            noiseSuppression = noiseSuppression,
+        )
+        val h = activeHandle.get()
+        if (h != 0L && VeloxNative.isLoaded) {
+            runCatching {
+                VeloxNative.nativeSetAudioProcessing(h, echoCancellation, noiseSuppression)
+            }
+        }
     }
 
     fun switchDisplay(displayIndex: Int) {

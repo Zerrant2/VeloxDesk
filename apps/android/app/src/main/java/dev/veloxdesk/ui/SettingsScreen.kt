@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Devices
+import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
@@ -74,6 +75,7 @@ import dev.veloxdesk.data.AppPreferences
 import dev.veloxdesk.data.AppSettings
 import dev.veloxdesk.data.AppThemeMode
 import dev.veloxdesk.data.BitratePreset
+import dev.veloxdesk.data.StreamMode
 import dev.veloxdesk.data.StreamProfile
 import dev.veloxdesk.ui.i18n.str
 import dev.veloxdesk.ui.theme.VeloxTheme
@@ -92,10 +94,15 @@ fun SettingsScreen(
     onRendezvousChange: (String) -> Unit,
     onRelayOnlyChange: (Boolean) -> Unit,
     onUpdateProfile: (mode: Int, (StreamProfile) -> StreamProfile) -> Unit,
+    onResetProfileDefaults: (StreamMode) -> Unit,
     onHostPasswordModeChange: (Int) -> Unit,
     onSaveHostPermanentPassword: (String) -> Unit,
     onClearHostPermanentPassword: () -> Unit,
     onHostRequireAcceptChange: (Boolean) -> Unit,
+    onHostAllowInputChange: (Boolean) -> Unit,
+    onHostAllowClipboardChange: (Boolean) -> Unit,
+    onHostAllowAudioChange: (Boolean) -> Unit,
+    onHostAllowChatChange: (Boolean) -> Unit,
     onRemoveHostTrustedPeer: (String) -> Unit,
 ) {
     val colors = VeloxTheme.colors
@@ -409,6 +416,41 @@ fun SettingsScreen(
                 Spacer(modifier = Modifier.height(10.dp))
 
                 Text(
+                    text = str(R.string.settings_host_default_perms_title),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = colors.textSecondary,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                SettingsToggleRow(
+                    title = str(R.string.settings_host_allow_input),
+                    subtitle = str(R.string.settings_host_allow_input_desc),
+                    checked = settings.hostAllowInput,
+                    onCheckedChange = onHostAllowInputChange,
+                )
+                SettingsToggleRow(
+                    title = str(R.string.settings_host_allow_clipboard),
+                    subtitle = str(R.string.settings_host_allow_clipboard_desc),
+                    checked = settings.hostAllowClipboard,
+                    onCheckedChange = onHostAllowClipboardChange,
+                )
+                SettingsToggleRow(
+                    title = str(R.string.settings_host_allow_audio),
+                    subtitle = str(R.string.settings_host_allow_audio_desc),
+                    checked = settings.hostAllowAudio,
+                    onCheckedChange = onHostAllowAudioChange,
+                )
+                SettingsToggleRow(
+                    title = str(R.string.settings_host_allow_chat),
+                    subtitle = str(R.string.settings_host_allow_chat_desc),
+                    checked = settings.hostAllowChat,
+                    onCheckedChange = onHostAllowChatChange,
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = colors.border.copy(alpha = 0.6f))
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
                     text = str(R.string.settings_host_trusted_title),
                     style = MaterialTheme.typography.labelMedium,
                     color = colors.textSecondary,
@@ -594,11 +636,11 @@ fun SettingsScreen(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 SettingsToggleRow(
-                    title = str(R.string.settings_audio),
-                    subtitle = str(R.string.settings_audio_desc),
-                    checked = profile.audioEnabled,
+                    title = str(R.string.settings_yuv444),
+                    subtitle = str(R.string.settings_yuv444_desc),
+                    checked = profile.preferYuv444,
                     onCheckedChange = { enabled ->
-                        onUpdateProfile(editingMode) { it.copy(audioEnabled = enabled) }
+                        onUpdateProfile(editingMode) { it.copy(preferYuv444 = enabled) }
                     },
                 )
                 SettingsToggleRow(
@@ -617,6 +659,109 @@ fun SettingsScreen(
                         onUpdateProfile(editingMode) { it.copy(showHudOnConnect = enabled) }
                     },
                 )
+
+                Spacer(modifier = Modifier.height(10.dp))
+                HorizontalDivider(color = colors.border.copy(alpha = 0.6f))
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
+                    text = str(R.string.settings_section_audio_voice),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = colors.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+
+                SettingsToggleRow(
+                    title = str(R.string.settings_audio),
+                    subtitle = str(R.string.settings_audio_desc),
+                    checked = profile.audioEnabled,
+                    onCheckedChange = { enabled ->
+                        onUpdateProfile(editingMode) { it.copy(audioEnabled = enabled) }
+                    },
+                )
+                SettingsToggleRow(
+                    title = str(R.string.settings_mic),
+                    subtitle = str(R.string.settings_mic_desc),
+                    checked = profile.micEnabled,
+                    onCheckedChange = { enabled ->
+                        onUpdateProfile(editingMode) { it.copy(micEnabled = enabled) }
+                    },
+                )
+                SettingsToggleRow(
+                    title = str(R.string.settings_aec),
+                    subtitle = str(R.string.settings_aec_desc),
+                    checked = profile.echoCancellation,
+                    onCheckedChange = { enabled ->
+                        onUpdateProfile(editingMode) { it.copy(echoCancellation = enabled) }
+                    },
+                )
+                SettingsToggleRow(
+                    title = str(R.string.settings_noise_suppression),
+                    subtitle = str(R.string.settings_noise_suppression_desc),
+                    checked = profile.noiseSuppression,
+                    onCheckedChange = { enabled ->
+                        onUpdateProfile(editingMode) { it.copy(noiseSuppression = enabled) }
+                    },
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = str(R.string.settings_audio_frame_latency),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = colors.textSecondary,
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    val autoLabel = if (editingMode == BridgeConstants.MODE_GAMING) {
+                        str(R.string.audio_latency_auto_gaming)
+                    } else {
+                        str(R.string.audio_latency_auto_desktop)
+                    }
+                    val latencies = listOf(
+                        StreamProfile.AUDIO_FRAME_LATENCY_AUTO to autoLabel,
+                        2 to str(R.string.audio_latency_2_5ms),
+                        5 to str(R.string.audio_latency_5ms),
+                        10 to str(R.string.audio_latency_10ms),
+                        20 to str(R.string.audio_latency_20ms),
+                    )
+                    latencies.forEach { (ms, label) ->
+                        SettingChip(
+                            selected = profile.audioFrameLatencyMs == ms,
+                            label = label,
+                            onClick = {
+                                onUpdateProfile(editingMode) { it.copy(audioFrameLatencyMs = ms) }
+                            },
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+                HorizontalDivider(color = colors.border.copy(alpha = 0.6f))
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedButton(
+                    onClick = { onResetProfileDefaults(StreamMode.fromId(editingMode)) },
+                    border = BorderStroke(1.dp, colors.border),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.RestartAlt,
+                        contentDescription = null,
+                        tint = colors.textPrimary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = str(R.string.btn_reset_profile_defaults),
+                        color = colors.textPrimary,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(20.dp))

@@ -10,7 +10,8 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use veloxdesk_crypto::auth::PasswordHash;
 use veloxdesk_protocol::DEFAULT_DIRECT_PORT;
-use veloxdesk_protocol::control::{ChromaFormat, VideoCodec};
+use veloxdesk_protocol::control::{ChromaFormat, Permissions, VideoCodec};
+use veloxdesk_virtual_display::PrivacyModeKind;
 
 use crate::audio::frame_ms_to_us;
 use crate::auth::{HostAuthConfig, TrustedPeer, encode_hex_pubkey, parse_hex_pubkey};
@@ -63,10 +64,18 @@ pub struct HostConfig {
     pub audio_bitrate_kbps: u32,
     /// Opus frame duration in ms (`2.5`, `5.0`, `10.0`, `20.0`; default `5.0`).
     pub audio_frame_ms: f32,
+    /// Whether `audio_frame_ms` was explicitly overridden (false = Auto: 5 ms Gaming / 10 ms Desktop) (v0.6.0).
+    pub audio_frame_ms_explicit: bool,
     /// Allow viewer microphone audio playback (`stream_id = 1`) on the host.
     pub allow_mic: bool,
     /// Enable echo cancellation (Windows process loopback exclusion + NLMS AEC) (v0.5.0).
     pub echo_cancellation: bool,
+    /// Enable pure-Rust microphone noise suppression on host audio path (v0.6.0).
+    pub mic_noise_suppression: bool,
+    /// Default permissions applied to unattended/interactive sessions (v0.6.0).
+    pub default_permissions: Permissions,
+    /// Windows privacy mode strategy (`CurtainOverlay` vs `VddMonitorOff`) (v0.6.0).
+    pub privacy_mode_kind: PrivacyModeKind,
     /// Portable mode: store config and device identity next to the executable instead of AppData.
     pub portable: bool,
     /// Local loopback TCP port for daemon/GUI IPC (`Some(DEFAULT_IPC_PORT)` by default,
@@ -120,8 +129,12 @@ impl Default for HostConfig {
             audio_enabled: true,
             audio_bitrate_kbps: 128,
             audio_frame_ms: 5.0,
+            audio_frame_ms_explicit: false,
             allow_mic: false,
             echo_cancellation: true,
+            mic_noise_suppression: true,
+            default_permissions: Permissions::interactive_default(),
+            privacy_mode_kind: PrivacyModeKind::CurtainOverlay,
             portable: false,
             ipc_port: Some(DEFAULT_IPC_PORT),
         }
@@ -522,6 +535,7 @@ impl HostArgs {
         }
         if let Some(v) = self.audio_frame_ms {
             cfg.audio_frame_ms = v;
+            cfg.audio_frame_ms_explicit = true;
         }
         if self.allow_mic {
             cfg.allow_mic = true;

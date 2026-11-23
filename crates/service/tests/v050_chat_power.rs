@@ -226,6 +226,7 @@ async fn chat_bidirectional_and_allow_chat_denied() {
             on_event: Some(Arc::new(move |ev| events_c.lock().unwrap().push(ev))),
             chat_tx: Some(chat_tx.clone()),
             power_executor: None,
+            ..Default::default()
         };
         let cfg = Arc::new(HostConfig { audio_enabled: false, ..Default::default() });
         let sess = tokio::spawn(run_session_with_hooks(host_ch, cfg, stub_backends(), stop_rx, hooks));
@@ -308,6 +309,7 @@ async fn chat_bidirectional_and_allow_chat_denied() {
             on_event: Some(Arc::new(move |ev| events_c.lock().unwrap().push(ev))),
             chat_tx: Some(chat_tx.clone()),
             power_executor: None,
+            ..Default::default()
         };
         let sess = tokio::spawn(run_session_with_hooks(host_ch, cfg, stub_backends(), stop_rx, hooks));
 
@@ -371,6 +373,7 @@ async fn system_power_request_denied_by_default_and_executed_when_allowed() {
             on_event: None,
             chat_tx: None,
             power_executor: Some(sim.clone()),
+            ..Default::default()
         };
         let cfg = Arc::new(HostConfig { audio_enabled: false, ..Default::default() });
         let sess = tokio::spawn(run_session_with_hooks(host_ch, cfg, stub_backends(), stop_rx, hooks));
@@ -425,6 +428,7 @@ async fn system_power_request_denied_by_default_and_executed_when_allowed() {
             on_event: None,
             chat_tx: None,
             power_executor: Some(sim.clone()),
+            ..Default::default()
         };
         let sess = tokio::spawn(run_session_with_hooks(host_ch, cfg, stub_backends(), stop_rx, hooks));
 

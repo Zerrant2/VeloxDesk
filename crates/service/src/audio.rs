@@ -11,13 +11,14 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use veloxdesk_audio::pcm::{LinearResampler, remix_channels};
 use veloxdesk_audio::{
-    AcousticEchoCanceller, AecConfig, AecReferenceFeed, AudioJitterBuffer, JitterConfig, JitterPop, OpusDecoder,
+    AcousticEchoCanceller, AecConfig, AecReferenceFeed, AudioJitterBuffer, DenoiseConfig, JitterConfig, JitterPop,
+    NoiseSuppressor, OpusDecoder,
 };
 use veloxdesk_core_traits::audio::{
     AudioCaptureConfig, AudioCodecId, AudioDecoder, AudioEncoderConfig, AudioFormat, AudioFrame, EncodedAudio,
 };
 use veloxdesk_core_traits::{CoreError, Result, TransportChannel};
-use veloxdesk_protocol::control::AudioConfig;
+use veloxdesk_protocol::control::{AudioConfig, SessionMode};
 use veloxdesk_transport::AudioSender;
 
 use crate::backends::HostBackends;
@@ -58,6 +59,18 @@ impl AudioPipeline {
         channel: Arc<dyn TransportChannel>,
         aec_ref: Option<AecReferenceFeed>,
     ) -> Result<(Self, AudioConfig)> {
+        Self::start_with_live_aec(params, backends, channel, aec_ref, None)
+    }
+
+    /// Like [`Self::start_with_aec`], plus an optional live `echo_cancel_flag` updated by
+    /// [`crate::RunningHost::set_echo_cancellation`] so AEC can be toggled on the fly.
+    pub fn start_with_live_aec(
+        params: AudioParams,
+        backends: &HostBackends,
+        channel: Arc<dyn TransportChannel>,
+        aec_ref: Option<AecReferenceFeed>,
+        echo_cancel_flag: Option<Arc<AtomicBool>>,
+    ) -> Result<(Self, AudioConfig)> {
         let cap_factory = backends
             .audio_capture
             .as_ref()
@@ -67,9 +80,12 @@ impl AudioPipeline {
             .as_ref()
             .ok_or_else(|| CoreError::unsupported("audio encoder backend not configured"))?;
 
+        let initial_aec = echo_cancel_flag
+            .as_ref()
+            .map_or(params.echo_cancellation, |f| f.load(Ordering::Relaxed));
         let frame_duration = Duration::from_micros(params.frame_duration_us as u64);
         let mut capture = if Arc::ptr_eq(cap_factory, &crate::host::system_audio_capture_factory()) {
-            veloxdesk_audio::create_loopback_capture_with_options(params.echo_cancellation)?
+            veloxdesk_audio::create_loopback_capture_with_options(initial_aec)?
         } else {
             cap_factory()?
         };
@@ -102,7 +118,7 @@ impl AudioPipeline {
         let stop_bg = stop.clone();
         let red_bg = redundant.clone();
         let mut sender = AudioSender::new(channel, params.stream_id);
-        let use_aec = params.echo_cancellation && aec_ref.is_some();
+        let aec_flag = echo_cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(params.echo_cancellation)));
 
         let thread = std::thread::Builder::new()
             .name("vdk-audio-tx".into())
@@ -110,7 +126,7 @@ impl AudioPipeline {
                 let mut resampler = (cap_fmt.sample_rate != enc_fmt.sample_rate).then(|| {
                     LinearResampler::new(cap_fmt.sample_rate, enc_fmt.sample_rate, enc_fmt.channels as usize)
                 });
-                let mut aec = use_aec.then(|| {
+                let mut aec = aec_ref.is_some().then(|| {
                     AcousticEchoCanceller::new(AecConfig {
                         sample_rate: enc_fmt.sample_rate,
                         channels: enc_fmt.channels,
@@ -142,17 +158,24 @@ impl AudioPipeline {
                                 frame.format.sample_rate = enc_fmt.sample_rate;
                             }
                             if let (Some(aec), Some(feed)) = (aec.as_mut(), aec_ref.as_ref()) {
-                                if enc_fmt.channels == 2 {
-                                    aec.process_capture_with_feed(&mut frame.samples, feed);
-                                } else {
-                                    // MicPlayback feeds stereo 48 kHz reference samples; downmix to mono.
-                                    aec_ref_scratch.clear();
-                                    feed.drain_into(&mut aec_ref_scratch, frame.samples.len() * 2);
-                                    if !aec_ref_scratch.is_empty() {
-                                        remix_channels(&aec_ref_scratch, 2, 1, &mut scratch);
-                                        aec.push_reference(&scratch);
+                                if aec_flag.load(Ordering::Relaxed) {
+                                    if enc_fmt.channels == 2 {
+                                        aec.process_capture_with_feed(&mut frame.samples, feed);
+                                    } else {
+                                        // MicPlayback feeds stereo 48 kHz reference samples; downmix to mono.
+                                        aec_ref_scratch.clear();
+                                        feed.drain_into(&mut aec_ref_scratch, frame.samples.len() * 2);
+                                        if !aec_ref_scratch.is_empty() {
+                                            remix_channels(&aec_ref_scratch, 2, 1, &mut scratch);
+                                            aec.push_reference(&scratch);
+                                        }
+                                        aec.process_capture(&mut frame.samples);
                                     }
-                                    aec.process_capture(&mut frame.samples);
+                                } else {
+                                    // Keep reference ring drained while AEC is bypassed so re-enabling starts fresh.
+                                    aec_ref_scratch.clear();
+                                    let drain_n = frame.samples.len() * if enc_fmt.channels == 2 { 1 } else { 2 };
+                                    feed.drain_into(&mut aec_ref_scratch, drain_n);
                                 }
                             }
                             match encoder.encode(&frame) {
@@ -233,6 +256,17 @@ impl MicPlayback {
         backends: &HostBackends,
         aec_ref: Option<AecReferenceFeed>,
     ) -> Result<Self> {
+        Self::start_with_options(frame_duration_us, backends, aec_ref, false)
+    }
+
+    /// Start viewer-microphone playback with optional [`AecReferenceFeed`] and pure-Rust
+    /// [`NoiseSuppressor`] denoising on incoming microphone audio (v0.6.0).
+    pub fn start_with_options(
+        frame_duration_us: u32,
+        backends: &HostBackends,
+        aec_ref: Option<AecReferenceFeed>,
+        mic_noise_suppression: bool,
+    ) -> Result<Self> {
         let pb_factory = backends
             .audio_playback
             .as_ref()
@@ -253,6 +287,13 @@ impl MicPlayback {
                     frame_duration,
                     target_delay: frame_duration * 2,
                     max_delay: frame_duration * 8,
+                });
+                let mut denoiser = mic_noise_suppression.then(|| {
+                    NoiseSuppressor::new(DenoiseConfig {
+                        sample_rate: fmt.sample_rate,
+                        channels: fmt.channels,
+                        ..DenoiseConfig::default()
+                    })
                 });
                 let tick = frame_duration.max(Duration::from_millis(2));
                 while !stop_bg.load(Ordering::Relaxed) {
@@ -280,7 +321,10 @@ impl MicPlayback {
                         JitterPop::Missing { .. } => decoder.decode(None).ok(),
                         JitterPop::Buffering => None,
                     };
-                    if let Some(pcm) = frame {
+                    if let Some(mut pcm) = frame {
+                        if let Some(ns) = denoiser.as_mut() {
+                            ns.process(&mut pcm.samples);
+                        }
                         if let Some(feed) = &aec_ref {
                             feed.push(&pcm.samples);
                         }
@@ -329,6 +373,34 @@ pub fn frame_ms_to_us(ms: f32) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// Resolve an effective valid Opus frame duration (µs) from a requested value and [`SessionMode`].
+///
+/// `0` selects mode-dependent Auto (`5_000 µs` for Gaming, `10_000 µs` for Desktop);
+/// non-zero values are clamped/snapped to the nearest valid Opus frame duration
+/// (`2_500`, `5_000`, `10_000`, `20_000 µs`).
+pub fn normalize_opus_frame_us(requested_us: u32, mode: SessionMode) -> u32 {
+    match requested_us {
+        0 => match mode {
+            SessionMode::Gaming => 5_000,
+            SessionMode::Desktop => 10_000,
+        },
+        u if u <= 3_750 => 2_500,
+        u if u <= 7_500 => 5_000,
+        u if u <= 15_000 => 10_000,
+        _ => 20_000,
+    }
+}
+
+/// Negotiate initial Opus frame duration (µs) from host config (`audio_frame_ms`, `explicit`) and [`SessionMode`].
+pub fn negotiate_audio_frame_us(audio_frame_ms: f32, explicit: bool, mode: SessionMode) -> u32 {
+    if explicit
+        && let Some(us) = frame_ms_to_us(audio_frame_ms)
+    {
+        return us;
+    }
+    normalize_opus_frame_us(0, mode)
 }
 
 #[cfg(test)]
