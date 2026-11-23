@@ -1,5 +1,8 @@
 //! M4 Remote Terminal window (ConPTY / POSIX PTY monospace scrollback, input & resize).
 
+use crate::i18n::tr;
+use crate::settings::Language;
+
 /// Maximum retained scrollback buffer in bytes.
 const MAX_SCROLLBACK_BYTES: usize = 64 * 1024;
 
@@ -97,24 +100,29 @@ impl TerminalWindow {
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Vec<TerminalAction> {
+        self.show_for(ctx, Language::En)
+    }
+
+    pub fn show_for(&mut self, ctx: &egui::Context, lang: Language) -> Vec<TerminalAction> {
+        let t = tr(lang);
         let mut actions = Vec::new();
         let mut open = self.open;
-        egui::Window::new("Remote Terminal")
+        egui::Window::new(t.terminal_title)
             .id(egui::Id::unique("veloxdesk-terminal"))
             .open(&mut open)
-            .default_size(egui::vec2(680.0, 420.0))
+            .default_size(egui::vec2(720.0, 430.0))
             .resizable(true)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Shell:");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(t.terminal_shell_label);
                     ui.add_enabled(
                         !self.connected,
                         egui::TextEdit::singleline(&mut self.shell)
-                            .hint_text("default")
+                            .hint_text(t.terminal_shell_hint)
                             .desired_width(120.0),
                     );
                     if !self.connected {
-                        if ui.button("Open").clicked() {
+                        if ui.button(t.terminal_open_btn).clicked() {
                             self.exit_code = None;
                             self.error = None;
                             actions.push(TerminalAction::Open {
@@ -123,21 +131,22 @@ impl TerminalWindow {
                                 shell: self.shell.trim().to_string(),
                             });
                         }
-                    } else if ui.button("Close").clicked() {
+                    } else if ui.button(t.terminal_close_btn).clicked() {
                         actions.push(TerminalAction::Close);
                     }
                     ui.separator();
-                    ui.label("Size:");
+                    ui.label(t.terminal_size_label);
                     let c_resp = ui.add(egui::DragValue::new(&mut self.cols).range(20..=300));
                     ui.label("×");
                     let r_resp = ui.add(egui::DragValue::new(&mut self.rows).range(5..=120));
-                    if self.connected && (c_resp.changed() || r_resp.changed() || ui.button("Resize").clicked()) {
+                    if self.connected && (c_resp.changed() || r_resp.changed() || ui.button(t.terminal_resize_btn).clicked())
+                    {
                         actions.push(TerminalAction::Resize { cols: self.cols, rows: self.rows });
                     }
                     if self.connected && ui.button("Ctrl+C").clicked() {
                         actions.push(TerminalAction::SendInput(vec![0x03]));
                     }
-                    if ui.button("Clear").clicked() {
+                    if ui.button(t.terminal_clear_btn).clicked() {
                         self.output.clear();
                     }
                 });
@@ -170,11 +179,11 @@ impl TerminalWindow {
                         self.connected,
                         egui::TextEdit::singleline(&mut self.input_line)
                             .font(egui::FontId::monospace(12.5))
-                            .hint_text("Type command and press Enter")
-                            .desired_width(ui.available_width() - 68.0),
+                            .hint_text(t.terminal_input_hint)
+                            .desired_width((ui.available_width() - 96.0).max(120.0)),
                     );
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if self.connected && (ui.button("Send").clicked() || enter) {
+                    if self.connected && (ui.button(t.terminal_send_btn).clicked() || enter) {
                         let mut bytes = self.input_line.as_bytes().to_vec();
                         bytes.extend_from_slice(b"\r\n");
                         self.input_line.clear();
@@ -183,7 +192,7 @@ impl TerminalWindow {
                 });
 
                 if let Some(code) = self.exit_code {
-                    ui.weak(format!("Process exited with code {code}"));
+                    ui.weak(t.terminal_exit_code(code));
                 }
                 if let Some(err) = &self.error {
                     ui.colored_label(egui::Color32::from_rgb(255, 110, 110), err);

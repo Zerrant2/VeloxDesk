@@ -3,6 +3,8 @@
 use veloxdesk_protocol::control::Permissions;
 
 use crate::connect::format_device_id;
+use crate::i18n::tr;
+use crate::settings::Language;
 
 /// Short human-readable fingerprint (e.g. `abcd1234…ef567890`) for out-of-band verification.
 pub fn format_fingerprint(hex: &str) -> String {
@@ -38,10 +40,16 @@ impl PasswordPrompt {
         }
     }
 
-    /// Draw the modal. Returns `Some(PasswordAction)` once the user submits or cancels.
+    /// Draw the modal in English. Returns `Some(PasswordAction)` once the user submits or cancels.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<PasswordAction> {
+        self.show_for(ctx, Language::En)
+    }
+
+    /// Draw the modal in `lang`. Returns `Some(PasswordAction)` once the user submits or cancels.
+    pub fn show_for(&mut self, ctx: &egui::Context, lang: Language) -> Option<PasswordAction> {
+        let t = tr(lang);
         let mut action = None;
-        egui::Window::new("Authentication Required")
+        egui::Window::new(t.auth_required_title)
             .id(egui::Id::unique("veloxdesk-password-prompt"))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
@@ -49,10 +57,10 @@ impl PasswordPrompt {
             .show(ctx, |ui| {
                 ui.set_min_width(340.0);
                 if !self.host_device_id.is_empty() {
-                    ui.label(format!("Host ID: {}", format_device_id(&self.host_device_id)));
+                    ui.label(t.host_id_line(&format_device_id(&self.host_device_id)));
                 }
                 if !self.host_fingerprint.is_empty() {
-                    ui.weak(format!("Key fingerprint: {}", format_fingerprint(&self.host_fingerprint)));
+                    ui.weak(t.key_fingerprint_line(&format_fingerprint(&self.host_fingerprint)));
                 }
                 if !self.methods_hint.is_empty() {
                     ui.add_space(4.0);
@@ -63,13 +71,13 @@ impl PasswordPrompt {
                 ui.horizontal(|ui| {
                     let edit = egui::TextEdit::singleline(&mut self.password)
                         .password(!self.show_password)
-                        .hint_text("Enter password")
+                        .hint_text(t.enter_password_hint)
                         .desired_width(240.0);
                     let resp = ui.add(edit);
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         enter = true;
                     }
-                    if ui.button(if self.show_password { "Hide" } else { "Show" }).clicked() {
+                    if ui.button(if self.show_password { t.hide_btn } else { t.show_btn }).clicked() {
                         self.show_password = !self.show_password;
                     }
                 });
@@ -80,10 +88,10 @@ impl PasswordPrompt {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let can_submit = !self.password.is_empty();
-                    if ui.add_enabled(can_submit, egui::Button::new("Connect")).clicked() || (enter && can_submit) {
+                    if ui.add_enabled(can_submit, egui::Button::new(t.connect_btn)).clicked() || (enter && can_submit) {
                         action = Some(PasswordAction::Submit(self.password.clone()));
                     }
-                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if ui.button(t.cancel_btn).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         action = Some(PasswordAction::Cancel);
                     }
                 });
@@ -128,10 +136,16 @@ impl AcceptPrompt {
         Self { peer, permissions: default_permissions, trust_peer: false }
     }
 
-    /// Draw the approval dialog. Returns `Some(AcceptDecision)` once Accept or Reject is clicked.
+    /// Draw the approval dialog in English. Returns `Some(AcceptDecision)` once Accept or Reject is clicked.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<AcceptDecision> {
+        self.show_for(ctx, Language::En)
+    }
+
+    /// Draw the approval dialog in `lang`. Returns `Some(AcceptDecision)` once Accept or Reject is clicked.
+    pub fn show_for(&mut self, ctx: &egui::Context, lang: Language) -> Option<AcceptDecision> {
+        let t = tr(lang);
         let mut decision = None;
-        egui::Window::new("Incoming Connection")
+        egui::Window::new(t.incoming_connection_title)
             .id(egui::Id::unique("veloxdesk-accept-prompt"))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
@@ -139,37 +153,37 @@ impl AcceptPrompt {
             .show(ctx, |ui| {
                 ui.set_min_width(360.0);
                 let caller = if self.peer.peer_name.is_empty() {
-                    "Unknown device"
+                    t.unknown_device
                 } else {
                     self.peer.peer_name.as_str()
                 };
                 ui.label(egui::RichText::new(caller).strong().size(16.0));
-                ui.label(format!("Device ID: {}", format_device_id(&self.peer.peer_device_id)));
-                ui.weak(format!("Ed25519 fingerprint: {}", format_fingerprint(&self.peer.peer_fingerprint)));
+                ui.label(t.device_id_line(&format_device_id(&self.peer.peer_device_id)));
+                ui.weak(t.ed25519_fingerprint_line(&format_fingerprint(&self.peer.peer_fingerprint)));
                 ui.separator();
-                ui.label(egui::RichText::new("Granted permissions").strong());
+                ui.label(egui::RichText::new(t.granted_permissions_heading).strong());
                 egui::Grid::new("veloxdesk-accept-perms").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
-                    ui.checkbox(&mut self.permissions.view, "View screen");
-                    ui.checkbox(&mut self.permissions.input, "Keyboard & mouse");
+                    ui.checkbox(&mut self.permissions.view, t.perm_view);
+                    ui.checkbox(&mut self.permissions.input, t.perm_input);
                     ui.end_row();
-                    ui.checkbox(&mut self.permissions.clipboard, "Clipboard");
-                    ui.checkbox(&mut self.permissions.file_transfer, "File transfer");
+                    ui.checkbox(&mut self.permissions.clipboard, t.perm_clipboard);
+                    ui.checkbox(&mut self.permissions.file_transfer, t.perm_file_transfer);
                     ui.end_row();
-                    ui.checkbox(&mut self.permissions.audio, "Audio");
-                    ui.checkbox(&mut self.permissions.tunnel, "TCP tunnels");
+                    ui.checkbox(&mut self.permissions.audio, t.perm_audio);
+                    ui.checkbox(&mut self.permissions.tunnel, t.perm_tunnel);
                     ui.end_row();
-                    ui.checkbox(&mut self.permissions.terminal, "Terminal");
-                    ui.checkbox(&mut self.permissions.privacy_mode, "Privacy mode");
+                    ui.checkbox(&mut self.permissions.terminal, t.perm_terminal);
+                    ui.checkbox(&mut self.permissions.privacy_mode, t.perm_privacy_mode);
                     ui.end_row();
-                    ui.checkbox(&mut self.permissions.restart, "Restart host");
+                    ui.checkbox(&mut self.permissions.restart, t.perm_restart);
                     ui.end_row();
                 });
                 ui.separator();
-                ui.checkbox(&mut self.trust_peer, "Trust this device (allow passwordless reconnect)");
+                ui.checkbox(&mut self.trust_peer, t.trust_device_checkbox);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let accept_btn = egui::Button::new(
-                        egui::RichText::new("Accept").color(egui::Color32::from_rgb(130, 235, 150)),
+                        egui::RichText::new(t.accept_btn).color(egui::Color32::from_rgb(130, 235, 150)),
                     );
                     if ui.add(accept_btn).clicked() {
                         decision = Some(AcceptDecision {
@@ -179,7 +193,7 @@ impl AcceptPrompt {
                         });
                     }
                     let reject_btn = egui::Button::new(
-                        egui::RichText::new("Reject").color(egui::Color32::from_rgb(255, 120, 120)),
+                        egui::RichText::new(t.reject_btn).color(egui::Color32::from_rgb(255, 120, 120)),
                     );
                     if ui.add(reject_btn).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         decision = Some(AcceptDecision {

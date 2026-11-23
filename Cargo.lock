@@ -310,6 +310,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1511,6 +1517,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "http"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
+dependencies = [
+ "bytes",
+ "itoa",
+]
+
+[[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
 name = "icu_collections"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2585,7 +2607,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -4062,6 +4084,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ac5cecf619ca81f66a96482db09687c9f7465af65f4300a8c30cca05bd5a59d"
+dependencies = [
+ "base64 0.23.1",
+ "flate2",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622dce33c252115466d83f63e9744a18f12b4406aae51a01c15ad8fcf1185eb3"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4072,6 +4123,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
@@ -4140,7 +4197,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4149,10 +4206,13 @@ dependencies = [
  "egui",
  "parking_lot",
  "prost",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "veloxdesk-audio",
  "veloxdesk-clipboard",
  "veloxdesk-codec",
@@ -4173,7 +4233,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "rusty-opus",
@@ -4185,7 +4245,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-benches"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4206,7 +4266,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ashpd",
  "bytes",
@@ -4221,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-clipboard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arboard",
  "bytes",
@@ -4237,7 +4297,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-codec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "openh264",
@@ -4252,7 +4312,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-core-traits"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4263,7 +4323,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "ed25519-dalek",
@@ -4282,7 +4342,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-file-transfer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "prost",
@@ -4297,7 +4357,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "tracing",
@@ -4308,7 +4368,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "prost",
@@ -4317,7 +4377,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "egui",
@@ -4335,7 +4395,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4350,7 +4410,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-server-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "socket2",
  "tokio",
@@ -4361,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-server-rendezvous"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "rand_core 0.6.4",
@@ -4375,7 +4435,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4406,7 +4466,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-terminal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4421,11 +4481,13 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "egui",
  "prost",
+ "serde_json",
  "tokio",
  "veloxdesk-audio",
  "veloxdesk-benches",
@@ -4442,13 +4504,14 @@ dependencies = [
  "veloxdesk-terminal",
  "veloxdesk-transport",
  "veloxdesk-tunnel",
+ "veloxdesk-ui",
  "veloxdesk-virtual-display",
  "windows",
 ]
 
 [[package]]
 name = "veloxdesk-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4471,7 +4534,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-tunnel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "prost",
@@ -4485,7 +4548,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "serde",
@@ -4497,7 +4560,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-virtual-display"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tracing",
  "veloxdesk-core-traits",
@@ -4766,6 +4829,15 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "url",
  "web-sys",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

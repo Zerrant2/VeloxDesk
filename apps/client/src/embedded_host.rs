@@ -50,8 +50,10 @@ impl EmbeddedHostHandle {
         _rendezvous: Option<SocketAddr>,
         _require_accept: bool,
         _proxy: veloxdesk_render::winit::event_loop::EventLoopProxy<crate::app::UserEvent>,
+        lang: std::sync::Arc<std::sync::atomic::AtomicU8>,
     ) -> anyhow::Result<Self> {
-        anyhow::bail!("embedded host requires the `net` feature")
+        let l = veloxdesk_ui::Language::from_u8(lang.load(std::sync::atomic::Ordering::Relaxed));
+        anyhow::bail!("{}", veloxdesk_ui::i18n::tr(l).err_embedded_host_requires_net)
     }
 
     pub fn rotate_otp(&self) {}
@@ -65,7 +67,7 @@ impl EmbeddedHostHandle {
 mod net {
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::thread::JoinHandle;
 
     use tokio::sync::{mpsc, oneshot};
@@ -74,10 +76,14 @@ mod net {
         ApprovalDecision, ApprovalHandler, ApprovalRequest, HostAuthConfig, HostBackends, HostConfig, HostStatusEvent,
         RunningHost,
     };
-    use veloxdesk_ui::{AcceptDecision, IncomingSessionInfo};
+    use veloxdesk_ui::{AcceptDecision, IncomingSessionInfo, Language, i18n::tr};
 
     use super::EmbeddedHostEvent;
     use crate::app::UserEvent;
+
+    fn current_lang(flag: &AtomicU8) -> Language {
+        Language::from_u8(flag.load(Ordering::Relaxed))
+    }
 
     enum HostCmd {
         RotateOtp,
@@ -97,15 +103,18 @@ mod net {
             rendezvous: Option<SocketAddr>,
             require_accept: bool,
             proxy: EventLoopProxy<UserEvent>,
+            lang: Arc<AtomicU8>,
         ) -> anyhow::Result<Self> {
             let id = crate::viewer::load_identity(None)?;
             let require_flag = Arc::new(AtomicBool::new(require_accept));
             let require_cb = require_flag.clone();
             let proxy_cb = proxy.clone();
+            let lang_cb = lang.clone();
 
             let approval_handler: ApprovalHandler = Arc::new(move |req: ApprovalRequest| {
                 let require_now = require_cb.load(Ordering::Relaxed);
                 let proxy = proxy_cb.clone();
+                let lang = lang_cb.clone();
                 Box::pin(async move {
                     if !require_now {
                         return ApprovalDecision::accept(req.default_permissions);
@@ -125,7 +134,7 @@ mod net {
                         }))
                         .is_err()
                     {
-                        return ApprovalDecision::reject("host UI unavailable");
+                        return ApprovalDecision::reject(tr(current_lang(&lang)).host_reject_ui_unavailable);
                     }
                     match rx.await {
                         Ok(dec) if dec.accepted => {
@@ -135,8 +144,8 @@ mod net {
                                 ApprovalDecision::accept(dec.permissions)
                             }
                         }
-                        Ok(_) => ApprovalDecision::reject("rejected by host user"),
-                        Err(_) => ApprovalDecision::reject("approval prompt closed"),
+                        Ok(_) => ApprovalDecision::reject(tr(current_lang(&lang)).host_reject_by_user),
+                        Err(_) => ApprovalDecision::reject(tr(current_lang(&lang)).host_reject_prompt_closed),
                     }
                 })
             });
@@ -156,7 +165,7 @@ mod net {
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             let thread = std::thread::Builder::new()
                 .name("veloxdesk-host".into())
-                .spawn(move || run_host_thread(cfg, id, cmd_rx, proxy))?;
+                .spawn(move || run_host_thread(cfg, id, cmd_rx, proxy, lang))?;
 
             Ok(Self { cmd_tx, require_accept: require_flag, thread: Some(thread) })
         }
@@ -189,6 +198,7 @@ mod net {
         id: veloxdesk_crypto::DeviceIdentity,
         mut cmd_rx: mpsc::UnboundedReceiver<HostCmd>,
         proxy: EventLoopProxy<UserEvent>,
+        lang: Arc<AtomicU8>,
     ) {
         let rt = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -198,9 +208,9 @@ mod net {
         {
             Ok(rt) => rt,
             Err(e) => {
-                let _ = proxy.send_event(UserEvent::Host(EmbeddedHostEvent::Error(format!(
-                    "cannot start host runtime: {e}"
-                ))));
+                let _ = proxy.send_event(UserEvent::Host(EmbeddedHostEvent::Error(
+                    tr(current_lang(&lang)).fmt_err_host_runtime(&e.to_string()),
+                )));
                 return;
             }
         };
@@ -227,9 +237,9 @@ mod net {
             let running = match RunningHost::start(cfg, id, HostBackends::system(), Some(on_event)).await {
                 Ok(h) => h,
                 Err(e) => {
-                    let _ = proxy.send_event(UserEvent::Host(EmbeddedHostEvent::Error(format!(
-                        "failed to start local host: {e}"
-                    ))));
+                    let _ = proxy.send_event(UserEvent::Host(EmbeddedHostEvent::Error(
+                        tr(current_lang(&lang)).fmt_err_host_start(&e.to_string()),
+                    )));
                     return;
                 }
             };
@@ -237,8 +247,8 @@ mod net {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     HostCmd::RotateOtp => {
-                        let otp = running.auth_state().rotate_otp();
-                        let _ = proxy.send_event(UserEvent::Host(EmbeddedHostEvent::OtpRotated { otp }));
+                        // `HostAuthState::rotate_otp` already invokes the `on_event` hook with `OtpRotated`.
+                        let _ = running.auth_state().rotate_otp();
                     }
                     HostCmd::SetRequireAccept(req) => {
                         running.auth_state().set_require_accept(req);

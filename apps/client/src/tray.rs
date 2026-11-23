@@ -20,6 +20,7 @@ impl TrayHandle {
     pub fn spawn(
         _tooltip: String,
         _proxy: veloxdesk_render::winit::event_loop::EventLoopProxy<crate::app::UserEvent>,
+        _lang: std::sync::Arc<std::sync::atomic::AtomicU8>,
     ) -> Option<Self> {
         Some(Self)
     }
@@ -28,10 +29,12 @@ impl TrayHandle {
 #[cfg(windows)]
 mod win {
     use std::ptr::{null, null_mut};
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::thread::{self, JoinHandle};
 
     use veloxdesk_render::winit::event_loop::EventLoopProxy;
+    use veloxdesk_ui::{Language, tr};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{
@@ -57,6 +60,7 @@ mod win {
 
     struct TrayState {
         proxy: EventLoopProxy<UserEvent>,
+        lang: Arc<AtomicU8>,
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -69,17 +73,18 @@ mod win {
         }
     }
 
-    fn show_context_menu(hwnd: HWND, proxy: &EventLoopProxy<UserEvent>) {
+    fn show_context_menu(hwnd: HWND, proxy: &EventLoopProxy<UserEvent>, lang: Language) {
+        let t = tr(lang);
         // SAFETY: standard Win32 popup menu lifecycle on our thread-owned hidden tray HWND.
         unsafe {
             let hmenu = CreatePopupMenu();
             if hmenu.is_null() {
                 return;
             }
-            let lbl_show = to_wide("Show Window");
-            let lbl_copy = to_wide("Copy Device ID");
-            let lbl_otp = to_wide("Rotate OTP");
-            let lbl_quit = to_wide("Quit");
+            let lbl_show = to_wide(t.tray_show_window);
+            let lbl_copy = to_wide(t.tray_copy_id);
+            let lbl_otp = to_wide(t.tray_rotate_otp);
+            let lbl_quit = to_wide(t.tray_quit);
             AppendMenuW(hmenu, MF_STRING, ID_SHOW, lbl_show.as_ptr());
             AppendMenuW(hmenu, MF_STRING, ID_COPY_ID, lbl_copy.as_ptr());
             AppendMenuW(hmenu, MF_STRING, ID_ROTATE_OTP, lbl_otp.as_ptr());
@@ -129,7 +134,8 @@ mod win {
                                 let _ = state.proxy.send_event(UserEvent::Tray(TrayAction::ShowWindow));
                             }
                             WM_RBUTTONUP | WM_CONTEXTMENU => {
-                                show_context_menu(hwnd, &state.proxy);
+                                let lang = Language::from_u8(state.lang.load(Ordering::Relaxed));
+                                show_context_menu(hwnd, &state.proxy, lang);
                             }
                             _ => {}
                         }
@@ -162,11 +168,11 @@ mod win {
     }
 
     impl TrayHandle {
-        pub fn spawn(tooltip: String, proxy: EventLoopProxy<UserEvent>) -> Option<Self> {
+        pub fn spawn(tooltip: String, proxy: EventLoopProxy<UserEvent>, lang: Arc<AtomicU8>) -> Option<Self> {
             let (tx, rx) = mpsc::channel::<Option<isize>>();
             let thread = thread::Builder::new()
                 .name("veloxdesk-tray".into())
-                .spawn(move || run_tray_thread(tooltip, proxy, tx))
+                .spawn(move || run_tray_thread(tooltip, proxy, lang, tx))
                 .ok()?;
             match rx.recv() {
                 Ok(Some(hwnd)) => Some(Self { hwnd, thread: Some(thread) }),
@@ -193,7 +199,12 @@ mod win {
         }
     }
 
-    fn run_tray_thread(tooltip: String, proxy: EventLoopProxy<UserEvent>, ready: mpsc::Sender<Option<isize>>) {
+    fn run_tray_thread(
+        tooltip: String,
+        proxy: EventLoopProxy<UserEvent>,
+        lang: Arc<AtomicU8>,
+        ready: mpsc::Sender<Option<isize>>,
+    ) {
         // SAFETY: thread-local hidden Win32 window + `Shell_NotifyIconW(NIM_ADD)` + message pump.
         unsafe {
             let hinst = GetModuleHandleW(null());
@@ -229,7 +240,7 @@ mod win {
                 return;
             }
 
-            let state_ptr = Box::into_raw(Box::new(TrayState { proxy }));
+            let state_ptr = Box::into_raw(Box::new(TrayState { proxy, lang }));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
 
             let mut nid: NOTIFYICONDATAW = std::mem::zeroed();

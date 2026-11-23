@@ -14,10 +14,10 @@ pub fn device_id_label() -> String {
 
 #[cfg(not(feature = "net"))]
 pub fn connect(
-    _opts: crate::session::ConnectOptions,
+    opts: crate::session::ConnectOptions,
     _proxy: veloxdesk_render::winit::event_loop::EventLoopProxy<crate::app::UserEvent>,
 ) -> anyhow::Result<crate::session::SessionHandle> {
-    anyhow::bail!("network support disabled at compile time (rebuild with `--features net`)")
+    anyhow::bail!("{}", veloxdesk_ui::tr(opts.lang()).err_net_feature_disabled)
 }
 
 #[cfg(feature = "net")]
@@ -56,8 +56,8 @@ mod net {
     };
     use veloxdesk_tunnel::LocalForwarder;
     use veloxdesk_ui::{
-        ActiveTunnel, ConnectTarget, FileAction, TerminalAction, TransferProgress, TunnelAction, TunnelSpec,
-        format_device_id,
+        ActiveTunnel, ConnectTarget, FileAction, Language, TerminalAction, TransferProgress, TunnelAction, TunnelSpec,
+        format_device_id, tr,
     };
 
     use crate::app::UserEvent;
@@ -128,9 +128,9 @@ mod net {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::Closed(format!(
-                            "cannot start async runtime: {e}"
-                        ))));
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::Closed(
+                            tr(opts.lang()).fmt_err_async_runtime(&e.to_string()),
+                        )));
                         return;
                     }
                 };
@@ -678,16 +678,16 @@ mod net {
     ) -> Option<String> {
         let id = match load_identity(None) {
             Ok(id) => id,
-            Err(e) => return Some(format!("identity error: {e:#}")),
+            Err(e) => return Some(tr(opts.lang()).fmt_err_identity(&format!("{e:#}"))),
         };
 
         let target_label = match &opts.target {
             ConnectTarget::Direct(addr) => addr.to_string(),
             ConnectTarget::DeviceId(target_id) => format_device_id(target_id),
         };
-        let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status(format!(
-            "Connecting to {target_label}…"
-        ))));
+        let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status(
+            tr(opts.lang()).fmt_connecting_to(&target_label),
+        )));
 
         // 1. QUIC connect (direct IP or P2P/relay by 9-digit Device ID; cancellable).
         let ch = match &opts.target {
@@ -695,8 +695,8 @@ mod net {
                 res = timeout(CONNECT_TIMEOUT, veloxdesk_transport::connect(*addr, &id, None)) => {
                     match res {
                         Ok(Ok(ch)) => Arc::new(ch),
-                        Ok(Err(e)) => return Some(format!("connect failed: {e}")),
-                        Err(_) => return Some(format!("timed out connecting to {addr}")),
+                        Ok(Err(e)) => return Some(tr(opts.lang()).fmt_err_connect_failed(&e.to_string())),
+                        Err(_) => return Some(tr(opts.lang()).fmt_err_connect_timeout(&addr.to_string())),
                     }
                 }
                 () = recv_disconnect(&mut cmd_rx) => {
@@ -705,7 +705,7 @@ mod net {
             },
             ConnectTarget::DeviceId(target_id) => {
                 let Some(rendezvous) = opts.rendezvous else {
-                    return Some("no rendezvous server configured".into());
+                    return Some(tr(opts.lang()).err_no_rendezvous_configured.into());
                 };
                 let mut p2p_opts = veloxdesk_transport::P2pConnectOptions::new(rendezvous, target_id.clone());
                 p2p_opts.relay_only = opts.relay_only;
@@ -713,8 +713,8 @@ mod net {
                     res = timeout(CONNECT_TIMEOUT, veloxdesk_transport::connect_p2p(p2p_opts, &id)) => {
                         match res {
                             Ok(Ok(ch)) => Arc::new(ch),
-                            Ok(Err(e)) => return Some(format!("P2P connect failed: {e}")),
-                            Err(_) => return Some(format!("timed out connecting to {target_label}")),
+                            Ok(Err(e)) => return Some(tr(opts.lang()).fmt_err_p2p_connect_failed(&e.to_string())),
+                            Err(_) => return Some(tr(opts.lang()).fmt_err_connect_timeout(&target_label)),
                         }
                     }
                     () = recv_disconnect(&mut cmd_rx) => {
@@ -733,21 +733,23 @@ mod net {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => {
                 ch.close(1, "control stream failed");
-                return Some(format!("open control stream failed: {e}"));
+                return Some(tr(opts.lang()).fmt_err_open_control_stream(&e.to_string()));
             }
             Err(_) => {
                 ch.close(1, "handshake timeout");
-                return Some("timed out opening control stream".into());
+                return Some(tr(opts.lang()).err_open_control_timeout.into());
             }
         };
         let (mut ctrl_tx, mut ctrl_rx) = framed(send, recv);
         let hello = build_hello(&id, &opts);
         if let Err(e) = ctrl_tx.send(&Msg::Hello(hello).into()).await {
             ch.close(1, "send hello failed");
-            return Some(format!("send Hello failed: {e}"));
+            return Some(tr(opts.lang()).fmt_err_send_hello(&e.to_string()));
         }
 
-        let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status("Waiting for host…".into())));
+        let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status(
+            tr(opts.lang()).waiting_for_host.into(),
+        )));
 
         // 3. Handshake: optional AuthChallenge -> AuthResponse -> AuthResult -> SessionConfig.
         let initial_cfg = match handshake(
@@ -757,6 +759,7 @@ mod net {
             &id,
             ch.peer_public_key(),
             opts.password.clone(),
+            opts.lang(),
             &proxy,
         )
         .await
@@ -837,7 +840,7 @@ mod net {
         let mut tunnels: HashMap<u64, LocalForwarder> = HashMap::new();
         let mut next_tunnel_id: u64 = 1;
         for spec in opts.initial_tunnels.clone() {
-            add_tunnel(spec, ch.clone(), &mut tunnels, &mut next_tunnel_id, &proxy).await;
+            add_tunnel(spec, ch.clone(), &mut tunnels, &mut next_tunnel_id, opts.lang(), &proxy).await;
         }
         let mut term_tx: Option<mpsc::UnboundedSender<TermCtrl>> = None;
 
@@ -1024,7 +1027,7 @@ mod net {
                             let _ = ctrl_out_tx.send(Msg::PrivacyMode(PrivacyMode { enable }).into());
                         }
                         Some(SessionCommand::File(action)) => {
-                            spawn_file_action(ft_client.clone(), action, proxy.clone());
+                            spawn_file_action(ft_client.clone(), action, opts.lang(), proxy.clone());
                         }
                         Some(SessionCommand::Terminal(action)) => match action {
                             TerminalAction::Open { cols, rows, shell } => {
@@ -1051,7 +1054,8 @@ mod net {
                         },
                         Some(SessionCommand::Tunnel(action)) => match action {
                             TunnelAction::Add(spec) => {
-                                add_tunnel(spec, ch.clone(), &mut tunnels, &mut next_tunnel_id, &proxy).await;
+                                add_tunnel(spec, ch.clone(), &mut tunnels, &mut next_tunnel_id, opts.lang(), &proxy)
+                                    .await;
                             }
                             TunnelAction::Remove(id) => {
                                 if let Some(fwd) = tunnels.remove(&id) {
@@ -1149,14 +1153,17 @@ mod net {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn respond_to_challenge(
         challenge: &AuthChallenge,
         id: &DeviceIdentity,
         tls_peer_pk: Option<[u8; 32]>,
         cli_password: &mut Option<String>,
         cmd_rx: &mut mpsc::UnboundedReceiver<SessionCommand>,
+        lang: Language,
         proxy: &EventLoopProxy<UserEvent>,
     ) -> anyhow::Result<Option<AuthResponse>> {
+        let t = tr(lang);
         let host_pk: [u8; 32] = if challenge.host_public_key.is_empty() {
             tls_peer_pk.unwrap_or([0u8; 32])
         } else {
@@ -1164,18 +1171,18 @@ mod net {
                 .host_public_key
                 .as_slice()
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("AuthChallenge host_public_key must be 32 bytes"))?
+                .map_err(|_| anyhow::anyhow!("{}", t.err_auth_pk_len))?
         };
         if let Some(tls_pk) = tls_peer_pk
             && !challenge.host_public_key.is_empty()
             && tls_pk != host_pk
         {
-            bail!("host public key in AuthChallenge does not match TLS certificate");
+            bail!("{}", t.err_auth_pk_mismatch);
         }
         if !challenge.host_device_id.is_empty() {
             let derived = veloxdesk_crypto::device_id_from_public_key(&host_pk);
             if derived != challenge.host_device_id {
-                bail!("host device_id does not match host public key");
+                bail!("{}", t.err_auth_device_id_mismatch);
             }
         }
 
@@ -1198,9 +1205,9 @@ mod net {
                 Some(pw) => pw,
                 None => {
                     let methods_hint = match (allow_perm, allow_otp) {
-                        (true, true) => "Enter permanent or one-time password".into(),
-                        (true, false) => "Enter permanent password".into(),
-                        (false, true) => "Enter one-time password".into(),
+                        (true, true) => t.auth_methods_both.into(),
+                        (true, false) => t.auth_methods_perm.into(),
+                        (false, true) => t.auth_methods_otp.into(),
                         (false, false) => unreachable!(),
                     };
                     let host_id = if challenge.host_device_id.is_empty() {
@@ -1221,7 +1228,7 @@ mod net {
                 }
             };
 
-            let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status("Authenticating…".into())));
+            let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status(t.authenticating.into())));
             let method = if allow_perm && !challenge.salt.is_empty() {
                 AuthMethod::PermanentPassword
             } else if allow_otp {
@@ -1243,11 +1250,11 @@ mod net {
             let nonce = challenge.nonce.clone();
             let proof = tokio::task::spawn_blocking(move || -> anyhow::Result<[u8; 32]> {
                 let key = derive_password_key(&password, &salt, params)
-                    .map_err(|e| anyhow::anyhow!("password key derivation failed: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{}", tr(lang).fmt_err_kdf(&e.to_string())))?;
                 Ok(password_proof(&key, &nonce))
             })
             .await
-            .context("password derivation task panicked")??;
+            .context(t.err_kdf_panicked)??;
 
             return Ok(Some(AuthResponse { method: method as i32, proof: proof.to_vec() }));
         }
@@ -1255,14 +1262,15 @@ mod net {
         // 3. Interactive approval only (no password required).
         if has(AuthMethod::None) || challenge.methods.is_empty() {
             let _ = proxy.send_event(UserEvent::Session(SessionEvent::Status(
-                "Waiting for host to accept…".into(),
+                t.waiting_for_host_accept.into(),
             )));
             return Ok(Some(AuthResponse { method: AuthMethod::None as i32, proof: Vec::new() }));
         }
 
-        bail!("host offered no supported authentication methods ({:?})", challenge.methods);
+        bail!("{}", t.fmt_err_no_auth_methods(&challenge.methods));
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handshake(
         ctrl_tx: &mut ControlSender,
         ctrl_rx: &mut veloxdesk_transport::ControlReceiver,
@@ -1270,13 +1278,15 @@ mod net {
         id: &DeviceIdentity,
         tls_peer_pk: Option<[u8; 32]>,
         mut cli_password: Option<String>,
+        lang: Language,
         proxy: &EventLoopProxy<UserEvent>,
     ) -> anyhow::Result<HandshakeOutcome> {
+        let t = tr(lang);
         let mut step_timeout = HANDSHAKE_TIMEOUT;
         loop {
             let env = tokio::select! {
                 res = timeout(step_timeout, ctrl_rx.recv()) => {
-                    res.context("handshake timed out")?.context("reading handshake message")?
+                    res.context(t.err_handshake_timeout)?.context(t.err_reading_handshake)?
                 }
                 () = recv_disconnect(cmd_rx) => return Ok(HandshakeOutcome::Cancelled),
             };
@@ -1288,19 +1298,20 @@ mod net {
                         tls_peer_pk,
                         &mut cli_password,
                         cmd_rx,
+                        lang,
                         proxy,
                     )
                     .await?
                     else {
                         return Ok(HandshakeOutcome::Cancelled);
                     };
-                    ctrl_tx.send(&Msg::AuthResponse(resp).into()).await.context("sending AuthResponse")?;
+                    ctrl_tx.send(&Msg::AuthResponse(resp).into()).await.context(t.err_sending_auth_response)?;
                     // After responding, host may present an interactive Accept dialog.
                     step_timeout = APPROVAL_TIMEOUT;
                 }
                 Some(Msg::AuthResult(r)) => {
                     if !r.ok {
-                        let reason = if r.reason.is_empty() { "authentication rejected".into() } else { r.reason };
+                        let reason = if r.reason.is_empty() { t.err_auth_rejected.into() } else { r.reason };
                         bail!("{reason}");
                     }
                     tracing::info!(session_id = r.session_id, "authenticated with host");
@@ -1311,7 +1322,7 @@ mod net {
                 }
                 Some(Msg::Close(c)) => {
                     let reason = if c.reason.is_empty() {
-                        format!("host rejected session (code {})", c.code)
+                        t.fmt_host_rejected_code(c.code)
                     } else {
                         c.reason
                     };
@@ -1373,6 +1384,7 @@ mod net {
         ch: Arc<dyn TransportChannel>,
         tunnels: &mut HashMap<u64, LocalForwarder>,
         next_id: &mut u64,
+        lang: Language,
         proxy: &EventLoopProxy<UserEvent>,
     ) {
         let bind_addr = SocketAddr::from(([127, 0, 0, 1], spec.local_port));
@@ -1391,10 +1403,9 @@ mod net {
                 })));
             }
             Err(e) => {
-                let _ = proxy.send_event(UserEvent::Session(SessionEvent::TunnelError(format!(
-                    "tunnel {} -> {}:{}: {e}",
-                    spec.local_port, spec.remote_host, spec.remote_port
-                ))));
+                let _ = proxy.send_event(UserEvent::Session(SessionEvent::TunnelError(
+                    tr(lang).fmt_err_tunnel(spec.local_port, &spec.remote_host, spec.remote_port, &e.to_string()),
+                )));
             }
         }
     }
@@ -1402,9 +1413,11 @@ mod net {
     fn spawn_file_action(
         client: Arc<FileTransferClient>,
         action: FileAction,
+        lang: Language,
         proxy: EventLoopProxy<UserEvent>,
     ) {
         tokio::spawn(async move {
+            let t = tr(lang);
             match action {
                 FileAction::ListDir(path) => match client.list_dir(&path).await {
                     Ok(entries) => {
@@ -1416,9 +1429,9 @@ mod net {
                 },
                 FileAction::Mkdir(path) => match client.mkdir(&path).await {
                     Ok(()) => {
-                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
-                            "Created directory {path}"
-                        ))));
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(
+                            t.fmt_file_created_dir(&path),
+                        )));
                         let parent = veloxdesk_ui::parent_remote_path(&path);
                         if let Ok(entries) = client.list_dir(&parent).await {
                             let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing {
@@ -1433,9 +1446,9 @@ mod net {
                 },
                 FileAction::Delete(path) => match client.delete(&path).await {
                     Ok(()) => {
-                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
-                            "Deleted {path}"
-                        ))));
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(
+                            t.fmt_file_deleted(&path),
+                        )));
                         let parent = veloxdesk_ui::parent_remote_path(&path);
                         if let Ok(entries) = client.list_dir(&parent).await {
                             let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing {
@@ -1450,9 +1463,9 @@ mod net {
                 },
                 FileAction::Rename { from, to } => match client.rename(&from, &to).await {
                     Ok(()) => {
-                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
-                            "Renamed to {to}"
-                        ))));
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(
+                            t.fmt_file_renamed(&to),
+                        )));
                         let parent = veloxdesk_ui::parent_remote_path(&to);
                         if let Ok(entries) = client.list_dir(&parent).await {
                             let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing {
@@ -1466,7 +1479,7 @@ mod net {
                     }
                 },
                 FileAction::Download { remote_path, local_path, resume, compress } => {
-                    let label = format!("Downloading {remote_path}");
+                    let label = t.fmt_file_downloading(&remote_path);
                     let p_proxy = proxy.clone();
                     let p_label = label.clone();
                     let cb = Arc::new(move |done: u64, total: u64| {
@@ -1479,10 +1492,9 @@ mod net {
                         .await
                     {
                         Ok(rep) => {
-                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
-                                "Downloaded {} ({} bytes, resumed from {})",
-                                remote_path, rep.total_bytes, rep.resumed_from
-                            ))));
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(
+                                t.fmt_file_downloaded(&remote_path, rep.total_bytes, rep.resumed_from),
+                            )));
                         }
                         Err(e) => {
                             let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileError(e.to_string())));
@@ -1490,7 +1502,7 @@ mod net {
                     }
                 }
                 FileAction::Upload { local_path, remote_path, resume, compress } => {
-                    let label = format!("Uploading {remote_path}");
+                    let label = t.fmt_file_uploading(&remote_path);
                     let p_proxy = proxy.clone();
                     let p_label = label.clone();
                     let cb = Arc::new(move |done: u64, total: u64| {
@@ -1503,10 +1515,9 @@ mod net {
                         .await
                     {
                         Ok(rep) => {
-                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(format!(
-                                "Uploaded {} ({} bytes, resumed from {})",
-                                remote_path, rep.total_bytes, rep.resumed_from
-                            ))));
+                            let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileStatus(
+                                t.fmt_file_uploaded(&remote_path, rep.total_bytes, rep.resumed_from),
+                            )));
                             let parent = veloxdesk_ui::parent_remote_path(&remote_path);
                             if let Ok(entries) = client.list_dir(&parent).await {
                                 let _ = proxy.send_event(UserEvent::Session(SessionEvent::FileListing {

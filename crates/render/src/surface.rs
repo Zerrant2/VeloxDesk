@@ -103,6 +103,7 @@ pub struct VideoSurface {
     hud: Option<HudSnapshot>,
     hud_extra: Option<String>,
     hud_visible: bool,
+    hud_labels: hud::HudLabels,
     video_rect: Option<VideoRect>,
     repaint_at: Option<Instant>,
     last: RenderBreakdown,
@@ -204,6 +205,7 @@ impl VideoSurface {
             hud: None,
             hud_extra: None,
             hud_visible: false,
+            hud_labels: hud::HudLabels::EN,
             video_rect: None,
             repaint_at: None,
             last: RenderBreakdown::default(),
@@ -249,6 +251,10 @@ impl VideoSurface {
     /// Extra status line rendered below the standard HUD (e.g. audio buffer, gamepads, pointer lock).
     pub fn set_hud_extra(&mut self, extra: Option<String>) {
         self.hud_extra = extra;
+    }
+    /// Set localized labels used when rendering the Performance HUD overlay.
+    pub fn set_hud_labels(&mut self, labels: hud::HudLabels) {
+        self.hud_labels = labels;
     }
     /// Adapter LUID on Windows when zero-copy DX12 import is active.
     pub fn adapter_luid(&self) -> Option<u64> {
@@ -301,10 +307,11 @@ impl VideoSurface {
         let hud_visible = self.hud_visible;
         let hud_snap = self.hud.clone();
         let hud_extra = self.hud_extra.clone();
+        let hud_labels = self.hud_labels;
         let full = self.egui_ctx.run_ui(raw, |root| {
             ui(root);
             if hud_visible && let Some(s) = &hud_snap {
-                hud::show_hud(root, s, hud_extra.as_deref());
+                hud::show_hud_with(root, s, hud_extra.as_deref(), &hud_labels);
             }
         });
         self.egui_state.handle_platform_output(&self.window, full.platform_output);

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
-use veloxdesk_ui::{TailscaleInfo, TailscalePeer};
+use veloxdesk_ui::{Language, TailscaleInfo, TailscalePeer, tr};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -83,14 +83,21 @@ fn extract_name(node: &Value) -> String {
 }
 
 /// Parse the JSON output of `tailscale status --json` into a [`TailscaleInfo`] snapshot.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_status_json(raw: &str) -> TailscaleInfo {
+    parse_status_json_for(raw, Language::En)
+}
+
+/// Parse `tailscale status --json` with localized status/error text.
+pub fn parse_status_json_for(raw: &str, lang: Language) -> TailscaleInfo {
+    let t = tr(lang);
     let val: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
             return TailscaleInfo {
                 installed: true,
                 running: false,
-                error: Some(format!("failed to parse tailscale status: {e}")),
+                error: Some(t.fmt_ts_parse_err(&e.to_string())),
                 ..Default::default()
             };
         }
@@ -129,11 +136,11 @@ pub fn parse_status_json(raw: &str) -> TailscaleInfo {
         None
     } else {
         Some(match state {
-            "NeedsLogin" => "Tailscale needs login".into(),
-            "Stopped" => "Tailscale is stopped".into(),
-            "Starting" => "Tailscale is starting…".into(),
-            "NoState" | "" => "Tailscale daemon is not running".into(),
-            other => format!("Tailscale state: {other}"),
+            "NeedsLogin" => t.ts_needs_login.into(),
+            "Stopped" => t.ts_stopped.into(),
+            "Starting" => t.ts_starting.into(),
+            "NoState" | "" => t.ts_daemon_not_running.into(),
+            other => t.fmt_ts_state(other),
         })
     };
 
@@ -141,7 +148,8 @@ pub fn parse_status_json(raw: &str) -> TailscaleInfo {
 }
 
 /// Query local Tailscale status via `tailscale status --json` (non-interactive, no console flash).
-pub fn query_status() -> TailscaleInfo {
+pub fn query_status_for(lang: Language) -> TailscaleInfo {
+    let t = tr(lang);
     let Some(exe) = find_tailscale_exe() else {
         return TailscaleInfo { installed: false, ..Default::default() };
     };
@@ -155,19 +163,15 @@ pub fn query_status() -> TailscaleInfo {
             return TailscaleInfo {
                 installed: true,
                 running: false,
-                error: Some(format!("cannot run tailscale: {e}")),
+                error: Some(t.fmt_ts_cannot_run(&e.to_string())),
                 ..Default::default()
             };
         }
     };
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stdout.trim().is_empty() {
-        let info = parse_status_json(&stdout);
-        // `tailscale status --json` returns valid JSON even when stopped/needs-login.
-        if info.running || info.error.as_deref().is_some_and(|e| !e.starts_with("failed to parse")) {
-            return info;
-        }
+    if !stdout.trim().is_empty() && serde_json::from_str::<Value>(&stdout).is_ok() {
+        return parse_status_json_for(&stdout, lang);
     }
 
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -175,7 +179,7 @@ pub fn query_status() -> TailscaleInfo {
         installed: true,
         running: false,
         error: Some(if stderr.is_empty() {
-            "Tailscale is not running".into()
+            t.ts_not_running.into()
         } else {
             stderr
         }),
@@ -184,8 +188,9 @@ pub fn query_status() -> TailscaleInfo {
 }
 
 /// Launch the Tailscale GUI (`tailscale-ipn.exe` on Windows) or invoke `tailscale up`.
-pub fn start_tailscale() -> Result<(), String> {
-    let exe = find_tailscale_exe().ok_or_else(|| "Tailscale is not installed".to_string())?;
+pub fn start_tailscale_for(lang: Language) -> Result<(), String> {
+    let t = tr(lang);
+    let exe = find_tailscale_exe().ok_or_else(|| t.ts_not_installed.to_string())?;
 
     #[cfg(windows)]
     {
@@ -204,21 +209,35 @@ pub fn start_tailscale() -> Result<(), String> {
     apply_no_window(&mut cmd);
     cmd.spawn()
         .map(|_| ())
-        .map_err(|e| format!("failed to launch tailscale: {e}"))
+        .map_err(|e| t.fmt_ts_failed_launch(&e.to_string()))
 }
 
-/// Open an external HTTP(S) URL in the platform's default browser without flashing a console window.
+/// Validate that `url` is a clean `https://` URL with no control characters or whitespace.
+fn is_safe_open_url(url: &str) -> bool {
+    url.starts_with("https://")
+        && url.len() > "https://".len()
+        && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// Open an external HTTPS URL in the platform's default browser without invoking a shell.
 pub fn open_url(url: &str) {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        tracing::warn!(%url, "refusing to open non-http(s) URL");
+    if !is_safe_open_url(url) {
+        tracing::warn!(%url, "refusing to open unsafe or non-https URL");
         return;
     }
     #[cfg(windows)]
     {
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "start", "", url]);
-        apply_no_window(&mut cmd);
-        let _ = cmd.spawn();
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let open: Vec<u16> = "open\0".encode_utf16().collect();
+        let target: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `open` and `target` are NUL-terminated UTF-16 strings valid for the call;
+        // `ShellExecuteW` opens the URL directly via Windows Shell without spawning `cmd.exe`.
+        unsafe {
+            let _ = ShellExecuteW(null_mut(), open.as_ptr(), target.as_ptr(), null(), null(), SW_SHOWNORMAL);
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -318,5 +337,16 @@ mod tests {
         assert!(bad.installed);
         assert!(!bad.running);
         assert!(bad.error.as_deref().unwrap_or("").contains("failed to parse"));
+    }
+
+    #[test]
+    fn open_url_rejects_non_https_and_control_chars() {
+        assert!(is_safe_open_url("https://tailscale.com/download"));
+        assert!(is_safe_open_url("https://github.com/Zerrant2/VeloxDesk/releases/tag/v0.2.0"));
+        assert!(!is_safe_open_url("http://github.com/Zerrant2/VeloxDesk"));
+        assert!(!is_safe_open_url("https://"));
+        assert!(!is_safe_open_url("https://example.com/a b"));
+        assert!(!is_safe_open_url("https://example.com/a\ncalc.exe"));
+        assert!(!is_safe_open_url("file:///C:/Windows/System32/calc.exe"));
     }
 }

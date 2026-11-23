@@ -9,6 +9,7 @@ mod session;
 mod stats;
 mod tailscale;
 mod tray;
+mod updater;
 mod viewer;
 
 use std::path::PathBuf;
@@ -43,7 +44,11 @@ impl PresentArg {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "veloxdesk", version, about = "VeloxDesk low-latency remote desktop")]
+#[command(
+    name = "veloxdesk",
+    version = env!("VELOXDESK_BUILD_DISPLAY"),
+    about = "VeloxDesk low-latency remote desktop"
+)]
 struct Cli {
     /// Run as host (stream this desktop to connecting viewers).
     #[arg(long, conflicts_with_all = ["connect", "test_pattern"])]
@@ -273,7 +278,7 @@ fn run_host_cli(
     let id = viewer::load_identity(cfg.identity_path.as_deref())?;
     println!(
         "VeloxDesk host {} listening on {} (device ID: {})",
-        env!("CARGO_PKG_VERSION"),
+        env!("VELOXDESK_BUILD_DISPLAY"),
         cfg.bind,
         veloxdesk_ui::format_device_id(&id.device_id()),
     );
@@ -377,28 +382,29 @@ fn main() -> ExitCode {
     } else {
         (Settings::load_or_default(), None)
     };
-    if cli.hud {
-        settings.show_hud = true;
-    }
     if cli.gaming {
         settings.mode = Mode::Gaming;
     }
+    let active = settings.active_mut();
+    if cli.hud {
+        active.show_hud = true;
+    }
     if cli.sw_decode {
-        settings.prefer_hw_decode = false;
+        active.prefer_hw_decode = false;
     }
     if cli.mic {
-        settings.mic_enabled = true;
+        active.mic_enabled = true;
     }
     #[cfg(feature = "net")]
     {
         if cli.host_args.no_audio {
-            settings.audio_enabled = false;
+            active.audio_enabled = false;
         }
         if cli.host_args.hdr {
-            settings.hdr_10bit = true;
+            active.hdr_10bit = true;
         }
         if cli.host_args.yuv444 {
-            settings.yuv444 = true;
+            active.yuv444 = true;
         }
     }
 

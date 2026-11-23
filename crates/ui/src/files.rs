@@ -3,6 +3,9 @@
 
 use veloxdesk_protocol::control::FileEntry;
 
+use crate::i18n::tr;
+use crate::settings::Language;
+
 /// Actions emitted by [`FileManagerWindow`] to the viewer session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileAction {
@@ -33,20 +36,13 @@ impl TransferProgress {
 }
 
 /// Format byte sizes cleanly (`1.4 MiB`, `820 B`, etc.).
+pub fn format_size_i18n(bytes: u64, lang: Language) -> String {
+    tr(lang).format_size(bytes)
+}
+
+/// Format byte sizes cleanly (`1.4 MiB`, `820 B`, etc.) in English.
 pub fn format_size(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    let b = bytes as f64;
-    if b >= GIB {
-        format!("{:.2} GiB", b / GIB)
-    } else if b >= MIB {
-        format!("{:.2} MiB", b / MIB)
-    } else if b >= KIB {
-        format!("{:.1} KiB", b / KIB)
-    } else {
-        format!("{bytes} B")
-    }
+    format_size_i18n(bytes, Language::En)
 }
 
 /// Join a remote directory path and entry name without platform-specific host assumptions.
@@ -119,27 +115,32 @@ impl Default for FileManagerWindow {
 
 impl FileManagerWindow {
     pub fn show(&mut self, ctx: &egui::Context) -> Vec<FileAction> {
+        self.show_for(ctx, Language::En)
+    }
+
+    pub fn show_for(&mut self, ctx: &egui::Context, lang: Language) -> Vec<FileAction> {
+        let t = tr(lang);
         let mut actions = Vec::new();
         let mut open = self.open;
-        egui::Window::new("File Manager")
+        egui::Window::new(t.files_title)
             .id(egui::Id::unique("veloxdesk-files"))
             .open(&mut open)
-            .default_size(egui::vec2(620.0, 420.0))
+            .default_size(egui::vec2(660.0, 430.0))
             .resizable(true)
             .show(ctx, |ui| {
                 // Path navigation bar.
                 ui.horizontal(|ui| {
-                    if ui.button("⬆ Up").clicked() {
+                    if ui.button((crate::icons::arrow_up_atom(12.0), t.files_up_btn)).clicked() {
                         self.current_path = parent_remote_path(&self.current_path);
                         self.selected = None;
                         actions.push(FileAction::ListDir(self.current_path.clone()));
                     }
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.current_path)
-                            .desired_width(ui.available_width() - 90.0),
+                            .desired_width((ui.available_width() - 96.0).max(120.0)),
                     );
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("Refresh").clicked() || enter {
+                    if ui.button(t.refresh_btn).clicked() || enter {
                         self.selected = None;
                         actions.push(FileAction::ListDir(self.current_path.clone()));
                     }
@@ -153,27 +154,34 @@ impl FileManagerWindow {
                         .striped(true)
                         .min_col_width(80.0)
                         .show(ui, |ui| {
-                            ui.strong("Name");
-                            ui.strong("Type");
-                            ui.strong("Size");
+                            ui.strong(t.files_col_name);
+                            ui.strong(t.files_col_type);
+                            ui.strong(t.files_col_size);
                             ui.end_row();
                             let mut nav_dir: Option<String> = None;
                             for (idx, entry) in self.entries.iter().enumerate() {
+                                use egui::IntoAtoms as _;
                                 let is_sel = self.selected == Some(idx);
-                                let label = if entry.is_dir {
-                                    format!("📁 {}", entry.name)
+                                let resp = if entry.is_dir {
+                                    ui.selectable_label(
+                                        is_sel,
+                                        (crate::icons::folder_atom(13.0), entry.name.as_str()).into_atoms(),
+                                    )
                                 } else {
-                                    entry.name.clone()
+                                    ui.selectable_label(is_sel, entry.name.as_str())
                                 };
-                                let resp = ui.selectable_label(is_sel, label);
                                 if resp.clicked() {
                                     self.selected = Some(idx);
                                 }
                                 if resp.double_clicked() && entry.is_dir {
                                     nav_dir = Some(join_remote_path(&self.current_path, &entry.name));
                                 }
-                                ui.label(if entry.is_dir { "Dir" } else { "File" });
-                                ui.label(if entry.is_dir { String::new() } else { format_size(entry.size) });
+                                ui.label(if entry.is_dir { t.files_type_dir } else { t.files_type_file });
+                                ui.label(if entry.is_dir {
+                                    String::new()
+                                } else {
+                                    format_size_i18n(entry.size, lang)
+                                });
                                 ui.end_row();
                             }
                             if let Some(dir) = nav_dir {
@@ -187,21 +195,21 @@ impl FileManagerWindow {
                 ui.separator();
 
                 // Transfer controls (Upload / Download + resume & zstd toggles).
-                ui.horizontal(|ui| {
-                    ui.label("Local path:");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(t.files_local_path_label);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.local_path)
-                            .hint_text("C:\\path\\to\\file")
+                            .hint_text(t.files_local_path_hint)
                             .desired_width(240.0),
                     );
-                    ui.checkbox(&mut self.resume, "Resume");
+                    ui.checkbox(&mut self.resume, t.files_resume_cb);
                     ui.checkbox(&mut self.compress, "zstd");
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let selected_entry = self.selected.and_then(|i| self.entries.get(i)).cloned();
                     let can_download = selected_entry.as_ref().is_some_and(|e| !e.is_dir)
                         && !self.local_path.trim().is_empty();
-                    if ui.add_enabled(can_download, egui::Button::new("Download")).clicked()
+                    if ui.add_enabled(can_download, egui::Button::new(t.files_download_btn)).clicked()
                         && let Some(e) = &selected_entry
                     {
                         actions.push(FileAction::Download {
@@ -212,7 +220,7 @@ impl FileManagerWindow {
                         });
                     }
                     let can_upload = !self.local_path.trim().is_empty();
-                    if ui.add_enabled(can_upload, egui::Button::new("Upload")).clicked() {
+                    if ui.add_enabled(can_upload, egui::Button::new(t.files_upload_btn)).clicked() {
                         let local = self.local_path.trim();
                         let fname = std::path::Path::new(local)
                             .file_name()
@@ -228,15 +236,18 @@ impl FileManagerWindow {
                     ui.separator();
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_name)
-                            .hint_text("Folder or new name")
+                            .hint_text(t.files_new_name_hint)
                             .desired_width(140.0),
                     );
-                    if ui.add_enabled(!self.new_name.trim().is_empty(), egui::Button::new("Mkdir")).clicked() {
+                    if ui
+                        .add_enabled(!self.new_name.trim().is_empty(), egui::Button::new(t.files_mkdir_btn))
+                        .clicked()
+                    {
                         actions.push(FileAction::Mkdir(join_remote_path(&self.current_path, self.new_name.trim())));
                         self.new_name.clear();
                     }
                     let can_rename = selected_entry.is_some() && !self.new_name.trim().is_empty();
-                    if ui.add_enabled(can_rename, egui::Button::new("Rename")).clicked()
+                    if ui.add_enabled(can_rename, egui::Button::new(t.files_rename_btn)).clicked()
                         && let Some(e) = &selected_entry
                     {
                         actions.push(FileAction::Rename {
@@ -248,7 +259,9 @@ impl FileManagerWindow {
                     if ui
                         .add_enabled(
                             selected_entry.is_some(),
-                            egui::Button::new(egui::RichText::new("Delete").color(egui::Color32::from_rgb(255, 120, 120))),
+                            egui::Button::new(
+                                egui::RichText::new(t.files_delete_btn).color(egui::Color32::from_rgb(255, 120, 120)),
+                            ),
                         )
                         .clicked()
                         && let Some(e) = &selected_entry
@@ -260,7 +273,12 @@ impl FileManagerWindow {
 
                 if let Some(p) = &self.progress {
                     ui.add_space(4.0);
-                    let text = format!("{} ({} / {})", p.label, format_size(p.bytes_done), format_size(p.bytes_total));
+                    let text = format!(
+                        "{} ({} / {})",
+                        p.label,
+                        format_size_i18n(p.bytes_done, lang),
+                        format_size_i18n(p.bytes_total, lang)
+                    );
                     ui.add(egui::ProgressBar::new(p.fraction()).text(text));
                 }
                 if let Some(s) = &self.status {

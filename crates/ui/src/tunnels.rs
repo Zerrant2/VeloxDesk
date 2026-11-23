@@ -1,6 +1,9 @@
 //! M4 TCP Port Forwarding panel (`local_port -> remote_host:remote_port`).
 
-/// One TCP forwarding rule (`127.0.0.1:<local_port>` → `<remote_host>:<remote_port>`).
+use crate::i18n::tr;
+use crate::settings::Language;
+
+/// One TCP forwarding rule (`127.0.0.1:<local_port>` -> `<remote_host>:<remote_port>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelSpec {
     pub local_port: u16,
@@ -8,29 +11,35 @@ pub struct TunnelSpec {
     pub remote_port: u16,
 }
 
-/// Parse `<local_port>:<remote_host>:<remote_port>` (also supports IPv6 `[::1]`).
-pub fn parse_tunnel_spec(s: &str) -> Result<TunnelSpec, String> {
+/// Parse `<local_port>:<remote_host>:<remote_port>` (also supports IPv6 `[::1]`) with localized errors.
+pub fn parse_tunnel_spec_i18n(s: &str, lang: Language) -> Result<TunnelSpec, String> {
+    let t = tr(lang);
     let s = s.trim();
     let (local_str, rest) = s
         .split_once(':')
-        .ok_or_else(|| format!("expected local_port:remote_host:remote_port, got {s:?}"))?;
+        .ok_or_else(|| t.err_tunnel_expected_full(s))?;
     let local_port: u16 = local_str
         .parse()
-        .map_err(|_| format!("invalid local port {local_str:?}"))?;
+        .map_err(|_| t.err_tunnel_invalid_local_port(local_str))?;
     let (host_str, rport_str) = rest
         .rsplit_once(':')
-        .ok_or_else(|| format!("expected remote_host:remote_port, got {rest:?}"))?;
+        .ok_or_else(|| t.err_tunnel_expected_remote(rest))?;
     let remote_host = host_str.trim().trim_matches(['[', ']']).to_string();
     if remote_host.is_empty() {
-        return Err("remote host must not be empty".into());
+        return Err(t.err_tunnel_empty_host.into());
     }
     let remote_port: u16 = rport_str
         .parse()
-        .map_err(|_| format!("invalid remote port {rport_str:?}"))?;
+        .map_err(|_| t.err_tunnel_invalid_remote_port(rport_str))?;
     if remote_port == 0 {
-        return Err("remote port must be > 0".into());
+        return Err(t.err_tunnel_zero_port.into());
     }
     Ok(TunnelSpec { local_port, remote_host, remote_port })
+}
+
+/// Parse `<local_port>:<remote_host>:<remote_port>` (also supports IPv6 `[::1]`).
+pub fn parse_tunnel_spec(s: &str) -> Result<TunnelSpec, String> {
+    parse_tunnel_spec_i18n(s, Language::En)
 }
 
 /// An active tunnel displayed in [`TunnelsWindow`].
@@ -75,18 +84,23 @@ impl Default for TunnelsWindow {
 
 impl TunnelsWindow {
     pub fn show(&mut self, ctx: &egui::Context) -> Vec<TunnelAction> {
+        self.show_for(ctx, Language::En)
+    }
+
+    pub fn show_for(&mut self, ctx: &egui::Context, lang: Language) -> Vec<TunnelAction> {
+        let t = tr(lang);
         let mut actions = Vec::new();
         let mut open = self.open;
-        egui::Window::new("TCP Port Forwarding")
+        egui::Window::new(t.tunnels_title)
             .id(egui::Id::unique("veloxdesk-tunnels"))
             .open(&mut open)
-            .default_size(egui::vec2(480.0, 280.0))
+            .default_size(egui::vec2(530.0, 290.0))
             .resizable(true)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Local port:");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(t.tunnels_local_port_label);
                     ui.add(egui::TextEdit::singleline(&mut self.local_port_text).desired_width(60.0));
-                    ui.label("→");
+                    crate::icons::arrow_right_widget(ui, 14.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.remote_host)
                             .hint_text("127.0.0.1")
@@ -94,14 +108,14 @@ impl TunnelsWindow {
                     );
                     ui.label(":");
                     ui.add(egui::TextEdit::singleline(&mut self.remote_port_text).desired_width(60.0));
-                    if ui.button("Add").clicked() {
+                    if ui.button(t.tunnels_add_btn).clicked() {
                         let raw = format!(
                             "{}:{}:{}",
                             self.local_port_text.trim(),
                             self.remote_host.trim(),
                             self.remote_port_text.trim()
                         );
-                        match parse_tunnel_spec(&raw) {
+                        match parse_tunnel_spec_i18n(&raw, lang) {
                             Ok(spec) => {
                                 self.error = None;
                                 actions.push(TunnelAction::Add(spec));
@@ -115,18 +129,18 @@ impl TunnelsWindow {
                 }
                 ui.separator();
                 if self.active.is_empty() {
-                    ui.weak("No active port forwards.");
+                    ui.weak(t.tunnels_empty);
                 } else {
                     egui::Grid::new("veloxdesk-tunnel-list").num_columns(3).striped(true).show(ui, |ui| {
-                        ui.strong("Local");
-                        ui.strong("Remote");
+                        ui.strong(t.tunnels_col_local);
+                        ui.strong(t.tunnels_col_remote);
                         ui.strong("");
                         ui.end_row();
-                        for t in &self.active {
-                            ui.monospace(&t.local_addr);
-                            ui.monospace(format!("{}:{}", t.remote_host, t.remote_port));
-                            if ui.small_button("Stop").clicked() {
-                                actions.push(TunnelAction::Remove(t.id));
+                        for tun in &self.active {
+                            ui.monospace(&tun.local_addr);
+                            ui.monospace(format!("{}:{}", tun.remote_host, tun.remote_port));
+                            if ui.small_button(t.tunnels_stop_btn).clicked() {
+                                actions.push(TunnelAction::Remove(tun.id));
                             }
                             ui.end_row();
                         }

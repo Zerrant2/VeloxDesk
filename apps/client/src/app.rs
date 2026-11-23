@@ -1,8 +1,9 @@
 //! winit application: connect screen, remote session view, test-pattern benchmark.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use veloxdesk_core_traits::Timestamp;
@@ -11,7 +12,7 @@ use veloxdesk_core_traits::render::VideoRenderer;
 use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
 use veloxdesk_protocol::control::{SessionConfig, VideoCodec};
-use veloxdesk_render::hud::{hud_line, is_toggle_shortcut};
+use veloxdesk_render::hud::{HudLabels, hud_line, is_toggle_shortcut};
 use veloxdesk_render::pattern::nv12_test_frame;
 use veloxdesk_render::winit::application::ApplicationHandler;
 use veloxdesk_render::winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
@@ -20,10 +21,10 @@ use veloxdesk_render::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use veloxdesk_render::{RenderBreakdown, SurfaceOptions, VideoSurface, egui};
 use veloxdesk_ui::{
-    AcceptDecision, AcceptPrompt, ConnectAction, ConnectScreen, ConnectTarget, FileAction, FileManagerWindow, Mode,
-    PasswordAction, PasswordPrompt, Present, SessionInfo, SessionToolbar, Settings, TailscaleInfo, TerminalAction,
-    TerminalWindow, ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, format_device_id, parse_rendezvous_addr,
-    parse_target, settings_window,
+    AcceptDecision, AcceptPrompt, ConnectAction, ConnectScreen, ConnectTarget, FileAction, FileManagerWindow, Language,
+    Mode, PasswordAction, PasswordPrompt, Present, SessionInfo, SessionToolbar, Settings, TailscaleInfo,
+    TerminalAction, TerminalWindow, ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, UpdateUiState,
+    format_device_id, parse_rendezvous_addr_i18n, parse_target_i18n, settings_window_full, tr,
 };
 
 use crate::embedded_host::{EmbeddedHostEvent, EmbeddedHostHandle};
@@ -33,6 +34,41 @@ use crate::session::{ConnectOptions, SessionCommand, SessionEvent, SessionHandle
 use crate::stats::PresentedFrame;
 use crate::tailscale;
 use crate::tray::{TrayAction, TrayHandle};
+use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome};
+
+fn hud_labels_for(lang: Language) -> HudLabels {
+    let t = tr(lang);
+    HudLabels {
+        capture: t.hud_capture,
+        encode: t.hud_encode,
+        net: t.hud_net,
+        rtt: t.hud_rtt,
+        decode: t.hud_decode,
+        render: t.hud_render,
+        total: t.hud_total,
+        ms: t.hud_ms,
+        fps: t.hud_fps,
+        mbps: t.hud_mbps,
+        loss: t.hud_loss,
+        fec_rec: t.hud_fec_rec,
+        decode_prefix: t.hud_decode_prefix,
+        zero_copy: t.hud_zero_copy,
+        yes: t.hud_yes,
+        no: t.hud_no,
+        path_unknown: t.hud_path_unknown,
+        path_direct: t.hud_path_direct,
+        path_p2p: t.hud_path_p2p,
+        path_relay: t.hud_path_relay,
+    }
+}
+
+/// Auto-updater lifecycle events delivered from background worker threads.
+#[derive(Debug)]
+pub enum UpdateEvent {
+    Checked(Result<UpdateCheckOutcome, String>),
+    Progress { downloaded: u64, total: Option<u64> },
+    ReadyToRelaunch(Result<std::path::PathBuf, String>),
+}
 
 /// Events delivered to the winit loop from other threads.
 #[derive(Debug)]
@@ -46,6 +82,7 @@ pub enum UserEvent {
     #[cfg_attr(not(windows), allow(dead_code))]
     Tray(TrayAction),
     Tailscale(TailscaleInfo),
+    Update(UpdateEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +130,88 @@ enum State {
     TestPattern(Box<TestPatternState>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppPhase {
+    Connect,
+    Connecting,
+    Session,
+    TestPattern,
+}
+
+impl AppPhase {
+    fn allows_fullscreen_entry(self) -> bool {
+        matches!(self, Self::Session | Self::TestPattern)
+    }
+}
+
+impl State {
+    fn phase(&self) -> AppPhase {
+        match self {
+            Self::Connect => AppPhase::Connect,
+            Self::Connecting(_) => AppPhase::Connecting,
+            Self::Session { .. } => AppPhase::Session,
+            Self::TestPattern(_) => AppPhase::TestPattern,
+        }
+    }
+}
+
+/// Window chrome state tracked independently of winit/wgpu so transitions are unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowChromeState {
+    fullscreen: bool,
+    decorations: bool,
+    pointer_locked: bool,
+    toolbar_expanded: bool,
+}
+
+impl Default for WindowChromeState {
+    fn default() -> Self {
+        Self {
+            fullscreen: false,
+            decorations: true,
+            pointer_locked: false,
+            toolbar_expanded: false,
+        }
+    }
+}
+
+impl WindowChromeState {
+    /// Entering fullscreen is allowed only during an active `Session` or `TestPattern`;
+    /// exiting fullscreen is ALWAYS allowed in every phase and restores `decorations = true`.
+    fn toggle_fullscreen(&mut self, phase: AppPhase) -> bool {
+        if self.fullscreen {
+            self.fullscreen = false;
+            self.decorations = true;
+            true
+        } else if phase.allows_fullscreen_entry() {
+            self.fullscreen = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unconditionally exit fullscreen and restore decorated window chrome.
+    fn exit_fullscreen(&mut self) -> bool {
+        let changed = self.fullscreen || !self.decorations;
+        self.fullscreen = false;
+        self.decorations = true;
+        changed
+    }
+
+    /// Reset window and session chrome on disconnect, session close, auth cancel, or test-pattern Esc.
+    fn end_session(&mut self) {
+        self.fullscreen = false;
+        self.decorations = true;
+        self.pointer_locked = false;
+        self.toolbar_expanded = false;
+    }
+}
+
+fn is_fullscreen_shortcut(code: KeyCode, mods: ModifiersState) -> bool {
+    code == KeyCode::KeyF && mods.control_key() && mods.shift_key() && !mods.alt_key()
+}
+
 /// Viewer-side CLI overrides for M2/M4 P2P, E2EE, tunnels, and portable mode.
 #[derive(Debug, Clone, Default)]
 pub struct ViewerCliOpts {
@@ -118,6 +237,7 @@ pub struct App {
     launch: Option<Launch>,
     proxy: EventLoopProxy<UserEvent>,
     settings: Settings,
+    lang_atomic: Arc<AtomicU8>,
     viewer_opts: ViewerCliOpts,
     present_override: Option<Present>,
     surface: Option<VideoSurface>,
@@ -127,7 +247,10 @@ pub struct App {
     password_prompt: Option<PasswordPrompt>,
     accept_prompt: Option<(AcceptPrompt, tokio::sync::oneshot::Sender<AcceptDecision>)>,
     embedded_host: Option<EmbeddedHostHandle>,
-    host_bind_label: String,
+    host_listen_info: Option<(u16, Option<SocketAddr>)>,
+    host_last_peer: Option<String>,
+    available_release: Option<ReleaseInfo>,
+    manual_update_check: bool,
     tray: Option<TrayHandle>,
     files: FileManagerWindow,
     terminal: TerminalWindow,
@@ -138,6 +261,7 @@ pub struct App {
     wheel: WheelAccum,
     rel: RelativeAccum,
     pointer_locked: bool,
+    chrome: WindowChromeState,
     session_info: SessionInfo,
     decoder: (String, bool),
     path_kind: PathKind,
@@ -153,11 +277,15 @@ impl App {
         present: Option<Present>,
         viewer_opts: ViewerCliOpts,
     ) -> Self {
+        let lang_atomic = Arc::new(AtomicU8::new(settings.language.to_u8()));
         let mut connect = ConnectScreen::new(&settings);
         connect.device_id = crate::device_id_label();
+        connect.settings_path = viewer_opts.settings_path.clone();
+        connect.build_display = env!("VELOXDESK_BUILD_DISPLAY").to_string();
         Self {
             launch: Some(launch),
             proxy,
+            lang_atomic,
             viewer_opts,
             present_override: present,
             surface: None,
@@ -167,7 +295,10 @@ impl App {
             password_prompt: None,
             accept_prompt: None,
             embedded_host: None,
-            host_bind_label: String::new(),
+            host_listen_info: None,
+            host_last_peer: None,
+            available_release: None,
+            manual_update_check: false,
             tray: None,
             files: FileManagerWindow::default(),
             terminal: TerminalWindow::default(),
@@ -178,6 +309,7 @@ impl App {
             wheel: WheelAccum::default(),
             rel: RelativeAccum::default(),
             pointer_locked: false,
+            chrome: WindowChromeState::default(),
             session_info: SessionInfo::default(),
             decoder: (String::new(), false),
             path_kind: PathKind::Direct,
@@ -185,6 +317,95 @@ impl App {
             settings,
             exit_code: 0,
         }
+    }
+
+    fn sync_language(&mut self) {
+        let lang = self.settings.language;
+        self.lang_atomic.store(lang.to_u8(), Ordering::Relaxed);
+        self.connect.copied_notice = None;
+        if let Some(s) = &mut self.surface {
+            s.set_hud_labels(hud_labels_for(lang));
+        }
+        self.refresh_host_status_label();
+        if self.connect.tailscale.error.is_some() {
+            self.refresh_tailscale();
+        }
+    }
+
+    fn refresh_host_status_label(&mut self) {
+        let t = tr(self.settings.language);
+        if !self.connect.host_running {
+            self.connect.host_status = if self.embedded_host.is_some() {
+                t.host_starting.into()
+            } else {
+                t.host_stopped.into()
+            };
+            return;
+        }
+        if self.connect.active_sessions > 0 {
+            let peer = self
+                .host_last_peer
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(format_device_id)
+                .unwrap_or_else(|| t.host_peer_viewer.into());
+            self.connect.host_status = t.fmt_host_connected(&peer);
+        } else if let Some((port, rdv)) = self.host_listen_info {
+            self.connect.host_status = match rdv {
+                Some(r) => t.fmt_host_listening_rdv(port, r),
+                None => t.fmt_host_listening_port(port),
+            };
+        } else {
+            self.connect.host_status = t.host_listening.into();
+        }
+    }
+
+    fn check_for_updates_bg(&mut self, manual: bool) {
+        if matches!(
+            self.connect.update_state,
+            UpdateUiState::Checking | UpdateUiState::Downloading { .. }
+        ) {
+            return;
+        }
+        self.manual_update_check = manual;
+        self.connect.update_state = UpdateUiState::Checking;
+        if manual {
+            self.connect.update_dismissed = false;
+        }
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("veloxdesk-update-check".into()).spawn(move || {
+            let res = updater::check_for_update(env!("CARGO_PKG_VERSION")).map_err(|e| format!("{e:#}"));
+            let _ = proxy.send_event(UserEvent::Update(UpdateEvent::Checked(res)));
+        });
+    }
+
+    fn start_update_bg(&mut self) {
+        let Some(release) = self.available_release.clone() else { return };
+        if matches!(self.connect.update_state, UpdateUiState::Downloading { .. }) {
+            return;
+        }
+        let t = tr(self.settings.language);
+        self.connect.update_dismissed = false;
+        self.connect.update_state = UpdateUiState::Downloading {
+            progress: Some(0.0),
+            status: t.update_downloading.into(),
+        };
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("veloxdesk-update-apply".into()).spawn(move || {
+            let progress_proxy = proxy.clone();
+            let mut last_sent = Instant::now() - Duration::from_secs(1);
+            let res = updater::install_update(&release, |downloaded, total| {
+                let now = Instant::now();
+                if now.duration_since(last_sent) >= Duration::from_millis(80)
+                    || total.is_some_and(|tot| downloaded >= tot)
+                {
+                    last_sent = now;
+                    let _ = progress_proxy.send_event(UserEvent::Update(UpdateEvent::Progress { downloaded, total }));
+                }
+            })
+            .map_err(|e| format!("{e:#}"));
+            let _ = proxy.send_event(UserEvent::Update(UpdateEvent::ReadyToRelaunch(res)));
+        });
     }
 
     fn copy_to_clipboard(&self, text: &str) {
@@ -205,22 +426,28 @@ impl App {
         if self.embedded_host.is_some() {
             return;
         }
+        let t = tr(self.settings.language);
         let rendezvous = match self.resolve_rendezvous() {
             Ok(r) => r,
             Err(e) => {
-                self.connect.host_error = Some(format!("Invalid rendezvous server: {e}"));
+                self.connect.host_error = Some(t.fmt_invalid_rendezvous(&e));
                 return;
             }
         };
         self.connect.host_error = None;
-        self.connect.host_status = "Starting…".into();
-        match EmbeddedHostHandle::start(rendezvous, self.settings.require_accept, self.proxy.clone()) {
+        self.connect.host_status = t.host_starting.into();
+        match EmbeddedHostHandle::start(
+            rendezvous,
+            self.settings.require_accept,
+            self.proxy.clone(),
+            self.lang_atomic.clone(),
+        ) {
             Ok(h) => {
                 self.embedded_host = Some(h);
             }
             Err(e) => {
                 self.connect.host_running = false;
-                self.connect.host_status = "Stopped".into();
+                self.connect.host_status = t.host_stopped.into();
                 self.connect.host_error = Some(format!("{e:#}"));
             }
         }
@@ -231,26 +458,30 @@ impl App {
             h.stop();
         }
         self.accept_prompt = None;
+        self.host_listen_info = None;
+        self.host_last_peer = None;
         self.connect.host_running = false;
         self.connect.active_sessions = 0;
         self.connect.host_otp.clear();
-        self.connect.host_status = "Stopped".into();
+        self.connect.host_status = tr(self.settings.language).host_stopped.into();
     }
 
     fn refresh_tailscale(&self) {
         let proxy = self.proxy.clone();
+        let lang = self.settings.language;
         let _ = std::thread::Builder::new().name("veloxdesk-ts".into()).spawn(move || {
-            let info = tailscale::query_status();
+            let info = tailscale::query_status_for(lang);
             let _ = proxy.send_event(UserEvent::Tailscale(info));
         });
     }
 
     fn start_tailscale_bg(&self) {
         let proxy = self.proxy.clone();
+        let lang = self.settings.language;
         let _ = std::thread::Builder::new().name("veloxdesk-ts-start".into()).spawn(move || {
-            let start_res = tailscale::start_tailscale();
+            let start_res = tailscale::start_tailscale_for(lang);
             std::thread::sleep(Duration::from_millis(1200));
-            let mut info = tailscale::query_status();
+            let mut info = tailscale::query_status_for(lang);
             if let Err(err) = start_res
                 && !info.running
             {
@@ -261,17 +492,11 @@ impl App {
     }
 
     fn save_settings(&self) {
-        if let Some(p) = &self.viewer_opts.settings_path {
-            if let Err(e) = self.settings.save(p) {
-                tracing::warn!("saving settings to {}: {e}", p.display());
-            }
-        } else {
-            self.settings.save_default();
-        }
+        self.settings.save_to_or_default(self.viewer_opts.settings_path.as_deref());
     }
 
     fn present_pref(&self) -> Present {
-        self.present_override.unwrap_or(self.settings.present)
+        self.present_override.unwrap_or(self.settings.active().present)
     }
 
     fn resolve_rendezvous(&self) -> Result<Option<std::net::SocketAddr>, String> {
@@ -286,16 +511,17 @@ impl App {
                 (!s.is_empty()).then_some(s)
             });
         match raw {
-            Some(s) => parse_rendezvous_addr(s).map(Some),
+            Some(s) => parse_rendezvous_addr_i18n(s, self.settings.language).map(Some),
             None => Ok(None),
         }
     }
 
     fn start_connect(&mut self, address: String, target: ConnectTarget) {
+        let t = tr(self.settings.language);
         let rendezvous = match self.resolve_rendezvous() {
             Ok(r) => r,
             Err(e) => {
-                self.connect.error = Some(format!("Invalid rendezvous server: {e}"));
+                self.connect.error = Some(t.fmt_invalid_rendezvous(&e));
                 if let Some(s) = &self.surface {
                     s.window().request_redraw();
                 }
@@ -303,8 +529,7 @@ impl App {
             }
         };
         if matches!(target, ConnectTarget::DeviceId(_)) && rendezvous.is_none() {
-            self.connect.error =
-                Some("Set a Rendezvous server in Settings (or pass --rendezvous) to connect by Device ID".into());
+            self.connect.error = Some(t.err_no_rendezvous_for_id.into());
             if let Some(s) = &self.surface {
                 s.window().request_redraw();
             }
@@ -318,8 +543,9 @@ impl App {
             .and_then(|s| s.window().current_monitor())
             .map(|m| (m.size().width, m.size().height, m.refresh_rate_millihertz().unwrap_or(60_000) / 1000))
             .unwrap_or((1920, 1080, 60));
-        let hz = self.settings.fps_cap.fps().max(monitor_hz.min(self.settings.fps_cap.fps()));
-        let prefer_gpu_decode = self.settings.prefer_hw_decode
+        let prof = *self.settings.active();
+        let hz = prof.fps_cap.fps().max(monitor_hz.min(prof.fps_cap.fps()));
+        let prefer_gpu_decode = prof.prefer_hw_decode
             && self.surface.as_ref().is_some_and(|s| !s.caps().zero_copy_import.is_empty());
         let label = match &target {
             ConnectTarget::Direct(a) => a.to_string(),
@@ -331,24 +557,25 @@ impl App {
             relay_only: self.viewer_opts.relay_only,
             password: self.viewer_opts.password.clone(),
             mode: self.settings.mode.to_wire(),
-            max_bitrate_kbps: self.settings.quality.bitrate_kbps(),
-            prefer_hw_decode: self.settings.prefer_hw_decode,
+            max_bitrate_kbps: prof.quality.bitrate_kbps(),
+            prefer_hw_decode: prof.prefer_hw_decode,
             prefer_gpu_decode,
-            audio_enabled: self.settings.audio_enabled,
-            mic_enabled: self.settings.mic_enabled,
-            clipboard_sync: self.settings.clipboard_sync,
+            audio_enabled: prof.audio_enabled,
+            mic_enabled: prof.mic_enabled,
+            clipboard_sync: prof.clipboard_sync,
             initial_tunnels: self.viewer_opts.tunnels.clone(),
-            hdr_10bit: self.settings.hdr_10bit,
-            yuv444: self.settings.yuv444,
+            hdr_10bit: prof.hdr_10bit,
+            yuv444: prof.yuv444,
             viewer_size: (vw, vh),
             viewer_refresh_hz: hz,
+            language: self.lang_atomic.clone(),
         };
         self.password_prompt = None;
         self.path_kind = PathKind::Unknown;
         match crate::viewer::connect(opts, self.proxy.clone()) {
             Ok(h) => {
                 self.connect.error = None;
-                self.connect.status = Some(format!("Connecting to {label}…"));
+                self.connect.status = Some(t.fmt_connecting_to(&label));
                 self.state = State::Connecting(h);
             }
             Err(e) => {
@@ -362,6 +589,9 @@ impl App {
 
     fn end_session(&mut self, reason: Option<String>) {
         self.release_pointer();
+        self.pressed.clear();
+        self.chrome.end_session();
+        self.toolbar.expanded = self.chrome.toolbar_expanded;
         self.state = State::Connect;
         self.connect.status = None;
         self.connect.error = reason;
@@ -380,9 +610,11 @@ impl App {
         if let Some(s) = &mut self.surface {
             s.set_cursor(None, 0, 0, false);
             let _ = s.set_present_mode(veloxdesk_core_traits::render::PresentMode::Fifo);
+            let _ = s.window().set_cursor_grab(CursorGrabMode::None);
+            s.window().set_cursor_visible(true);
             s.window().set_title("VeloxDesk");
-            s.window().request_redraw();
         }
+        self.apply_window_chrome();
     }
 
     fn start_test_pattern(&mut self, opts: TestPatternOpts) {
@@ -440,6 +672,7 @@ impl App {
             s.window().set_cursor_visible(true);
         }
         self.pointer_locked = false;
+        self.chrome.pointer_locked = false;
         self.session_info.pointer_locked = false;
     }
 
@@ -453,6 +686,7 @@ impl App {
         if ok {
             w.set_cursor_visible(false);
             self.pointer_locked = true;
+            self.chrome.pointer_locked = true;
             self.session_info.pointer_locked = true;
             tracing::info!("pointer locked (Ctrl+Alt+G to release)");
         }
@@ -473,7 +707,7 @@ impl App {
     }
 
     fn relative_mode(&self) -> bool {
-        self.settings.mode == Mode::Gaming && self.settings.relative_mouse_in_gaming
+        self.settings.mode == Mode::Gaming && self.settings.active().relative_mouse_in_gaming
     }
 
     /// Host display pixel for a video pixel (the host may stream a scaled image).
@@ -493,12 +727,38 @@ impl App {
 
     fn apply_toolbar(&mut self, a: ToolbarAction, event_loop: &ActiveEventLoop) {
         match a {
+            ToolbarAction::SetLanguage(_) => {
+                self.sync_language();
+                self.save_settings();
+                if let Some(s) = &self.surface {
+                    s.window().request_redraw();
+                }
+            }
             ToolbarAction::SetMode(m) => {
-                tracing::info!(mode = m.label(), "mode changed (input mode now; stream settings on reconnect)");
-                if m == Mode::Desktop {
+                tracing::info!(mode = m.label(), "mode changed; applying active profile settings");
+                let prof = *self.settings.active();
+                if m == Mode::Desktop || !prof.relative_mouse_in_gaming {
                     self.release_pointer();
                 }
-                self.settings.save_default();
+                if let Some(s) = &mut self.surface {
+                    s.set_scale_mode(prof.scale.to_core());
+                    s.set_hud_visible(prof.show_hud);
+                    self.session_info.hud_visible = prof.show_hud;
+                    if matches!(self.state, State::Session { .. }) {
+                        let pref = self.present_override.unwrap_or(prof.present).to_core();
+                        if s.present_mode() != pref {
+                            let _ = s.set_present_mode(pref);
+                        }
+                    }
+                    s.window().request_redraw();
+                }
+                if let State::Session { handle, .. } = &self.state {
+                    handle.send(SessionCommand::SetMaxBitrate(prof.quality.bitrate_kbps()));
+                    handle.send(SessionCommand::SetAudio(prof.audio_enabled));
+                    handle.send(SessionCommand::SetMic(prof.mic_enabled));
+                    handle.send(SessionCommand::SetClipboardSync(prof.clipboard_sync));
+                }
+                self.save_settings();
             }
             ToolbarAction::SwitchDisplay(i) => {
                 if let State::Session { handle, .. } = &self.state {
@@ -509,17 +769,17 @@ impl App {
                 if let State::Session { handle, .. } = &self.state {
                     handle.send(SessionCommand::SetMaxBitrate(q.bitrate_kbps()));
                 }
-                self.settings.save_default();
+                self.save_settings();
             }
             ToolbarAction::SetFpsCap(f) => {
                 tracing::info!(fps = f.fps(), "target FPS cap updated (applies on reconnect)");
-                self.settings.save_default();
+                self.save_settings();
             }
             ToolbarAction::SetAudio(on) => {
                 if let State::Session { handle, .. } = &self.state {
                     handle.send(SessionCommand::SetAudio(on));
                 }
-                self.settings.save_default();
+                self.save_settings();
             }
             ToolbarAction::SetMic(on) => {
                 if let State::Session { handle, .. } = &self.state {
@@ -537,6 +797,14 @@ impl App {
                 if let State::Session { handle, .. } = &self.state {
                     handle.send(SessionCommand::SetPrivacyMode(enable));
                 }
+            }
+            ToolbarAction::SetHud(on) => {
+                if let Some(s) = &mut self.surface {
+                    s.set_hud_visible(on);
+                    self.session_info.hud_visible = on;
+                    s.window().request_redraw();
+                }
+                self.save_settings();
             }
             ToolbarAction::ToggleFiles => {
                 self.files.open = !self.files.open;
@@ -559,19 +827,34 @@ impl App {
             ToolbarAction::TogglePointerLock => self.toggle_pointer_lock(),
             ToolbarAction::SetPresent(p) => {
                 self.present_override = None;
-                if let Some(s) = &mut self.surface {
+                if matches!(self.state, State::Session { .. })
+                    && let Some(s) = &mut self.surface
+                {
                     let _ = s.set_present_mode(p.to_core());
                 }
+                self.save_settings();
             }
             ToolbarAction::SetScale(sc) => {
                 if let Some(s) = &mut self.surface {
                     s.set_scale_mode(sc.to_core());
                 }
-                self.settings.save_default();
+                self.save_settings();
             }
             ToolbarAction::ToggleHud => self.toggle_hud(),
             ToolbarAction::ToggleFullscreen => self.toggle_fullscreen(),
             ToolbarAction::OpenSettings => self.settings_open = true,
+            ToolbarAction::CheckForUpdates => {
+                self.check_for_updates_bg(true);
+                if let Some(s) = &self.surface {
+                    s.window().request_redraw();
+                }
+            }
+            ToolbarAction::StartUpdate => {
+                self.start_update_bg();
+                if let Some(s) = &self.surface {
+                    s.window().request_redraw();
+                }
+            }
             ToolbarAction::Disconnect => {
                 if self.launch_was_test() {
                     event_loop.exit();
@@ -594,16 +877,43 @@ impl App {
         }
     }
 
-    fn toggle_fullscreen(&mut self) {
+    fn apply_window_chrome(&self) {
         if let Some(s) = &self.surface {
             let w = s.window();
-            w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) });
+            let target_fs = self.chrome.fullscreen.then_some(Fullscreen::Borderless(None));
+            if w.fullscreen().is_some() != self.chrome.fullscreen {
+                w.set_fullscreen(target_fs);
+            }
+            if self.chrome.decorations {
+                w.set_decorations(true);
+            }
+            w.request_redraw();
+        }
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        if let Some(s) = &self.surface {
+            self.chrome.fullscreen = s.window().fullscreen().is_some();
+        }
+        if self.chrome.toggle_fullscreen(self.state.phase()) {
+            self.apply_window_chrome();
+        }
+    }
+
+    fn exit_fullscreen(&mut self) {
+        if let Some(s) = &self.surface {
+            self.chrome.fullscreen = s.window().fullscreen().is_some();
+        }
+        if self.chrome.exit_fullscreen() {
+            self.apply_window_chrome();
         }
     }
 
     /// Render one frame (or a UI-only redraw) with the UI for the current state.
     fn render(&mut self, event_loop: &ActiveEventLoop, frame: Option<&Frame>) -> Option<veloxdesk_core_traits::render::PresentStats> {
         let surface = self.surface.as_mut()?;
+        let is_fullscreen = surface.window().fullscreen().is_some();
+        self.chrome.fullscreen = is_fullscreen;
         let mut actions: Vec<UiAction> = Vec::new();
         let settings = &mut self.settings;
         let connect = &mut self.connect;
@@ -614,15 +924,18 @@ impl App {
         let terminal = &mut self.terminal;
         let tunnels = &mut self.tunnels;
         let settings_open = &mut self.settings_open;
+        let settings_path = self.viewer_opts.settings_path.as_deref();
         let info = &mut self.session_info;
         info.files_open = files.open;
         info.terminal_open = terminal.open;
         info.tunnels_open = tunnels.open;
         let state = &self.state;
         let mut ui_fn = |ui: &mut egui::Ui| {
+            let lang = settings.language;
+            let t = tr(lang);
             match state {
                 State::Connect | State::Connecting(_) => {
-                    if let Some(a) = connect.show(ui, settings) {
+                    if let Some(a) = connect.show(ui, settings, is_fullscreen) {
                         actions.push(UiAction::Connect(a));
                     }
                 }
@@ -636,22 +949,22 @@ impl App {
                             .show(ui.ctx(), |ui| {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
-                                    ui.label("Waiting for video…");
+                                    ui.label(t.waiting_for_video);
                                 });
                             });
                     }
                     if files.open {
-                        for a in files.show(ui.ctx()) {
+                        for a in files.show_for(ui.ctx(), lang) {
                             actions.push(UiAction::File(a));
                         }
                     }
                     if terminal.open {
-                        for a in terminal.show(ui.ctx()) {
+                        for a in terminal.show_for(ui.ctx(), lang) {
                             actions.push(UiAction::Terminal(a));
                         }
                     }
                     if tunnels.open {
-                        for a in tunnels.show(ui.ctx()) {
+                        for a in tunnels.show_for(ui.ctx(), lang) {
                             actions.push(UiAction::Tunnel(a));
                         }
                     }
@@ -662,31 +975,37 @@ impl App {
                         .interactable(false)
                         .show(ui.ctx(), |ui| {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "Test pattern {}x{} · Ctrl+Shift+H HUD · Esc quit",
-                                    tp.opts.width, tp.opts.height
-                                ))
-                                .color(egui::Color32::WHITE)
-                                .background_color(egui::Color32::from_black_alpha(160)),
+                                egui::RichText::new(t.fmt_test_pattern_hint(tp.opts.width, tp.opts.height))
+                                    .color(egui::Color32::WHITE)
+                                    .background_color(egui::Color32::from_black_alpha(160)),
                             );
                         });
                 }
             }
+            let cur_lang = settings.language;
             if let Some(pw) = password_prompt.as_mut()
-                && let Some(a) = pw.show(ui.ctx())
+                && let Some(a) = pw.show_for(ui.ctx(), cur_lang)
             {
                 actions.push(UiAction::Password(a));
             }
             if let Some((ap, _)) = accept_prompt.as_mut()
-                && let Some(dec) = ap.show(ui.ctx())
+                && let Some(dec) = ap.show_for(ui.ctx(), cur_lang)
             {
                 actions.push(UiAction::Accept(dec));
             }
-            for a in settings_window(ui.ctx(), settings_open, settings) {
+            for a in settings_window_full(
+                ui.ctx(),
+                settings_open,
+                settings,
+                settings_path,
+                Some(&connect.build_display),
+                Some(&connect.update_state),
+            ) {
                 actions.push(UiAction::Toolbar(a));
             }
         };
         let result = surface.render(frame, &mut ui_fn);
+        self.chrome.toolbar_expanded = self.toolbar.expanded;
         let stats = match result {
             Ok(s) => Some(s),
             Err(e) => {
@@ -727,7 +1046,7 @@ impl App {
                     self.refresh_tailscale();
                 }
                 UiAction::Connect(ConnectAction::StartTailscale) => {
-                    self.connect.tailscale.error = Some("Starting Tailscale…".into());
+                    self.connect.tailscale.error = Some(tr(self.settings.language).ts_starting.into());
                     self.start_tailscale_bg();
                     if let Some(s) = &self.surface {
                         s.window().request_redraw();
@@ -736,11 +1055,38 @@ impl App {
                 UiAction::Connect(ConnectAction::OpenUrl(url)) => {
                     tailscale::open_url(&url);
                 }
+                UiAction::Connect(ConnectAction::ExitFullscreen) => {
+                    self.exit_fullscreen();
+                }
+                UiAction::Connect(ConnectAction::SetLanguage(_)) => {
+                    self.sync_language();
+                    if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
+                }
+                UiAction::Connect(ConnectAction::StartUpdate) => {
+                    self.start_update_bg();
+                    if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
+                }
+                UiAction::Connect(ConnectAction::DismissUpdate) => {
+                    self.connect.update_dismissed = true;
+                    if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
+                }
+                UiAction::Connect(ConnectAction::CheckForUpdates) => {
+                    self.check_for_updates_bg(true);
+                    if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
+                }
                 UiAction::Toolbar(t) => self.apply_toolbar(t, event_loop),
                 UiAction::Password(PasswordAction::Submit(pw)) => {
                     self.password_prompt = None;
                     if let State::Connecting(handle) = &self.state {
-                        self.connect.status = Some("Authenticating…".into());
+                        self.connect.status = Some(tr(self.settings.language).authenticating.into());
                         handle.send(SessionCommand::SubmitPassword(pw));
                     }
                 }
@@ -816,16 +1162,17 @@ impl App {
                 self.session_info.active_gamepads = active_pads;
                 if let Some(snap) = hud.maybe_publish(Instant::now()) {
                     drop(hud);
+                    let t = tr(self.settings.language);
                     let audio_ms = shared.audio_buf_us.load(Ordering::Relaxed) as f64 / 1000.0;
                     let mut parts = Vec::new();
-                    if audio_ms > 0.0 || self.settings.audio_enabled {
-                        parts.push(format!("audio buf {audio_ms:.1} ms"));
+                    if audio_ms > 0.0 || self.settings.active().audio_enabled {
+                        parts.push(t.fmt_hud_audio_buf(audio_ms));
                     }
                     if active_pads > 0 {
-                        parts.push(format!("gamepads {active_pads}"));
+                        parts.push(t.fmt_hud_gamepads(active_pads));
                     }
                     if self.pointer_locked {
-                        parts.push("pointer locked (Ctrl+Alt+G)".into());
+                        parts.push(t.hud_pointer_locked.into());
                     }
                     if let Some(s) = &mut self.surface {
                         s.set_hud(snap);
@@ -929,7 +1276,8 @@ impl App {
                 self.session_info.active_display = cfg.active_display;
                 self.session_info.host_name = cfg.host_name.clone();
                 if let Some(s) = &self.surface {
-                    s.window().set_title(&format!("VeloxDesk — {}", cfg.host_name));
+                    s.window()
+                        .set_title(&tr(self.settings.language).fmt_window_title_host(&cfg.host_name));
                 }
                 let state = std::mem::replace(&mut self.state, State::Connect);
                 self.state = match state {
@@ -1034,34 +1382,21 @@ impl App {
                 if let Some(o) = otp {
                     self.connect.host_otp = o;
                 }
-                let label = match rendezvous {
-                    Some(rdv) => format!("Listening on :{} · Rendezvous {}", bind.port(), rdv),
-                    None => format!("Listening on :{}", bind.port()),
-                };
-                self.host_bind_label = label.clone();
-                if self.connect.active_sessions == 0 {
-                    self.connect.host_status = label;
-                }
+                self.host_listen_info = Some((bind.port(), rendezvous));
+                self.refresh_host_status_label();
             }
             EmbeddedHostEvent::SessionStarted { peer_device_id } => {
                 self.connect.active_sessions += 1;
-                let peer = if peer_device_id.is_empty() {
-                    "viewer".to_string()
-                } else {
-                    format_device_id(&peer_device_id)
-                };
-                self.connect.host_status = format!("Connected: {peer}");
+                self.host_last_peer = Some(peer_device_id);
+                self.refresh_host_status_label();
             }
             EmbeddedHostEvent::SessionEnded { peer_device_id, reason } => {
                 tracing::info!(peer = %peer_device_id, %reason, "embedded host session ended");
                 self.connect.active_sessions = self.connect.active_sessions.saturating_sub(1);
-                if self.connect.active_sessions == 0 && self.connect.host_running {
-                    self.connect.host_status = if self.host_bind_label.is_empty() {
-                        "Listening".into()
-                    } else {
-                        self.host_bind_label.clone()
-                    };
+                if self.connect.active_sessions == 0 {
+                    self.host_last_peer = None;
                 }
+                self.refresh_host_status_label();
             }
             EmbeddedHostEvent::OtpRotated { otp } => {
                 self.connect.host_otp = otp;
@@ -1078,15 +1413,86 @@ impl App {
                 self.connect.host_running = false;
                 self.connect.active_sessions = 0;
                 self.connect.host_otp.clear();
-                self.connect.host_status = "Stopped".into();
+                self.host_listen_info = None;
+                self.host_last_peer = None;
+                self.connect.host_status = tr(self.settings.language).host_stopped.into();
                 self.accept_prompt = None;
             }
             EmbeddedHostEvent::Error(e) => {
                 tracing::warn!("embedded host error: {e}");
                 self.connect.host_running = false;
-                self.connect.host_status = "Stopped".into();
+                self.host_listen_info = None;
+                self.host_last_peer = None;
+                self.connect.host_status = tr(self.settings.language).host_stopped.into();
                 self.connect.host_error = Some(e);
                 self.embedded_host = None;
+            }
+        }
+        if let Some(s) = &self.surface {
+            s.window().request_redraw();
+        }
+    }
+
+    fn handle_update_event(&mut self, ev: UpdateEvent, event_loop: &ActiveEventLoop) {
+        let t = tr(self.settings.language);
+        match ev {
+            UpdateEvent::Checked(Ok(UpdateCheckOutcome::UpToDate { .. })) => {
+                self.available_release = None;
+                self.connect.update_state = UpdateUiState::UpToDate;
+            }
+            UpdateEvent::Checked(Ok(UpdateCheckOutcome::Available(rel))) => {
+                self.connect.update_dismissed = false;
+                self.connect.update_state = UpdateUiState::Available {
+                    current: env!("CARGO_PKG_VERSION").to_string(),
+                    latest: rel.version.clone(),
+                    notes: rel.body.clone(),
+                    html_url: rel.html_url.clone(),
+                };
+                self.available_release = Some(rel);
+            }
+            UpdateEvent::Checked(Err(e)) => {
+                tracing::debug!("update check failed: {e}");
+                if self.manual_update_check {
+                    self.connect.update_dismissed = false;
+                    self.connect.update_state = UpdateUiState::Error(e);
+                } else {
+                    // Stay completely silent on background startup failure (offline / DNS / rate-limit).
+                    self.connect.update_state = UpdateUiState::Idle;
+                }
+            }
+            UpdateEvent::Progress { downloaded, total } => {
+                let frac = total.filter(|&tot| tot > 0).map(|tot| (downloaded as f32 / tot as f32).clamp(0.0, 1.0));
+                let status = if total.is_some_and(|tot| tot > 0 && downloaded >= tot) {
+                    t.update_applying.into()
+                } else {
+                    t.fmt_update_downloading_bytes(downloaded, total)
+                };
+                self.connect.update_state = UpdateUiState::Downloading { progress: frac, status };
+            }
+            UpdateEvent::ReadyToRelaunch(Ok(exe_path)) => {
+                tracing::info!(exe = %exe_path.display(), "update installed; releasing resources before relaunch");
+                // Release active session, embedded host sockets (UDP :21118 / IPC :21119), and tray icon
+                // BEFORE spawning the new instance so it binds cleanly without WSAEADDRINUSE or duplicate tray.
+                self.end_session(None);
+                self.stop_embedded_host();
+                self.tray = None;
+                match updater::spawn_relaunched_executable(&exe_path) {
+                    Ok(()) => {
+                        tracing::info!("relaunched updated executable; exiting current instance");
+                        event_loop.exit();
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to relaunch updated executable: {e:#}");
+                        self.connect.update_dismissed = false;
+                        self.connect.update_state = UpdateUiState::Error(format!("{e:#}"));
+                    }
+                }
+            }
+            UpdateEvent::ReadyToRelaunch(Err(e)) => {
+                tracing::warn!("update install failed: {e}");
+                self.connect.update_dismissed = false;
+                self.connect.update_state = UpdateUiState::Error(e);
             }
         }
         if let Some(s) = &self.surface {
@@ -1097,6 +1503,9 @@ impl App {
     fn handle_tray_action(&mut self, action: TrayAction, event_loop: &ActiveEventLoop) {
         match action {
             TrayAction::ShowWindow => {
+                if !self.state.phase().allows_fullscreen_entry() {
+                    self.exit_fullscreen();
+                }
                 if let Some(s) = &self.surface {
                     let w = s.window();
                     w.set_minimized(false);
@@ -1109,7 +1518,7 @@ impl App {
                 if !self.connect.device_id.is_empty() {
                     let formatted = format_device_id(&self.connect.device_id);
                     self.copy_to_clipboard(&formatted);
-                    self.connect.copied_notice = Some("Device ID copied".into());
+                    self.connect.copied_notice = Some(tr(self.settings.language).device_id_copied.into());
                     if let Some(s) = &self.surface {
                         s.window().request_redraw();
                     }
@@ -1142,11 +1551,15 @@ impl App {
             hud.snapshot.resolution = (v.width, v.height);
         }
         hud.snapshot.path = self.path_kind;
+        let prof = *self.settings.active();
         let pref = self.present_pref().to_core();
-        if let Some(s) = &mut self.surface
-            && s.present_mode() != pref
-        {
-            let _ = s.set_present_mode(pref);
+        self.session_info.hud_visible = prof.show_hud;
+        if let Some(s) = &mut self.surface {
+            s.set_scale_mode(prof.scale.to_core());
+            s.set_hud_visible(prof.show_hud);
+            if s.present_mode() != pref {
+                let _ = s.set_present_mode(pref);
+            }
         }
     }
 
@@ -1158,21 +1571,18 @@ impl App {
             self.toggle_pointer_lock();
             return;
         }
+        if down && is_fullscreen_shortcut(code, self.modifiers) {
+            self.toggle_fullscreen();
+            return;
+        }
         if down && self.modifiers.control_key() && self.modifiers.shift_key() {
             if is_toggle_shortcut(code, self.modifiers) {
                 self.toggle_hud();
                 return;
             }
-            match code {
-                KeyCode::KeyL => {
-                    self.toggle_pointer_lock();
-                    return;
-                }
-                KeyCode::KeyF => {
-                    self.toggle_fullscreen();
-                    return;
-                }
-                _ => {}
+            if code == KeyCode::KeyL {
+                self.toggle_pointer_lock();
+                return;
             }
         }
         match &self.state {
@@ -1267,15 +1677,17 @@ impl ApplicationHandler<UserEvent> for App {
         } else {
             self.present_pref().to_core()
         };
+        let prof = *self.settings.active();
         let opts = SurfaceOptions {
             present_mode: initial_present,
-            scale_mode: self.settings.scale.to_core(),
+            scale_mode: prof.scale.to_core(),
             backends: None,
         };
         match VideoSurface::new(window, opts) {
             Ok(mut s) => {
-                s.set_hud_visible(self.settings.show_hud);
-                self.session_info.hud_visible = self.settings.show_hud;
+                s.set_hud_visible(prof.show_hud);
+                s.set_hud_labels(hud_labels_for(self.settings.language));
+                self.session_info.hud_visible = prof.show_hud;
                 let info = s.adapter_info();
                 tracing::info!(adapter = %info.name, backend = ?info.backend, present = ?s.present_mode(), "renderer ready");
                 self.surface = Some(s);
@@ -1289,17 +1701,20 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match launch {
             Launch::Gui => {
+                updater::cleanup_old_executable();
+                let t = tr(self.settings.language);
                 let tooltip = if self.connect.device_id.is_empty() {
-                    "VeloxDesk".to_string()
+                    t.app_title.to_string()
                 } else {
-                    format!("VeloxDesk — ID {}", format_device_id(&self.connect.device_id))
+                    t.fmt_tray_tooltip_id(&format_device_id(&self.connect.device_id))
                 };
-                self.tray = TrayHandle::spawn(tooltip, self.proxy.clone());
+                self.tray = TrayHandle::spawn(tooltip, self.proxy.clone(), self.lang_atomic.clone());
                 #[cfg(feature = "net")]
                 self.start_embedded_host();
                 self.refresh_tailscale();
+                self.check_for_updates_bg(false);
             }
-            Launch::Connect(addr) => match parse_target(&addr) {
+            Launch::Connect(addr) => match parse_target_i18n(&addr, self.settings.language) {
                 Ok(target) => self.start_connect(addr, target),
                 Err(e) => self.connect.error = Some(e),
             },
@@ -1324,6 +1739,7 @@ impl ApplicationHandler<UserEvent> for App {
                     s.window().request_redraw();
                 }
             }
+            UserEvent::Update(ev) => self.handle_update_event(ev, event_loop),
         }
     }
 
@@ -1430,6 +1846,9 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.release_all_keys();
+        self.release_pointer();
+        self.chrome.end_session();
+        self.toolbar.expanded = false;
         self.accept_prompt = None;
         self.stop_embedded_host();
         self.tray = None;
@@ -1446,5 +1865,111 @@ impl ApplicationHandler<UserEvent> for App {
             );
         }
         self.state = State::Connect;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_defaults_windowed_and_decorated() {
+        let chrome = WindowChromeState::default();
+        assert!(!chrome.fullscreen);
+        assert!(chrome.decorations);
+        assert!(!chrome.pointer_locked);
+        assert!(!chrome.toolbar_expanded);
+    }
+
+    #[test]
+    fn ctrl_shift_f_entry_restricted_to_active_session_or_test_pattern() {
+        let mut chrome = WindowChromeState::default();
+        assert!(!chrome.toggle_fullscreen(AppPhase::Connect));
+        assert!(!chrome.fullscreen);
+        assert!(chrome.decorations);
+
+        assert!(!chrome.toggle_fullscreen(AppPhase::Connecting));
+        assert!(!chrome.fullscreen);
+        assert!(chrome.decorations);
+
+        assert!(chrome.toggle_fullscreen(AppPhase::Session));
+        assert!(chrome.fullscreen);
+        assert!(chrome.toggle_fullscreen(AppPhase::Session));
+        assert!(!chrome.fullscreen);
+        assert!(chrome.decorations);
+
+        assert!(chrome.toggle_fullscreen(AppPhase::TestPattern));
+        assert!(chrome.fullscreen);
+    }
+
+    #[test]
+    fn exit_fullscreen_always_allowed_in_all_phases() {
+        for phase in [
+            AppPhase::Connect,
+            AppPhase::Connecting,
+            AppPhase::Session,
+            AppPhase::TestPattern,
+        ] {
+            let mut chrome = WindowChromeState {
+                fullscreen: true,
+                decorations: false,
+                pointer_locked: true,
+                toolbar_expanded: true,
+            };
+            assert!(chrome.toggle_fullscreen(phase));
+            assert!(!chrome.fullscreen);
+            assert!(chrome.decorations);
+        }
+
+        let mut chrome = WindowChromeState {
+            fullscreen: true,
+            decorations: false,
+            pointer_locked: false,
+            toolbar_expanded: false,
+        };
+        assert!(chrome.exit_fullscreen());
+        assert!(!chrome.fullscreen);
+        assert!(chrome.decorations);
+        // Second call when already windowed and decorated is a no-op.
+        assert!(!chrome.exit_fullscreen());
+    }
+
+    #[test]
+    fn end_session_restores_window_chrome_for_all_disconnect_paths() {
+        // Covers: ToolbarAction::Disconnect, SessionEvent::Closed, PasswordAction::Cancel,
+        // State::TestPattern Escape, and App::exiting cleanup.
+        for _trigger in [
+            "toolbar_disconnect",
+            "session_closed",
+            "password_cancel",
+            "test_pattern_escape",
+            "window_close_exiting",
+        ] {
+            let mut chrome = WindowChromeState {
+                fullscreen: true,
+                decorations: false,
+                pointer_locked: true,
+                toolbar_expanded: true,
+            };
+            chrome.end_session();
+            assert!(!chrome.fullscreen);
+            assert!(chrome.decorations);
+            assert!(!chrome.pointer_locked);
+            assert!(!chrome.toolbar_expanded);
+        }
+    }
+
+    #[test]
+    fn fullscreen_shortcut_matches_only_ctrl_shift_f() {
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        let ctrl_shift_alt = ctrl_shift | ModifiersState::ALT;
+
+        assert!(is_fullscreen_shortcut(KeyCode::KeyF, ctrl_shift));
+        assert!(!is_fullscreen_shortcut(KeyCode::KeyF, ctrl_shift_alt));
+        assert!(!is_fullscreen_shortcut(KeyCode::KeyF, ModifiersState::CONTROL));
+        assert!(!is_fullscreen_shortcut(KeyCode::KeyF, ModifiersState::SHIFT));
+        assert!(!is_fullscreen_shortcut(KeyCode::KeyF, ModifiersState::empty()));
+        assert!(!is_fullscreen_shortcut(KeyCode::F11, ModifiersState::empty()));
+        assert!(!is_fullscreen_shortcut(KeyCode::F11, ctrl_shift));
     }
 }

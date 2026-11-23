@@ -113,6 +113,14 @@ pub struct ConnectOptions {
     pub yuv444: bool,
     pub viewer_size: (u32, u32),
     pub viewer_refresh_hz: u32,
+    pub language: Arc<AtomicU8>,
+}
+
+impl ConnectOptions {
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub fn lang(&self) -> veloxdesk_ui::Language {
+        veloxdesk_ui::Language::from_u8(self.language.load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 pub struct SessionHandle {
