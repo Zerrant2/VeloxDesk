@@ -68,6 +68,8 @@ struct JniSessionCallbacks {
     m_on_rumble: CachedMethodId,
     m_on_cursor_shape: CachedMethodId,
     m_on_cursor_position: CachedMethodId,
+    m_on_chat_message: CachedMethodId,
+    m_on_chat_ack: CachedMethodId,
     m_on_closed: CachedMethodId,
 }
 
@@ -101,6 +103,12 @@ impl JniSessionCallbacks {
             CachedMethodId(env.get_method_id(&cls, "onCursorShape", "(JIIII[B)V")?);
         let m_on_cursor_position =
             CachedMethodId(env.get_method_id(&cls, "onCursorPosition", "(IIZJ)V")?);
+        let m_on_chat_message = CachedMethodId(env.get_method_id(
+            &cls,
+            "onChatMessage",
+            "(JLjava/lang/String;Ljava/lang/String;J)V",
+        )?);
+        let m_on_chat_ack = CachedMethodId(env.get_method_id(&cls, "onChatAck", "(J)V")?);
         let m_on_closed =
             CachedMethodId(env.get_method_id(&cls, "onClosed", "(Ljava/lang/String;Z)V")?);
 
@@ -118,6 +126,8 @@ impl JniSessionCallbacks {
             m_on_rumble,
             m_on_cursor_shape,
             m_on_cursor_position,
+            m_on_chat_message,
+            m_on_chat_ack,
             m_on_closed,
         })
     }
@@ -421,6 +431,48 @@ impl SessionCallbacks for JniSessionCallbacks {
                 env.call_method_unchecked(
                     &self.callback_obj,
                     self.m_on_cursor_position.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            Ok(())
+        });
+    }
+
+    fn on_chat_message(&self, id: u64, sender_name: &str, text: &str, ts_ms: u64) {
+        self.with_env("onChatMessage", |env| {
+            let j_sender = env.new_string(sender_name)?;
+            let j_text = env.new_string(text)?;
+            let args = [
+                JValue::Long(id as jlong).as_jni(),
+                JValue::Object(&j_sender).as_jni(),
+                JValue::Object(&j_text).as_jni(),
+                JValue::Long(ts_ms as jlong).as_jni(),
+            ];
+            // SAFETY: method ID and signature `(JLjava/lang/String;Ljava/lang/String;J)V` match.
+            let call_res = unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_chat_message.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )
+            };
+            let _ = env.delete_local_ref(j_sender);
+            let _ = env.delete_local_ref(j_text);
+            call_res?;
+            Ok(())
+        });
+    }
+
+    fn on_chat_ack(&self, id: u64) {
+        self.with_env("onChatAck", |env| {
+            let args = [JValue::Long(id as jlong).as_jni()];
+            // SAFETY: method ID and signature `(J)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_chat_ack.0,
                     ReturnType::Primitive(Primitive::Void),
                     &args,
                 )?;
@@ -927,6 +979,24 @@ pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeSendClipboard
     }));
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeSendChat<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    sender_name: JString<'local>,
+    text: JString<'local>,
+) -> jlong {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = handle_id_from_jlong(handle) else { return 0 };
+        let Some(h) = handles().get(id) else { return 0 };
+        let sender = jstring_to_rust(&mut env, &sender_name).unwrap_or_default();
+        let Some(body) = jstring_to_rust(&mut env, &text) else { return 0 };
+        h.send_chat(sender, body) as jlong
+    }))
+    .unwrap_or(0)
+}
+
 // ───────────────────────── Android Host JNI Callbacks ─────────────────────────
 
 struct JniHostCallbacks {
@@ -942,6 +1012,8 @@ struct JniHostCallbacks {
     m_on_keyframe_requested: CachedMethodId,
     m_on_input_event: CachedMethodId,
     m_on_clipboard_text: CachedMethodId,
+    m_on_chat_message: CachedMethodId,
+    m_on_chat_ack: CachedMethodId,
     m_on_error: CachedMethodId,
     m_on_stopped: CachedMethodId,
 }
@@ -985,6 +1057,16 @@ impl JniHostCallbacks {
         )?);
         let m_on_clipboard_text =
             CachedMethodId(env.get_method_id(&cls, "onHostClipboardText", "(Ljava/lang/String;)V")?);
+        let m_on_chat_message = CachedMethodId(env.get_method_id(
+            &cls,
+            "onHostChatMessage",
+            "(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;J)V",
+        )?);
+        let m_on_chat_ack = CachedMethodId(env.get_method_id(
+            &cls,
+            "onHostChatAck",
+            "(Ljava/lang/String;J)V",
+        )?);
         let m_on_error = CachedMethodId(env.get_method_id(&cls, "onHostError", "(Ljava/lang/String;)V")?);
         let m_on_stopped = CachedMethodId(env.get_method_id(&cls, "onHostStopped", "()V")?);
 
@@ -1001,6 +1083,8 @@ impl JniHostCallbacks {
             m_on_keyframe_requested,
             m_on_input_event,
             m_on_clipboard_text,
+            m_on_chat_message,
+            m_on_chat_ack,
             m_on_error,
             m_on_stopped,
         })
@@ -1258,6 +1342,57 @@ impl HostCallbacks for JniHostCallbacks {
                 )?;
             }
             let _ = env.delete_local_ref(j_text);
+            Ok(())
+        });
+    }
+
+    fn on_chat_message(&self, peer_device_id: &str, id: u64, sender_name: &str, text: &str, ts_ms: u64) {
+        self.with_env("onHostChatMessage", |env| {
+            let j_peer = env.new_string(peer_device_id)?;
+            let j_sender = env.new_string(sender_name)?;
+            let j_text = env.new_string(text)?;
+            let args = [
+                JValue::Object(&j_peer).as_jni(),
+                JValue::Long(id as jlong).as_jni(),
+                JValue::Object(&j_sender).as_jni(),
+                JValue::Object(&j_text).as_jni(),
+                JValue::Long(ts_ms as jlong).as_jni(),
+            ];
+            // SAFETY: method ID and signature `(Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;J)V` match.
+            let call_res = unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_chat_message.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )
+            };
+            let _ = env.delete_local_ref(j_peer);
+            let _ = env.delete_local_ref(j_sender);
+            let _ = env.delete_local_ref(j_text);
+            call_res?;
+            Ok(())
+        });
+    }
+
+    fn on_chat_ack(&self, peer_device_id: &str, id: u64) {
+        self.with_env("onHostChatAck", |env| {
+            let j_peer = env.new_string(peer_device_id)?;
+            let args = [
+                JValue::Object(&j_peer).as_jni(),
+                JValue::Long(id as jlong).as_jni(),
+            ];
+            // SAFETY: method ID and signature `(Ljava/lang/String;J)V` match.
+            let call_res = unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_chat_ack.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )
+            };
+            let _ = env.delete_local_ref(j_peer);
+            call_res?;
             Ok(())
         });
     }
@@ -1595,4 +1730,22 @@ pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostSendClipb
         let Some(s) = jstring_to_rust(&mut env, &text) else { return };
         h.send_clipboard_text(s);
     }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostSendChat<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    sender_name: JString<'local>,
+    text: JString<'local>,
+) -> jlong {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = handle_id_from_jlong(handle) else { return 0 };
+        let Some(h) = host_handles().get(id) else { return 0 };
+        let sender = jstring_to_rust(&mut env, &sender_name).unwrap_or_default();
+        let Some(body) = jstring_to_rust(&mut env, &text) else { return 0 };
+        h.send_chat(sender, body) as jlong
+    }))
+    .unwrap_or(0)
 }

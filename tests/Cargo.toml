@@ -10,9 +10,9 @@ publish = false
 [features]
 default = ["full"]
 # Tests needing the M1 transport (QUIC + FEC) API.
-net = ["dep:veloxdesk-transport", "dep:veloxdesk-crypto"]
+net = []
 # Host↔viewer session smoke test (needs transport + service + codec).
-full = ["net", "dep:veloxdesk-codec"]
+full = ["net"]
 
 [dependencies]
 anyhow.workspace = true
@@ -21,9 +21,6 @@ prost.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "time", "sync", "macros"] }
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
-veloxdesk-transport = { workspace = true, optional = true }
-veloxdesk-crypto = { workspace = true, optional = true }
-veloxdesk-codec = { workspace = true, optional = true }
 
 [dev-dependencies]
 egui = { workspace = true }
@@ -31,6 +28,8 @@ serde_json = "1"
 veloxdesk-benches = { path = "../benches" }
 veloxdesk-audio = { workspace = true }
 veloxdesk-clipboard = { workspace = true }
+veloxdesk-codec = { workspace = true }
+veloxdesk-crypto = { workspace = true }
 veloxdesk-file-transfer = { workspace = true }
 veloxdesk-recorder = { workspace = true }
 veloxdesk-render = { workspace = true }
@@ -38,6 +37,7 @@ veloxdesk-server-rendezvous = { workspace = true }
 veloxdesk-server-relay = { workspace = true }
 veloxdesk-service = { workspace = true }
 veloxdesk-terminal = { workspace = true }
+veloxdesk-transport = { workspace = true }
 veloxdesk-tunnel = { workspace = true }
 veloxdesk-ui = { workspace = true }
 veloxdesk-virtual-display = { workspace = true }
@@ -71,6 +71,10 @@ required-features = ["full"]
 
 [[test]]
 name = "v030_host_security"
+required-features = ["full"]
+
+[[test]]
+name = "v050_polish"
 required-features = ["full"]
 
 [lints]

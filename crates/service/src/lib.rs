@@ -17,6 +17,7 @@ pub mod host;
 pub mod inject;
 pub mod ipc;
 pub mod latest;
+pub mod power;
 pub mod session;
 pub mod stream;
 pub mod video;
@@ -36,4 +37,5 @@ pub use host::{
     run_host_with_backends, serve_p2p_until, serve_until,
 };
 pub use ipc::{DEFAULT_IPC_PORT, IpcClient, IpcHandler, IpcRequest, IpcResponse, IpcServer};
-pub use session::{SessionSummary, run_session, run_session_until};
+pub use power::{PowerExecutor, RecordedPowerAction, SimulatedPowerExecutor, SystemPowerExecutor};
+pub use session::{SessionHooks, SessionSummary, run_session, run_session_until, run_session_with_hooks};

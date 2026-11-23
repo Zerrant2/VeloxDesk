@@ -2,16 +2,17 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use veloxdesk_core_traits::Timestamp;
 use veloxdesk_core_traits::metrics::{HudSnapshot, LatencySamples};
 use veloxdesk_core_traits::render::VideoRenderer;
 use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
-use veloxdesk_protocol::control::{SessionConfig, VideoCodec};
+use veloxdesk_protocol::control::{SessionConfig, SystemPowerAction, VideoCodec};
 use veloxdesk_render::hud::{HudLabels, hud_line, is_toggle_shortcut};
 use veloxdesk_render::pattern::nv12_test_frame;
 use veloxdesk_render::winit::application::ApplicationHandler;
@@ -21,10 +22,11 @@ use veloxdesk_render::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use veloxdesk_render::{RenderBreakdown, SurfaceOptions, VideoSurface, egui};
 use veloxdesk_ui::{
-    AcceptDecision, AcceptPrompt, ConnectAction, ConnectScreen, ConnectTarget, FileAction, FileManagerWindow, Language,
-    Mode, PasswordAction, PasswordMode, PasswordPrompt, Present, SessionInfo, SessionToolbar, Settings, TailscaleInfo,
-    TerminalAction, TerminalWindow, ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, UpdateUiState,
-    format_device_id, parse_rendezvous_addr_i18n, parse_target_i18n, settings_window_with_security, tr,
+    AcceptDecision, AcceptPrompt, ChatAction, ChatWindow, ConnectAction, ConnectScreen, ConnectTarget, FileAction,
+    FileManagerWindow, Language, Mode, PasswordAction, PasswordMode, PasswordPrompt, Present, ReconnectAction,
+    ReconnectBannerState, ReconnectOverlay, SessionInfo, SessionToolbar, Settings, TailscaleInfo, TerminalAction,
+    TerminalWindow, ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, UpdateUiState, format_device_id,
+    parse_rendezvous_addr_i18n, parse_target_i18n, settings_window_with_security, tr,
 };
 
 use crate::embedded_host::{self, EmbeddedHostAuthOpts, EmbeddedHostEvent, EmbeddedHostHandle};
@@ -223,6 +225,105 @@ pub struct ViewerCliOpts {
     pub settings_path: Option<std::path::PathBuf>,
 }
 
+const AUTO_RECONNECT_MAX_SECS: u64 = 300;
+
+fn local_sender_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "VeloxDesk".into())
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// Preserved connection parameters for automatic reconnect after a remote reboot (v0.5.0).
+#[derive(Debug, Clone)]
+struct SavedConnectParams {
+    address: String,
+    target: ConnectTarget,
+    rendezvous: Option<SocketAddr>,
+    relay_only: bool,
+    password: Option<String>,
+    tunnels: Vec<TunnelSpec>,
+}
+
+/// Exponential backoff schedule (`2s, 4s, 8s, 15s` cap) for auto-reconnect.
+fn auto_reconnect_backoff(attempt: u32) -> Duration {
+    match attempt {
+        0 | 1 => Duration::from_secs(2),
+        2 => Duration::from_secs(4),
+        3 => Duration::from_secs(8),
+        _ => Duration::from_secs(15),
+    }
+}
+
+/// Pure state machine driving auto-reconnect retries after a remote host reboot.
+#[derive(Debug, Clone)]
+struct AutoReconnectController {
+    saved: SavedConnectParams,
+    started_at: Instant,
+    max_duration: Duration,
+    attempt: u32,
+    next_attempt_at: Instant,
+    in_flight: bool,
+    last_error: Option<String>,
+}
+
+impl AutoReconnectController {
+    fn arm(saved: SavedConnectParams, now: Instant) -> Self {
+        let initial_delay = auto_reconnect_backoff(1);
+        Self {
+            saved,
+            started_at: now,
+            max_duration: Duration::from_secs(AUTO_RECONNECT_MAX_SECS),
+            attempt: 1,
+            next_attempt_at: now + initial_delay,
+            in_flight: false,
+            last_error: None,
+        }
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= self.max_duration
+    }
+
+    fn should_retry_now(&self, now: Instant) -> bool {
+        !self.in_flight && now >= self.next_attempt_at && !self.is_expired(now)
+    }
+
+    fn mark_attempt_started(&mut self) {
+        self.in_flight = true;
+    }
+
+    fn on_attempt_failed(&mut self, err: String, now: Instant) {
+        self.in_flight = false;
+        self.last_error = Some(err);
+        self.attempt = self.attempt.saturating_add(1);
+        self.next_attempt_at = now + auto_reconnect_backoff(self.attempt);
+    }
+
+    fn banner_state(&self, now: Instant) -> ReconnectBannerState {
+        let elapsed_secs = now.saturating_duration_since(self.started_at).as_secs();
+        let next_retry_secs = if self.in_flight {
+            0
+        } else {
+            self.next_attempt_at.saturating_duration_since(now).as_secs()
+        };
+        ReconnectBannerState {
+            active: true,
+            target: self.saved.address.clone(),
+            attempt: self.attempt,
+            elapsed_secs,
+            max_secs: self.max_duration.as_secs(),
+            next_retry_secs,
+            last_error: self.last_error.clone(),
+        }
+    }
+}
+
 /// UI actions collected during the egui pass and applied afterwards.
 enum UiAction {
     Connect(ConnectAction),
@@ -232,6 +333,9 @@ enum UiAction {
     File(FileAction),
     Terminal(TerminalAction),
     Tunnel(TunnelAction),
+    ViewerChat(ChatAction),
+    HostChat(ChatAction),
+    Reconnect(ReconnectAction),
 }
 
 pub struct App {
@@ -258,6 +362,12 @@ pub struct App {
     files: FileManagerWindow,
     terminal: TerminalWindow,
     tunnels: TunnelsWindow,
+    viewer_chat: ChatWindow,
+    host_chat: ChatWindow,
+    next_chat_id: u64,
+    last_connect: Option<SavedConnectParams>,
+    auto_reconnect_armed: bool,
+    reconnect: Option<AutoReconnectController>,
     settings_open: bool,
     modifiers: ModifiersState,
     pressed: HashSet<KeyCode>,
@@ -320,6 +430,12 @@ impl App {
             files: FileManagerWindow::default(),
             terminal: TerminalWindow::default(),
             tunnels: TunnelsWindow::default(),
+            viewer_chat: ChatWindow::new("veloxdesk-viewer-chat", false),
+            host_chat: ChatWindow::new("veloxdesk-host-chat", true),
+            next_chat_id: 1,
+            last_connect: None,
+            auto_reconnect_armed: false,
+            reconnect: None,
             settings_open: false,
             modifiers: ModifiersState::empty(),
             pressed: HashSet::new(),
@@ -373,10 +489,14 @@ impl App {
 
     fn session_ui_active(&self) -> bool {
         self.toolbar.expanded
+            || self.toolbar.power_confirm.is_some()
             || self.settings_open
             || self.files.open
             || self.terminal.open
             || self.tunnels.open
+            || self.viewer_chat.open
+            || self.host_chat.open
+            || self.reconnect.is_some()
             || self.password_prompt.is_some()
             || self.accept_prompt.is_some()
             || matches!(self.state, State::Session { got_frame: false, .. })
@@ -505,6 +625,7 @@ impl App {
             permanent_password_hash: self.settings.permanent_password_hash.clone(),
             trusted_peers: self.settings.trusted_peers.clone(),
             require_accept: self.settings.require_accept,
+            echo_cancellation: self.settings.effective_echo_cancellation(),
         };
         match EmbeddedHostHandle::start(
             rendezvous,
@@ -605,8 +726,24 @@ impl App {
             }
             return;
         }
+        self.reconnect = None;
+        self.auto_reconnect_armed = false;
         self.settings.push_recent(&address);
         self.save_settings();
+        let saved = SavedConnectParams {
+            address,
+            target,
+            rendezvous,
+            relay_only: self.viewer_opts.relay_only,
+            password: self.viewer_opts.password.clone(),
+            tunnels: self.viewer_opts.tunnels.clone(),
+        };
+        self.last_connect = Some(saved.clone());
+        self.connect_with_params(saved);
+    }
+
+    fn connect_with_params(&mut self, saved: SavedConnectParams) {
+        let t = tr(self.settings.language);
         let (vw, vh, monitor_hz) = self
             .surface
             .as_ref()
@@ -617,23 +754,24 @@ impl App {
         let hz = prof.fps_cap.fps().max(monitor_hz.min(prof.fps_cap.fps()));
         let prefer_gpu_decode = prof.prefer_hw_decode
             && self.surface.as_ref().is_some_and(|s| !s.caps().zero_copy_import.is_empty());
-        let label = match &target {
+        let label = match &saved.target {
             ConnectTarget::Direct(a) => a.to_string(),
             ConnectTarget::DeviceId(id) => format_device_id(id),
         };
         let opts = ConnectOptions {
-            target,
-            rendezvous,
-            relay_only: self.viewer_opts.relay_only,
-            password: self.viewer_opts.password.clone(),
+            target: saved.target,
+            rendezvous: saved.rendezvous,
+            relay_only: saved.relay_only,
+            password: saved.password,
             mode: self.settings.mode.to_wire(),
             max_bitrate_kbps: prof.quality.bitrate_kbps(),
             prefer_hw_decode: prof.prefer_hw_decode,
             prefer_gpu_decode,
             audio_enabled: prof.audio_enabled,
             mic_enabled: prof.mic_enabled,
+            echo_cancellation: self.settings.effective_echo_cancellation(),
             clipboard_sync: prof.clipboard_sync,
-            initial_tunnels: self.viewer_opts.tunnels.clone(),
+            initial_tunnels: saved.tunnels,
             hdr_10bit: prof.hdr_10bit,
             yuv444: prof.yuv444,
             viewer_size: (vw, vh),
@@ -642,6 +780,9 @@ impl App {
         };
         self.password_prompt = None;
         self.path_kind = PathKind::Unknown;
+        self.session_info.allow_chat = true;
+        self.session_info.allow_power = false;
+        self.viewer_chat.allow_chat = true;
         match crate::viewer::connect(opts, self.proxy.clone()) {
             Ok(h) => {
                 self.connect.error = None;
@@ -649,7 +790,11 @@ impl App {
                 self.state = State::Connecting(h);
             }
             Err(e) => {
-                self.connect.error = Some(format!("{e:#}"));
+                if let Some(rc) = self.reconnect.as_mut() {
+                    rc.on_attempt_failed(format!("{e:#}"), Instant::now());
+                } else {
+                    self.connect.error = Some(format!("{e:#}"));
+                }
             }
         }
         if let Some(s) = &self.surface {
@@ -663,6 +808,7 @@ impl App {
         self.pending_abs_move = None;
         self.chrome.end_session();
         self.toolbar.expanded = self.chrome.toolbar_expanded;
+        self.toolbar.power_confirm = None;
         self.state = State::Connect;
         self.connect.status = None;
         self.connect.error = reason;
@@ -673,11 +819,24 @@ impl App {
         self.terminal.connected = false;
         self.tunnels.open = false;
         self.tunnels.active.clear();
+        self.viewer_chat.set_open(false);
+        self.viewer_chat.clear();
         self.session_info.host_os.clear();
         self.session_info.privacy_mode = false;
         self.session_info.files_open = false;
         self.session_info.terminal_open = false;
         self.session_info.tunnels_open = false;
+        self.session_info.chat_open = false;
+        self.session_info.chat_unread = 0;
+        self.session_info.allow_chat = true;
+        self.session_info.allow_power = false;
+        self.session_info.recording_active = false;
+        self.session_info.recording_waiting_keyframe = false;
+        self.session_info.recording_elapsed_ms = 0;
+        self.session_info.recording_bytes = 0;
+        if self.reconnect.is_none() {
+            self.auto_reconnect_armed = false;
+        }
         self.cursor_image = None;
         if let Some(s) = &mut self.surface {
             s.set_cursor(None, 0, 0, false);
@@ -806,6 +965,7 @@ impl App {
             }
             ToolbarAction::SetMode(m) => {
                 tracing::info!(mode = m.label(), "mode changed; applying active profile settings");
+                self.settings.set_mode(m);
                 let prof = *self.settings.active();
                 if m == Mode::Desktop || !prof.relative_mouse_in_gaming {
                     self.release_pointer();
@@ -826,6 +986,7 @@ impl App {
                     handle.send(SessionCommand::SetMaxBitrate(prof.quality.bitrate_kbps()));
                     handle.send(SessionCommand::SetAudio(prof.audio_enabled));
                     handle.send(SessionCommand::SetMic(prof.mic_enabled));
+                    handle.send(SessionCommand::SetEchoCancellation(self.settings.effective_echo_cancellation()));
                     handle.send(SessionCommand::SetClipboardSync(prof.clipboard_sync));
                 }
                 self.save_settings();
@@ -854,6 +1015,13 @@ impl App {
             ToolbarAction::SetMic(on) => {
                 if let State::Session { handle, .. } = &self.state {
                     handle.send(SessionCommand::SetMic(on));
+                }
+                self.save_settings();
+            }
+            ToolbarAction::SetEchoCancellation(on) => {
+                self.settings.echo_cancellation = on;
+                if let State::Session { handle, .. } = &self.state {
+                    handle.send(SessionCommand::SetEchoCancellation(self.settings.effective_echo_cancellation()));
                 }
                 self.save_settings();
             }
@@ -893,6 +1061,41 @@ impl App {
             ToolbarAction::ToggleTunnels => {
                 self.tunnels.open = !self.tunnels.open;
                 self.session_info.tunnels_open = self.tunnels.open;
+            }
+            ToolbarAction::ToggleChat => {
+                let next = !self.viewer_chat.open;
+                self.viewer_chat.set_open(next);
+                self.session_info.chat_open = self.viewer_chat.open;
+                self.session_info.chat_unread = self.viewer_chat.unread;
+            }
+            ToolbarAction::ToggleRecording => {
+                if let State::Session { handle, .. } = &self.state {
+                    let active = handle.shared.recording.lock().active;
+                    if active {
+                        handle.send(SessionCommand::StopRecording);
+                    } else {
+                        let dir = if self.settings.recordings_dir.trim().is_empty() {
+                            veloxdesk_recorder::default_recordings_dir()
+                        } else {
+                            PathBuf::from(self.settings.recordings_dir.trim())
+                        };
+                        let peer_label = if !self.session_info.host_name.trim().is_empty() {
+                            self.session_info.host_name.clone()
+                        } else {
+                            self.last_connect
+                                .as_ref()
+                                .map(|s| s.address.clone())
+                                .unwrap_or_else(|| "session".into())
+                        };
+                        let output_path = veloxdesk_recorder::generate_recording_path(&dir, &peer_label);
+                        handle.send(SessionCommand::StartRecording { output_path });
+                    }
+                }
+            }
+            ToolbarAction::SystemPower(action) => {
+                if let State::Session { handle, .. } = &self.state {
+                    handle.send(SessionCommand::SystemPower(action));
+                }
             }
             ToolbarAction::TogglePointerLock => self.toggle_pointer_lock(),
             ToolbarAction::SetPresent(p) => {
@@ -995,6 +1198,8 @@ impl App {
                 }
             }
             ToolbarAction::Disconnect => {
+                self.auto_reconnect_armed = false;
+                self.reconnect = None;
                 if self.launch_was_test() {
                     event_loop.exit();
                 }
@@ -1064,13 +1269,27 @@ impl App {
         let files = &mut self.files;
         let terminal = &mut self.terminal;
         let tunnels = &mut self.tunnels;
+        let viewer_chat = &mut self.viewer_chat;
+        let host_chat = &mut self.host_chat;
         let settings_open = &mut self.settings_open;
         let settings_path = self.viewer_opts.settings_path.as_deref();
         let pw_status = self.pw_status.as_deref();
+        let reconnect_banner = self.reconnect.as_ref().map(|rc| rc.banner_state(Instant::now()));
         let info = &mut self.session_info;
         info.files_open = files.open;
         info.terminal_open = terminal.open;
         info.tunnels_open = tunnels.open;
+        info.chat_open = viewer_chat.open;
+        info.chat_unread = viewer_chat.unread;
+        connect.host_chat_open = host_chat.open;
+        connect.host_chat_unread = host_chat.unread;
+        if let State::Session { handle, .. } = &self.state {
+            let rstats = handle.shared.recording.lock();
+            info.recording_active = rstats.active;
+            info.recording_waiting_keyframe = rstats.waiting_for_keyframe;
+            info.recording_elapsed_ms = rstats.elapsed_ms;
+            info.recording_bytes = rstats.bytes_written;
+        }
         let state = &self.state;
         let mut ui_fn = |ui: &mut egui::Ui| {
             let lang = settings.language;
@@ -1112,6 +1331,11 @@ impl App {
                             actions.push(UiAction::Tunnel(a));
                         }
                     }
+                    if viewer_chat.open {
+                        for a in viewer_chat.show_for(ui.ctx(), lang) {
+                            actions.push(UiAction::ViewerChat(a));
+                        }
+                    }
                 }
                 State::TestPattern(tp) => {
                     egui::Area::new(egui::Id::unique("veloxdesk-tp"))
@@ -1127,6 +1351,16 @@ impl App {
                 }
             }
             let cur_lang = settings.language;
+            if host_chat.open {
+                for a in host_chat.show_for(ui.ctx(), cur_lang) {
+                    actions.push(UiAction::HostChat(a));
+                }
+            }
+            if let Some(banner) = &reconnect_banner
+                && let Some(a) = ReconnectOverlay::show_for(ui.ctx(), banner, cur_lang)
+            {
+                actions.push(UiAction::Reconnect(a));
+            }
             if let Some(pw) = password_prompt.as_mut()
                 && let Some(a) = pw.show_for(ui.ctx(), cur_lang)
             {
@@ -1236,9 +1470,19 @@ impl App {
                         s.window().request_redraw();
                     }
                 }
+                UiAction::Connect(ConnectAction::ToggleHostChat) => {
+                    let next = !self.host_chat.open;
+                    self.host_chat.set_open(next);
+                    self.connect.host_chat_open = self.host_chat.open;
+                    self.connect.host_chat_unread = self.host_chat.unread;
+                    self.request_redraw();
+                }
                 UiAction::Toolbar(t) => self.apply_toolbar(t, event_loop),
                 UiAction::Password(PasswordAction::Submit(pw)) => {
                     self.password_prompt = None;
+                    if let Some(saved) = self.last_connect.as_mut() {
+                        saved.password = Some(pw.clone());
+                    }
                     if let State::Connecting(handle) = &self.state {
                         self.connect.status = Some(tr(self.settings.language).authenticating.into());
                         handle.send(SessionCommand::SubmitPassword(pw));
@@ -1246,6 +1490,8 @@ impl App {
                 }
                 UiAction::Password(PasswordAction::Cancel) => {
                     self.password_prompt = None;
+                    self.auto_reconnect_armed = false;
+                    self.reconnect = None;
                     if let State::Connecting(handle) = &self.state {
                         handle.send(SessionCommand::CancelAuth);
                     }
@@ -1276,6 +1522,28 @@ impl App {
                         self.tunnels.error = None;
                         handle.send(SessionCommand::Tunnel(ta));
                     }
+                }
+                UiAction::ViewerChat(ChatAction::Send(text)) => {
+                    if let State::Session { handle, .. } = &self.state {
+                        let id = self.next_chat_id;
+                        self.next_chat_id = self.next_chat_id.wrapping_add(1).max(1);
+                        let sender_name = local_sender_name();
+                        let ts_ms = unix_now_ms();
+                        self.viewer_chat.push_outgoing(id, sender_name.clone(), text.clone(), ts_ms);
+                        handle.send(SessionCommand::SendChat { id, sender_name, text, ts_ms });
+                        self.request_redraw();
+                    }
+                }
+                UiAction::HostChat(ChatAction::Send(text)) => {
+                    if let Some(h) = &self.embedded_host {
+                        h.send_chat(text, local_sender_name());
+                    }
+                }
+                UiAction::Reconnect(ReconnectAction::Cancel) => {
+                    self.reconnect = None;
+                    self.auto_reconnect_armed = false;
+                    self.end_session(None);
+                    self.request_redraw();
                 }
             }
         }
@@ -1445,6 +1713,8 @@ impl App {
             }
             SessionEvent::Config(cfg) => {
                 self.password_prompt = None;
+                self.reconnect = None;
+                self.auto_reconnect_armed = false;
                 self.session_info.displays = cfg.displays.clone();
                 self.session_info.active_display = cfg.active_display;
                 self.session_info.host_name = cfg.host_name.clone();
@@ -1468,6 +1738,11 @@ impl App {
                     other => other,
                 };
             }
+            SessionEvent::Permissions(p) => {
+                self.session_info.allow_chat = p.allow_chat;
+                self.session_info.allow_power = p.allow_power;
+                self.viewer_chat.allow_chat = p.allow_chat;
+            }
             SessionEvent::VideoConfig(v) => {
                 if let State::Session { handle, config, .. } = &mut self.state {
                     handle.shared.hud.lock().snapshot.resolution = (v.width, v.height);
@@ -1485,6 +1760,38 @@ impl App {
                 if let Some(e) = error {
                     tracing::warn!("privacy mode: {e}");
                 }
+            }
+            SessionEvent::ChatReceived(msg) => {
+                self.viewer_chat.push_incoming(msg);
+                self.session_info.chat_unread = self.viewer_chat.unread;
+            }
+            SessionEvent::ChatAcked(id) => {
+                self.viewer_chat.mark_acked(id);
+            }
+            SessionEvent::SystemPowerResult(res) => {
+                let action = SystemPowerAction::try_from(res.action).ok();
+                if res.ok {
+                    tracing::info!(?action, "remote host accepted power action");
+                    if matches!(action, Some(SystemPowerAction::Reboot | SystemPowerAction::RebootSafeMode)) {
+                        self.auto_reconnect_armed = true;
+                    }
+                } else {
+                    let msg = tr(self.settings.language).fmt_power_failed(&res.error);
+                    tracing::warn!("{msg}");
+                    self.viewer_chat.error = Some(msg);
+                }
+            }
+            SessionEvent::RecordingStopped(stats) => {
+                self.session_info.recording_active = false;
+                self.session_info.recording_waiting_keyframe = false;
+                self.session_info.recording_elapsed_ms = 0;
+                self.session_info.recording_bytes = 0;
+                tracing::info!(path = %stats.output_path.display(), bytes = stats.bytes_written, "recording saved");
+            }
+            SessionEvent::RecordingError(e) => {
+                self.session_info.recording_active = false;
+                self.session_info.recording_waiting_keyframe = false;
+                tracing::warn!("recording error: {e}");
             }
             SessionEvent::FileListing { path, entries } => {
                 self.files.current_path = path;
@@ -1545,7 +1852,25 @@ impl App {
             SessionEvent::Decoder { name, hardware } => self.decoder = (name, hardware),
             SessionEvent::Closed(reason) => {
                 tracing::info!("session closed: {reason}");
-                self.end_session(Some(reason));
+                if self.auto_reconnect_armed
+                    && let Some(saved) = self.last_connect.clone()
+                {
+                    self.auto_reconnect_armed = false;
+                    self.reconnect = Some(AutoReconnectController::arm(saved, Instant::now()));
+                    self.end_session(None);
+                } else if let Some(rc) = self.reconnect.as_mut() {
+                    let now = Instant::now();
+                    rc.on_attempt_failed(reason, now);
+                    if rc.is_expired(now) {
+                        self.reconnect = None;
+                        let timeout_msg = tr(self.settings.language).reconnect_timed_out.into();
+                        self.end_session(Some(timeout_msg));
+                    } else {
+                        self.end_session(None);
+                    }
+                } else {
+                    self.end_session(Some(reason));
+                }
             }
         }
         if let Some(s) = &self.surface {
@@ -1590,6 +1915,21 @@ impl App {
                 tracing::info!(id = %peer.device_id, name = %peer.name, "persisting trusted peer");
                 self.settings.upsert_trusted_peer(peer);
                 self.save_settings();
+            }
+            EmbeddedHostEvent::ChatReceived { peer_device_id, mut msg } => {
+                if msg.sender_name.trim().is_empty() && !peer_device_id.is_empty() {
+                    msg.sender_name = format_device_id(&peer_device_id);
+                }
+                tracing::debug!(peer = %peer_device_id, id = msg.id, "embedded host received chat message");
+                self.host_chat.push_incoming(msg);
+                self.connect.host_chat_unread = self.host_chat.unread;
+            }
+            EmbeddedHostEvent::ChatSent { id, sender_name, text, ts_ms } => {
+                self.host_chat.push_outgoing(id, sender_name, text, ts_ms);
+            }
+            EmbeddedHostEvent::ChatAcked { peer_device_id, id } => {
+                tracing::debug!(peer = %peer_device_id, id, "embedded host chat message acked");
+                self.host_chat.mark_acked(id);
             }
             EmbeddedHostEvent::ApprovalRequested { info, default_permissions, reply } => {
                 self.accept_prompt = Some((AcceptPrompt::new(info, default_permissions), reply));
@@ -2127,13 +2467,37 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.flush_pending_rel();
         self.flush_pending_abs();
+
+        // Drive auto-reconnect timer & retry loop after remote reboot.
+        let mut reconnect_deadline: Option<Instant> = None;
+        if let Some(rc) = self.reconnect.as_mut() {
+            let now = Instant::now();
+            if rc.is_expired(now) {
+                self.reconnect = None;
+                let timeout_msg = tr(self.settings.language).reconnect_timed_out.into();
+                self.end_session(Some(timeout_msg));
+                self.request_redraw();
+            } else if rc.should_retry_now(now) {
+                rc.mark_attempt_started();
+                let saved = rc.saved.clone();
+                self.connect_with_params(saved);
+                reconnect_deadline = Some(now + Duration::from_millis(250));
+            } else {
+                reconnect_deadline = Some(now + Duration::from_millis(250));
+                self.request_redraw();
+            }
+        }
+
         let Some(s) = &self.surface else { return };
         if matches!(&self.state, State::TestPattern(tp) if tp.opts.fps == 0) {
             self.request_redraw();
             event_loop.set_control_flow(ControlFlow::Poll);
             return;
         }
-        let deadline = s.repaint_deadline();
+        let deadline = match (s.repaint_deadline(), reconnect_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         match deadline {
             Some(t) if t <= Instant::now() => {
                 self.request_redraw();
@@ -2302,5 +2666,49 @@ mod tests {
         cfg.displays[0].width = 2400;
         cfg.displays[0].height = 1080;
         assert_eq!(map_video_to_host(&cfg, Some((1200, 540)), 600, 270), (1200, 540, 0));
+    }
+
+    #[test]
+    fn auto_reconnect_backoff_and_timeout_lifecycle() {
+        assert_eq!(auto_reconnect_backoff(1), Duration::from_secs(2));
+        assert_eq!(auto_reconnect_backoff(2), Duration::from_secs(4));
+        assert_eq!(auto_reconnect_backoff(3), Duration::from_secs(8));
+        assert_eq!(auto_reconnect_backoff(4), Duration::from_secs(15));
+        assert_eq!(auto_reconnect_backoff(99), Duration::from_secs(15));
+
+        let t0 = Instant::now();
+        let saved = SavedConnectParams {
+            address: "192.168.1.20:21118".into(),
+            target: ConnectTarget::Direct("192.168.1.20:21118".parse().unwrap()),
+            rendezvous: None,
+            relay_only: false,
+            password: Some("secret".into()),
+            tunnels: Vec::new(),
+        };
+        let mut rc = AutoReconnectController::arm(saved, t0);
+        assert!(!rc.should_retry_now(t0 + Duration::from_secs(1)));
+        assert!(rc.should_retry_now(t0 + Duration::from_secs(2)));
+
+        let b1 = rc.banner_state(t0 + Duration::from_secs(1));
+        assert!(b1.active);
+        assert_eq!(b1.attempt, 1);
+        assert_eq!(b1.max_secs, 300);
+        assert_eq!(b1.next_retry_secs, 1);
+
+        rc.mark_attempt_started();
+        assert!(!rc.should_retry_now(t0 + Duration::from_secs(2)));
+        assert_eq!(rc.banner_state(t0 + Duration::from_secs(2)).next_retry_secs, 0);
+
+        rc.on_attempt_failed("host rebooting".into(), t0 + Duration::from_secs(3));
+        assert_eq!(rc.attempt, 2);
+        assert_eq!(rc.last_error.as_deref(), Some("host rebooting"));
+        // Attempt #2 waits 4 seconds -> ready at t0 + 7s.
+        assert!(!rc.should_retry_now(t0 + Duration::from_secs(6)));
+        assert!(rc.should_retry_now(t0 + Duration::from_secs(7)));
+
+        // Expires cleanly at 5 minutes (300s).
+        assert!(!rc.is_expired(t0 + Duration::from_secs(299)));
+        assert!(rc.is_expired(t0 + Duration::from_secs(300)));
+        assert!(!rc.should_retry_now(t0 + Duration::from_secs(300)));
     }
 }

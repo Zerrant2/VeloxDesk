@@ -161,6 +161,7 @@ data class HostSavedTrustedPeer(
     val allowTerminal: Boolean = false,
     val allowTunnel: Boolean = false,
     val allowPrivacyMode: Boolean = false,
+    val allowChat: Boolean = true,
 ) {
     fun toJsonObject(): org.json.JSONObject = org.json.JSONObject().apply {
         put("publicKeyHex", publicKeyHex)
@@ -174,6 +175,7 @@ data class HostSavedTrustedPeer(
         put("allowTerminal", allowTerminal)
         put("allowTunnel", allowTunnel)
         put("allowPrivacyMode", allowPrivacyMode)
+        put("allowChat", allowChat)
     }
 
     companion object {
@@ -192,6 +194,7 @@ data class HostSavedTrustedPeer(
                 allowTerminal = obj.optBoolean("allowTerminal", false),
                 allowTunnel = obj.optBoolean("allowTunnel", false),
                 allowPrivacyMode = obj.optBoolean("allowPrivacyMode", false),
+                allowChat = obj.optBoolean("allowChat", true),
             )
         }
 
@@ -232,6 +235,111 @@ data class HostApprovalRequest(
     val peerPubKeyHex: String,
 )
 
+data class ChatMessageItem(
+    val id: Long,
+    val senderName: String,
+    val text: String,
+    val tsMs: Long,
+    val outgoing: Boolean,
+    val delivered: Boolean = false,
+)
+
+/**
+ * Immutable in-session chat state shared between Viewer (`SessionViewModel`) and
+ * Android Host (`HostController`). Handles unread badge counting, delivery ACKs,
+ * and race-safe pre-received ACKs (when `onChatAck` arrives before the UI records the send).
+ */
+data class ChatState(
+    val messages: List<ChatMessageItem> = emptyList(),
+    val unreadCount: Int = 0,
+    val isOpen: Boolean = false,
+    internal val pendingAcks: Set<Long> = emptySet(),
+) {
+    fun onOutgoingSent(
+        id: Long,
+        senderName: String,
+        text: String,
+        tsMs: Long,
+    ): ChatState {
+        if (id <= 0L || text.isEmpty()) return this
+        val alreadyAcked = id in pendingAcks
+        val item = ChatMessageItem(
+            id = id,
+            senderName = senderName,
+            text = text,
+            tsMs = tsMs,
+            outgoing = true,
+            delivered = alreadyAcked,
+        )
+        val nextMessages = (messages + item).takeLast(MAX_CHAT_MESSAGES)
+        val nextPending = if (alreadyAcked) pendingAcks - id else pendingAcks
+        return copy(messages = nextMessages, pendingAcks = nextPending)
+    }
+
+    fun onIncomingReceived(
+        id: Long,
+        senderName: String,
+        text: String,
+        tsMs: Long,
+    ): ChatState {
+        if (text.isEmpty()) return this
+        val item = ChatMessageItem(
+            id = id,
+            senderName = senderName,
+            text = text,
+            tsMs = tsMs,
+            outgoing = false,
+            delivered = true,
+        )
+        val nextMessages = (messages + item).takeLast(MAX_CHAT_MESSAGES)
+        val nextUnread = if (isOpen) 0 else unreadCount + 1
+        return copy(messages = nextMessages, unreadCount = nextUnread)
+    }
+
+    fun onAckReceived(id: Long): ChatState {
+        if (id <= 0L) return this
+        var matched = false
+        val updated = messages.map { msg ->
+            if (msg.outgoing && msg.id == id) {
+                matched = true
+                if (msg.delivered) msg else msg.copy(delivered = true)
+            } else {
+                msg
+            }
+        }
+        return if (matched) {
+            copy(messages = updated)
+        } else {
+            // ACK arrived from Rust thread before caller appended the outgoing item.
+            copy(pendingAcks = (pendingAcks + id).takeLastSet(MAX_PENDING_ACKS))
+        }
+    }
+
+    fun setOpen(open: Boolean): ChatState =
+        copy(isOpen = open, unreadCount = if (open) 0 else unreadCount)
+
+    fun clear(): ChatState = ChatState()
+
+    companion object {
+        const val MAX_CHAT_MESSAGES = 500
+        private const val MAX_PENDING_ACKS = 128
+
+        fun formatTimestamp(
+            tsMs: Long,
+            timeZone: java.util.TimeZone = java.util.TimeZone.getDefault(),
+        ): String {
+            if (tsMs <= 0L) return ""
+            val cal = java.util.Calendar.getInstance(timeZone).apply { timeInMillis = tsMs }
+            val h = cal.get(java.util.Calendar.HOUR_OF_DAY)
+            val m = cal.get(java.util.Calendar.MINUTE)
+            return String.format(java.util.Locale.US, "%02d:%02d", h, m)
+        }
+
+        private fun Set<Long>.takeLastSet(maxSize: Int): Set<Long> =
+            if (size <= maxSize) this else drop(size - maxSize).toSet()
+    }
+}
+
 data class HostUiState(
     val isRunning: Boolean = false,
     val isStarting: Boolean = false,
@@ -246,5 +354,6 @@ data class HostUiState(
     val captureHeight: Int = 0,
     val captureFps: Int = 30,
     val accessibilityEnabled: Boolean = false,
+    val chat: ChatState = ChatState(),
     val error: String? = null,
 )

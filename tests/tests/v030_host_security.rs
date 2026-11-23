@@ -274,6 +274,8 @@ fn saved_peer_from_trusted(p: &TrustedPeer) -> SavedTrustedPeer {
         allow_terminal: p.permissions.terminal,
         allow_tunnel: p.permissions.tunnel,
         allow_privacy_mode: p.permissions.privacy_mode,
+        allow_chat: p.permissions.allow_chat,
+        allow_power: p.permissions.allow_power,
     }
 }
 

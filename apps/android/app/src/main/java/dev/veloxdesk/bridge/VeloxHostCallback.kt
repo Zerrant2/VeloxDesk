@@ -58,6 +58,12 @@ interface VeloxHostCallback {
     // JNI: (Ljava/lang/String;)V
     fun onHostClipboardText(text: String)
 
+    // JNI: (Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;J)V
+    fun onHostChatMessage(peerDeviceId: String, id: Long, senderName: String, text: String, tsMs: Long)
+
+    // JNI: (Ljava/lang/String;J)V
+    fun onHostChatAck(peerDeviceId: String, id: Long)
+
     // JNI: (Ljava/lang/String;)V
     fun onHostError(message: String)
 

@@ -383,7 +383,7 @@ fn main() -> ExitCode {
         (Settings::load_or_default(), None)
     };
     if cli.gaming {
-        settings.mode = Mode::Gaming;
+        settings.set_mode(Mode::Gaming);
     }
     let active = settings.active_mut();
     if cli.hud {

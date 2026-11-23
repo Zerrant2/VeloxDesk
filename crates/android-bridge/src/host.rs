@@ -41,9 +41,9 @@ use veloxdesk_crypto::auth::{
 };
 use veloxdesk_crypto::{DeviceIdentity, device_id_from_public_key, fingerprint};
 use veloxdesk_protocol::control::{
-    AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, AuthResult, BitrateUpdate, ChromaFormat, Close,
-    DisplayInfo, DisplayList, Envelope, FrameTimingReport, Hello, InputEvent, MouseButton, Permissions, Pong,
-    SessionConfig, VideoCodec, VideoConfig, envelope::Msg, input_event::Event as InputEventKind,
+    AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, AuthResult, BitrateUpdate, ChatAck, ChatMessage,
+    ChromaFormat, Close, DisplayInfo, DisplayList, Envelope, FrameTimingReport, Hello, InputEvent, MouseButton,
+    Permissions, Pong, SessionConfig, VideoCodec, VideoConfig, envelope::Msg, input_event::Event as InputEventKind,
 };
 use veloxdesk_protocol::{DEFAULT_DIRECT_PORT, StreamKind};
 use veloxdesk_transport::{
@@ -54,6 +54,7 @@ use veloxdesk_transport::{
 use crate::clipboard::run_android_clipboard_stream;
 use crate::session::load_or_create_identity;
 use crate::target::parse_rendezvous_addr;
+use crate::unix_now_ms;
 
 const DEFAULT_OTP_LEN: usize = 8;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -116,6 +117,7 @@ pub struct SavedTrustedPeerJson {
     pub allow_terminal: bool,
     pub allow_tunnel: bool,
     pub allow_privacy_mode: bool,
+    pub allow_chat: bool,
 }
 
 impl Default for SavedTrustedPeerJson {
@@ -132,6 +134,7 @@ impl Default for SavedTrustedPeerJson {
             allow_terminal: false,
             allow_tunnel: false,
             allow_privacy_mode: false,
+            allow_chat: true,
         }
     }
 }
@@ -204,6 +207,8 @@ pub trait HostCallbacks: Send + Sync + 'static {
         text: &str,
     );
     fn on_clipboard_text(&self, text: &str);
+    fn on_chat_message(&self, _peer_device_id: &str, _id: u64, _sender_name: &str, _text: &str, _ts_ms: u64) {}
+    fn on_chat_ack(&self, _peer_device_id: &str, _id: u64) {}
     fn on_error(&self, message: &str);
     fn on_stopped(&self);
 }
@@ -245,7 +250,7 @@ impl AndroidTrustedPeer {
             terminal: saved.allow_terminal,
             restart: false,
             privacy_mode: saved.allow_privacy_mode,
-            allow_chat: true,
+            allow_chat: saved.allow_chat,
             allow_power: false,
         };
         Some(Self { public_key: pk, name: saved.name.clone(), permissions: perms })
@@ -264,6 +269,7 @@ impl AndroidTrustedPeer {
             allow_terminal: self.permissions.terminal,
             allow_tunnel: self.permissions.tunnel,
             allow_privacy_mode: self.permissions.privacy_mode,
+            allow_chat: self.permissions.allow_chat,
         }
     }
 }
@@ -627,13 +633,15 @@ fn resample_linear_interleaved(src: &[f32], src_rate: u32, dst_rate: u32, channe
     }
 }
 
-/// Shared active-session bridge enabling zero-hop video/audio/display/clipboard push from Kotlin threads.
+/// Shared active-session bridge enabling zero-hop video/audio/display/clipboard/chat push from Kotlin threads.
 struct ActiveSessionBridge {
     session_id: u64,
     mode: i32,
     allow_audio: bool,
+    allow_chat: bool,
     bitrate_kbps: AtomicU32,
     frame_id: AtomicU32,
+    next_chat_id: AtomicU64,
     video_sender: Mutex<VideoSender>,
     audio_state: Mutex<HostAudioState>,
     ctrl_out: mpsc::UnboundedSender<Envelope>,
@@ -645,6 +653,7 @@ impl ActiveSessionBridge {
         session_id: u64,
         mode: i32,
         allow_audio: bool,
+        allow_chat: bool,
         initial_bitrate_kbps: u32,
         ch: Arc<dyn TransportChannel>,
         ctrl_out: mpsc::UnboundedSender<Envelope>,
@@ -655,8 +664,10 @@ impl ActiveSessionBridge {
             session_id,
             mode,
             allow_audio,
+            allow_chat,
             bitrate_kbps: AtomicU32::new(initial_bitrate_kbps),
             frame_id: AtomicU32::new(1),
+            next_chat_id: AtomicU64::new(1),
             video_sender: Mutex::new(video_sender),
             audio_state: Mutex::new(HostAudioState::new(ch)),
             ctrl_out,
@@ -754,6 +765,15 @@ impl ActiveSessionBridge {
         if let Some(tx) = self.clip_out.lock().as_ref() {
             let _ = tx.send(text);
         }
+    }
+
+    fn send_chat(&self, sender_name: String, text: String) -> u64 {
+        if !self.allow_chat || text.is_empty() {
+            return 0;
+        }
+        let id = self.next_chat_id.fetch_add(1, Ordering::Relaxed);
+        let msg = ChatMessage { id, sender_name, text, ts_ms: unix_now_ms() };
+        if self.ctrl_out.send(Msg::ChatMessage(msg).into()).is_ok() { id } else { 0 }
     }
 }
 
@@ -900,6 +920,15 @@ impl AndroidHostEngine {
         if let Some(session) = self.shared.active_session.read().clone() {
             session.send_clipboard_text(text);
         }
+    }
+
+    /// Send an in-session chat message from the Android host to the active connected viewer.
+    /// Returns the assigned non-zero monotonic message ID, or `0` if idle, chat disabled, or text is empty.
+    pub fn send_chat(&self, sender_name: String, text: String) -> u64 {
+        let Some(session) = self.shared.active_session.read().clone() else {
+            return 0;
+        };
+        session.send_chat(sender_name, text)
     }
 
     /// Signal graceful shutdown (non-blocking & idempotent; safe to call from any thread).
@@ -1628,6 +1657,7 @@ async fn run_session(
         sid,
         hello.mode,
         allow_audio,
+        auth.permissions.allow_chat,
         requested_bitrate_kbps,
         ch.clone(),
         ctrl_out.clone(),
@@ -1744,6 +1774,23 @@ async fn run_session(
                             dispatch_input_event(&ev, &shared.callbacks);
                         }
                     }
+                    Some(Msg::ChatMessage(chat)) => {
+                        handle_host_chat_message(
+                            auth.permissions.allow_chat,
+                            &auth.peer_device_id,
+                            &chat,
+                            &ctrl_out,
+                            &shared.callbacks,
+                        );
+                    }
+                    Some(Msg::ChatAck(ack)) => {
+                        handle_host_chat_ack(
+                            auth.permissions.allow_chat,
+                            &auth.peer_device_id,
+                            &ack,
+                            &shared.callbacks,
+                        );
+                    }
                     Some(Msg::Close(c)) => {
                         break if c.reason.is_empty() {
                             format!("viewer closed ({})", c.code)
@@ -1858,6 +1905,32 @@ pub fn map_mouse_button_code(wire_button: i32) -> i32 {
     }
 }
 
+fn handle_host_chat_message(
+    allow_chat: bool,
+    peer_device_id: &str,
+    chat: &ChatMessage,
+    ctrl_out: &mpsc::UnboundedSender<Envelope>,
+    callbacks: &Arc<dyn HostCallbacks>,
+) {
+    if allow_chat {
+        let _ = ctrl_out.send(Msg::ChatAck(ChatAck { id: chat.id }).into());
+        callbacks.on_chat_message(peer_device_id, chat.id, &chat.sender_name, &chat.text, chat.ts_ms);
+    } else {
+        tracing::debug!(id = chat.id, "AndroidHost: ignoring ChatMessage (allow_chat=false)");
+    }
+}
+
+fn handle_host_chat_ack(
+    allow_chat: bool,
+    peer_device_id: &str,
+    ack: &ChatAck,
+    callbacks: &Arc<dyn HostCallbacks>,
+) {
+    if allow_chat {
+        callbacks.on_chat_ack(peer_device_id, ack.id);
+    }
+}
+
 fn dispatch_input_event(ev: &InputEvent, callbacks: &Arc<dyn HostCallbacks>) {
     let Some(kind) = &ev.event else { return };
     match kind {
@@ -1962,5 +2035,103 @@ mod tests {
         assert_eq!(map_mouse_button_code(MouseButton::Left as i32), 1);
         assert_eq!(map_mouse_button_code(MouseButton::Right as i32), 2);
         assert_eq!(map_mouse_button_code(MouseButton::Middle as i32), 3);
+    }
+
+    #[test]
+    fn saved_trusted_peer_json_defaults_allow_chat_true_and_respects_false() {
+        let pk_hex = encode_hex_pubkey_32(&[0x33u8; 32]);
+        // Legacy v0.4.0 JSON without `allowChat` must default allow_chat to true.
+        let legacy_json = format!(
+            r#"[{{"publicKeyHex":"{pk_hex}","deviceId":"123456789","name":"LegacyPC","allowInput":true}}]"#
+        );
+        let parsed = parse_trusted_peers_json(&legacy_json);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].permissions.allow_chat);
+
+        // Explicit `allowChat: false` must disable chat permission.
+        let denied_json = format!(
+            r#"[{{"publicKeyHex":"{pk_hex}","deviceId":"123456789","name":"NoChatPC","allowChat":false}}]"#
+        );
+        let parsed_denied = parse_trusted_peers_json(&denied_json);
+        assert_eq!(parsed_denied.len(), 1);
+        assert!(!parsed_denied[0].permissions.allow_chat);
+    }
+
+    #[test]
+    fn host_chat_dispatch_respects_allow_chat_gating() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct RecordedChat {
+            peer: String,
+            id: u64,
+            sender: String,
+            text: String,
+            ts_ms: u64,
+        }
+        #[derive(Default)]
+        struct ChatHostCb {
+            msgs: Mutex<Vec<RecordedChat>>,
+            acks: Mutex<Vec<(String, u64)>>,
+        }
+        impl HostCallbacks for ChatHostCb {
+            fn on_listening(&self, _: &str, _: &str, _: u16) {}
+            fn on_otp_rotated(&self, _: &str) {}
+            fn on_approval_requested(&self, _: u64, _: &str, _: &str, _: &str, _: &str) {}
+            fn on_trusted_peer_added(&self, _: &str) {}
+            fn on_session_started(&self, _: &str, _: &str, _: u32, _: u32) {}
+            fn on_session_ended(&self, _: &str, _: &str) {}
+            fn on_bitrate_changed(&self, _: u32) {}
+            fn on_keyframe_requested(&self) {}
+            fn on_input_event(&self, _: i32, _: i32, _: i32, _: i32, _: bool, _: i32, _: i32, _: i32, _: &str) {}
+            fn on_clipboard_text(&self, _: &str) {}
+            fn on_chat_message(&self, peer_device_id: &str, id: u64, sender_name: &str, text: &str, ts_ms: u64) {
+                self.msgs.lock().push(RecordedChat {
+                    peer: peer_device_id.to_string(),
+                    id,
+                    sender: sender_name.to_string(),
+                    text: text.to_string(),
+                    ts_ms,
+                });
+            }
+            fn on_chat_ack(&self, peer_device_id: &str, id: u64) {
+                self.acks.lock().push((peer_device_id.to_string(), id));
+            }
+            fn on_error(&self, _: &str) {}
+            fn on_stopped(&self) {}
+        }
+
+        let rec = Arc::new(ChatHostCb::default());
+        let cb: Arc<dyn HostCallbacks> = rec.clone();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+
+        let msg = ChatMessage {
+            id: 7,
+            sender_name: "PC-Viewer".into(),
+            text: "Hi Android!".into(),
+            ts_ms: 1_700_000_000_123,
+        };
+
+        // Gated when allow_chat = false: neither callback nor ChatAck is emitted.
+        handle_host_chat_message(false, "123456789", &msg, &ctrl_tx, &cb);
+        handle_host_chat_ack(false, "123456789", &ChatAck { id: 3 }, &cb);
+        assert!(ctrl_rx.try_recv().is_err());
+        assert!(rec.msgs.lock().is_empty());
+        assert!(rec.acks.lock().is_empty());
+
+        // Allowed when allow_chat = true: emits ChatAck and invokes callbacks.
+        handle_host_chat_message(true, "123456789", &msg, &ctrl_tx, &cb);
+        handle_host_chat_ack(true, "123456789", &ChatAck { id: 3 }, &cb);
+        let ack_env = ctrl_rx.try_recv().expect("host must send ChatAck when allow_chat = true");
+        assert_eq!(ack_env.msg, Some(Msg::ChatAck(ChatAck { id: 7 })));
+        assert_eq!(
+            rec.msgs.lock().as_slice(),
+            &[RecordedChat {
+                peer: "123456789".into(),
+                id: 7,
+                sender: "PC-Viewer".into(),
+                text: "Hi Android!".into(),
+                ts_ms: 1_700_000_000_123,
+            }]
+        );
+        assert_eq!(rec.acks.lock().as_slice(), &[("123456789".into(), 3)]);
     }
 }

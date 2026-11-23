@@ -10,8 +10,6 @@ publish = false
 [dependencies]
 bytes.workspace = true
 crossbeam-channel.workspace = true
-parking_lot.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 veloxdesk-core-traits = { workspace = true }
 

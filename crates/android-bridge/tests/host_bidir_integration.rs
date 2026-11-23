@@ -18,9 +18,9 @@ use veloxdesk_core_traits::TransportChannel;
 use veloxdesk_crypto::DeviceIdentity;
 use veloxdesk_crypto::auth::{Argon2Params, derive_password_key, password_proof, sign_pubkey_challenge};
 use veloxdesk_protocol::control::{
-    AudioCodec, AuthMethod, AuthResponse, BitrateUpdate, Hello, InputEvent, KeyEvent, KeyframeRequest, MouseButton,
-    MouseButtonEvent, MouseMove, MouseWheel, SessionConfig, SessionMode, TextInput, VideoCodec, VideoCodecCap,
-    envelope::Msg, input_event::Event as InputEventKind,
+    AudioCodec, AuthMethod, AuthResponse, BitrateUpdate, ChatMessage, Hello, InputEvent, KeyEvent, KeyframeRequest,
+    MouseButton, MouseButtonEvent, MouseMove, MouseWheel, SessionConfig, SessionMode, TextInput, VideoCodec,
+    VideoCodecCap, envelope::Msg, input_event::Event as InputEventKind,
 };
 use veloxdesk_protocol::{PROTOCOL_VERSION, StreamKind};
 use veloxdesk_server_relay::{RelayConfig, RelayServer};
@@ -32,8 +32,8 @@ use veloxdesk_transport::{
 use veloxdesk_android::SecretString;
 use veloxdesk_android::constants;
 use veloxdesk_android::host::{
-    AndroidHostConfig, AndroidHostEngine, HostCallbacks, HostPasswordMode, SavedTrustedPeerJson, hash_password_phc,
-    input_kind,
+    AndroidHostConfig, AndroidHostEngine, HostCallbacks, HostPasswordMode, SavedTrustedPeerJson, encode_hex_pubkey_32,
+    hash_password_phc, input_kind,
 };
 use veloxdesk_android::session::{ConnectConfig, HandleTable, SessionCallbacks, load_or_create_identity};
 use veloxdesk_android::stats::HudMetrics;
@@ -71,6 +71,15 @@ struct RecordedApproval {
     peer_pub_key_hex: String,
 }
 
+#[derive(Debug, Clone)]
+struct RecordedHostChat {
+    peer_device_id: String,
+    id: u64,
+    sender_name: String,
+    text: String,
+    ts_ms: u64,
+}
+
 #[derive(Default)]
 struct HostRecorder {
     listening: Mutex<Option<(String, String, u16)>>,
@@ -83,6 +92,8 @@ struct HostRecorder {
     keyframe_requests: AtomicUsize,
     inputs: Mutex<Vec<RecordedInput>>,
     clipboard: Mutex<Vec<String>>,
+    chat_messages: Mutex<Vec<RecordedHostChat>>,
+    chat_acks: Mutex<Vec<(String, u64)>>,
     errors: Mutex<Vec<String>>,
     stopped: AtomicBool,
 }
@@ -165,6 +176,20 @@ impl HostCallbacks for HostRecorder {
 
     fn on_clipboard_text(&self, text: &str) {
         self.clipboard.lock().unwrap().push(text.to_string());
+    }
+
+    fn on_chat_message(&self, peer_device_id: &str, id: u64, sender_name: &str, text: &str, ts_ms: u64) {
+        self.chat_messages.lock().unwrap().push(RecordedHostChat {
+            peer_device_id: peer_device_id.to_string(),
+            id,
+            sender_name: sender_name.to_string(),
+            text: text.to_string(),
+            ts_ms,
+        });
+    }
+
+    fn on_chat_ack(&self, peer_device_id: &str, id: u64) {
+        self.chat_acks.lock().unwrap().push((peer_device_id.to_string(), id));
     }
 
     fn on_error(&self, message: &str) {
@@ -568,6 +593,8 @@ struct ViewerRecorder {
     display_lists: Mutex<Vec<String>>,
     video_frames: Mutex<Vec<(u32, u32, Vec<u8>)>>,
     clipboard: Mutex<Vec<String>>,
+    chat_messages: Mutex<Vec<(u64, String, String, u64)>>,
+    chat_acks: Mutex<Vec<u64>>,
     closed: Mutex<Option<(String, bool)>>,
 }
 
@@ -601,6 +628,15 @@ impl SessionCallbacks for ViewerRecorder {
         self.clipboard.lock().unwrap().push(text.to_string());
     }
     fn on_rumble(&self, _pad_id: i32, _low_freq: i32, _high_freq: i32) {}
+    fn on_chat_message(&self, id: u64, sender_name: &str, text: &str, ts_ms: u64) {
+        self.chat_messages
+            .lock()
+            .unwrap()
+            .push((id, sender_name.to_string(), text.to_string(), ts_ms));
+    }
+    fn on_chat_ack(&self, id: u64) {
+        self.chat_acks.lock().unwrap().push(id);
+    }
     fn on_closed(&self, reason: &str, is_error: bool) {
         *self.closed.lock().unwrap() = Some((reason.to_string(), is_error));
     }
@@ -806,4 +842,199 @@ async fn phone_to_phone_via_rendezvous_device_id() {
     rdv_task.abort();
     let _ = std::fs::remove_dir_all(&host_dir);
     let _ = std::fs::remove_dir_all(&viewer_dir);
+}
+
+// ───────────────────────── Test 5: Bidirectional Chat (Viewer <-> Host) & allow_chat Gating ─────────────────────────
+
+#[test]
+fn bidirectional_chat_viewer_and_host_with_acks() {
+    let host_dir = temp_dir("chat-host");
+    let viewer_dir = temp_dir("chat-viewer");
+    let host_rec = Arc::new(HostRecorder::default());
+    let viewer_rec = Arc::new(ViewerRecorder::default());
+
+    let host = AndroidHostEngine::start(
+        AndroidHostConfig {
+            files_dir: host_dir.clone(),
+            bind_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            rendezvous_addr: String::new(),
+            device_name: "Pixel-Host".into(),
+            width: 1080,
+            height: 2340,
+            fps: 60,
+            password_mode: HostPasswordMode::OneTime,
+            permanent_hash_phc: String::new(),
+            require_accept: false,
+            trusted_peers_json: String::new(),
+        },
+        host_rec.clone(),
+    )
+    .expect("start host");
+
+    assert!(wait_until(Duration::from_secs(5), || host_rec.listening.lock().unwrap().is_some()));
+    let (_host_id, otp, port) = host_rec.listening.lock().unwrap().clone().unwrap();
+
+    // Idle host cannot send chat before a viewer connects.
+    assert_eq!(host.send_chat("Pixel-Host".into(), "nobody here".into()), 0);
+
+    let viewer_table = Arc::new(HandleTable::new());
+    let sess_id = viewer_table
+        .spawn_session(
+            ConnectConfig {
+                files_dir: viewer_dir.clone(),
+                target: format!("127.0.0.1:{port}"),
+                rendezvous_addr: String::new(),
+                relay_only: false,
+                password: Some(SecretString::from(otp)),
+                mode: constants::MODE_DESKTOP,
+                max_bitrate_kbps: 4_000,
+                audio_enabled: false,
+                clipboard_enabled: false,
+                viewer_width: 1080,
+                viewer_height: 2400,
+                viewer_refresh_hz: 60,
+                device_name: "Pixel-Viewer".into(),
+                codec_caps_mask: constants::CAP_H264_HW,
+            },
+            viewer_rec.clone(),
+        )
+        .expect("spawn viewer");
+    let viewer = viewer_table.get(sess_id).unwrap();
+
+    assert!(wait_until(Duration::from_secs(5), || !viewer_rec.configs.lock().unwrap().is_empty()));
+    let viewer_device_id = load_or_create_identity(&viewer_dir).unwrap().device_id();
+
+    // 1. Viewer -> Host chat message + automatic ChatAck back to Viewer.
+    let v_id1 = viewer.send_chat("Pixel-Viewer".into(), "Hello Host! Привет!".into());
+    let v_id2 = viewer.send_chat("Pixel-Viewer".into(), "Second message".into());
+    assert_eq!(v_id1, 1);
+    assert_eq!(v_id2, 2);
+
+    assert!(wait_until(Duration::from_secs(3), || host_rec.chat_messages.lock().unwrap().len() >= 2));
+    {
+        let host_msgs = host_rec.chat_messages.lock().unwrap();
+        assert_eq!(host_msgs[0].peer_device_id, viewer_device_id);
+        assert_eq!(host_msgs[0].id, v_id1);
+        assert_eq!(host_msgs[0].sender_name, "Pixel-Viewer");
+        assert_eq!(host_msgs[0].text, "Hello Host! Привет!");
+        assert!(host_msgs[0].ts_ms > 0);
+        assert_eq!(host_msgs[1].id, v_id2);
+        assert_eq!(host_msgs[1].text, "Second message");
+    }
+    assert!(wait_until(Duration::from_secs(3), || {
+        let acks = viewer_rec.chat_acks.lock().unwrap();
+        acks.contains(&v_id1) && acks.contains(&v_id2)
+    }));
+
+    // 2. Host -> Viewer chat message + automatic ChatAck back to Host.
+    let h_id1 = host.send_chat("Pixel-Host".into(), "Reply from Android Host!".into());
+    assert_eq!(h_id1, 1);
+
+    assert!(wait_until(Duration::from_secs(3), || !viewer_rec.chat_messages.lock().unwrap().is_empty()));
+    {
+        let viewer_msgs = viewer_rec.chat_messages.lock().unwrap();
+        assert_eq!(viewer_msgs[0].0, h_id1);
+        assert_eq!(viewer_msgs[0].1, "Pixel-Host");
+        assert_eq!(viewer_msgs[0].2, "Reply from Android Host!");
+        assert!(viewer_msgs[0].3 > 0);
+    }
+    assert!(wait_until(Duration::from_secs(3), || {
+        host_rec.chat_acks.lock().unwrap().iter().any(|(peer, id)| peer == &viewer_device_id && *id == h_id1)
+    }));
+
+    viewer.disconnect();
+    assert!(wait_until(Duration::from_secs(3), || viewer_rec.closed.lock().unwrap().is_some()));
+    host.stop_and_join();
+    let _ = std::fs::remove_dir_all(&host_dir);
+    let _ = std::fs::remove_dir_all(&viewer_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_gates_chat_when_allow_chat_is_false() {
+    let host_dir = temp_dir("chat-denied");
+    let rec = Arc::new(HostRecorder::default());
+    let viewer_id = DeviceIdentity::generate();
+
+    let trusted = vec![SavedTrustedPeerJson {
+        public_key_hex: encode_hex_pubkey_32(&viewer_id.public_key()),
+        device_id: viewer_id.device_id(),
+        name: "NoChat-PC".into(),
+        fingerprint: viewer_id.fingerprint(),
+        allow_input: true,
+        allow_clipboard: false,
+        allow_file_transfer: false,
+        allow_audio: false,
+        allow_terminal: false,
+        allow_tunnel: false,
+        allow_privacy_mode: false,
+        allow_chat: false,
+    }];
+    let trusted_json = serde_json::to_string(&trusted).unwrap();
+
+    let host = AndroidHostEngine::start(
+        AndroidHostConfig {
+            files_dir: host_dir.clone(),
+            bind_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            rendezvous_addr: String::new(),
+            device_name: "Pixel-NoChat".into(),
+            width: 720,
+            height: 1600,
+            fps: 30,
+            password_mode: HostPasswordMode::OneTime,
+            permanent_hash_phc: String::new(),
+            require_accept: false,
+            trusted_peers_json: trusted_json,
+        },
+        rec.clone(),
+    )
+    .expect("start host");
+
+    assert!(wait_until(Duration::from_secs(5), || rec.listening.lock().unwrap().is_some()));
+    let (_, _, port) = rec.listening.lock().unwrap().clone().unwrap();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+
+    let (ch, mut tx, mut rx, _, _) = pc_viewer_connect_and_auth(addr, &viewer_id, "NoChat-PC", None, false)
+        .await
+        .expect("trusted login with allow_chat = false");
+
+    // Viewer sends ChatMessage -> host must NOT deliver callback and must NOT send ChatAck.
+    tx.send(
+        &Msg::ChatMessage(ChatMessage {
+            id: 77,
+            sender_name: "NoChat-PC".into(),
+            text: "Should be blocked".into(),
+            ts_ms: 1_700_000_000_000,
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+
+    // Send a Ping afterward as a control-stream fence; receiving Pong guarantees ChatMessage was already processed.
+    tx.send(&Msg::Ping(veloxdesk_protocol::control::Ping { seq: 9, sent_us: 1234 }).into())
+        .await
+        .unwrap();
+
+    let mut got_pong = false;
+    let mut got_chat_ack = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !got_pong && tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(env)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+            match env.msg {
+                Some(Msg::ChatAck(_)) => got_chat_ack = true,
+                Some(Msg::Pong(p)) if p.seq == 9 => got_pong = true,
+                _ => {}
+            }
+        }
+    }
+    assert!(got_pong, "control stream fence Pong must arrive");
+    assert!(!got_chat_ack, "host must NOT send ChatAck when allow_chat = false");
+    assert!(rec.chat_messages.lock().unwrap().is_empty(), "host must NOT emit on_chat_message when allow_chat = false");
+
+    // Host-side send_chat must also be gated when allow_chat = false.
+    assert_eq!(host.send_chat("Pixel-NoChat".into(), "blocked outbound".into()), 0);
+
+    ch.close(0, "done");
+    host.stop_and_join();
+    let _ = std::fs::remove_dir_all(&host_dir);
 }

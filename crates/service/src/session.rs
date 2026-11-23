@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use veloxdesk_audio::AecReferenceFeed;
 use veloxdesk_core_traits::audio::AudioCodecId;
 use veloxdesk_core_traits::input::{DisplayGeometry, InputEvent, InputEventKind, InputFeedback};
 use veloxdesk_core_traits::transport::{RecvStream, SendStream};
@@ -14,8 +15,9 @@ use veloxdesk_core_traits::video::{ChromaFormat, Display, VideoCodec};
 use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
 use veloxdesk_protocol::StreamKind;
 use veloxdesk_protocol::control::{
-    AudioConfig, BitrateUpdate, Close, DisplayInfo, DisplayList, Envelope, FileAck, Hello, Permissions, Pong,
-    PrivacyModeResult, SessionConfig, SessionMode, TerminalExit, TunnelResult, VideoConfig, envelope::Msg,
+    AudioConfig, BitrateUpdate, ChatAck, ChatMessage, Close, DisplayInfo, DisplayList, Envelope, FileAck, Hello,
+    Permissions, Pong, PrivacyModeResult, SessionConfig, SessionMode, SystemPowerAction, SystemPowerResult,
+    TerminalExit, TunnelResult, VideoConfig, envelope::Msg,
 };
 use veloxdesk_protocol::media::MediaKind;
 use veloxdesk_transport::{
@@ -29,6 +31,7 @@ use crate::backends::{HostBackends, RateController, RateDecision};
 use crate::config::HostConfig;
 use crate::host::HostStatusEvent;
 use crate::inject::{InputHandle, InputThread};
+use crate::power::{PowerExecutor, SystemPowerExecutor};
 use crate::video::{VideoEvent, VideoParams, VideoPipeline};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -168,11 +171,15 @@ pub async fn run_session(
     run_session_until(ch, cfg, backends, rx).await
 }
 
-/// Internal lifecycle hooks supplied by [`crate::host::RunningHost`] / `serve_listener`.
+/// Lifecycle and feature hooks supplied by [`crate::host::RunningHost`] or integration tests.
 #[derive(Clone, Default)]
-pub(crate) struct SessionHooks {
+pub struct SessionHooks {
     pub active_sessions: Option<Arc<AtomicUsize>>,
     pub on_event: Option<Arc<dyn Fn(HostStatusEvent) + Send + Sync>>,
+    /// Broadcast channel delivering host → viewer chat messages into active sessions.
+    pub chat_tx: Option<broadcast::Sender<ChatMessage>>,
+    /// Optional override for remote host power management (defaults to [`SystemPowerExecutor`]).
+    pub power_executor: Option<Arc<dyn PowerExecutor>>,
 }
 
 struct ActiveSessionGuard {
@@ -227,7 +234,9 @@ async fn wait_stop(stop: &mut watch::Receiver<bool>) {
     }
 }
 
-pub(crate) async fn run_session_with_hooks(
+/// Run one host session with explicit lifecycle/feature [`SessionHooks`] (used by
+/// [`crate::host::RunningHost`] and deterministic integration tests).
+pub async fn run_session_with_hooks(
     ch: Arc<dyn TransportChannel>,
     cfg: Arc<HostConfig>,
     backends: HostBackends,
@@ -275,6 +284,14 @@ pub(crate) async fn run_session_with_hooks(
     // 2. Authentication & authorization (M1 open mode fast-path or M2 challenge-response).
     let auth = crate::auth::authenticate(sid, &hello, &ch, &cfg, &mut writer, &mut reader).await?;
     summary.peer_device_id = auth.peer_device_id;
+    let on_event_cb = hooks.on_event.clone();
+    let power_executor: Arc<dyn PowerExecutor> =
+        hooks.power_executor.clone().unwrap_or_else(|| Arc::new(SystemPowerExecutor));
+    let mut chat_rx = if auth.permissions.allow_chat {
+        hooks.chat_tx.as_ref().map(broadcast::Sender::subscribe)
+    } else {
+        None
+    };
     let mut active_guard = ActiveSessionGuard::enter(hooks, summary.peer_device_id.clone());
     let allow_input = auth.permissions.input && cfg.allow_input;
     let viewer_accepts_opus =
@@ -290,11 +307,24 @@ pub(crate) async fn run_session_with_hooks(
     let input =
         if allow_input { Some(InputThread::start_with_feedback(backends.injector.clone(), Some(fb_tx))?) } else { None };
     let audio_frame_us = frame_ms_to_us(cfg.audio_frame_ms).unwrap_or(5_000);
+    let aec_feed = (cfg.echo_cancellation
+        && allow_audio
+        && allow_mic
+        && backends.audio_capture.is_some()
+        && backends.audio_encoder.is_some()
+        && backends.audio_playback.is_some())
+    .then(|| AecReferenceFeed::new(48_000));
     let (audio, audio_cfg) = if allow_audio && backends.audio_capture.is_some() && backends.audio_encoder.is_some() {
-        match AudioPipeline::start(
-            AudioParams { stream_id: 0, bitrate_kbps: cfg.audio_bitrate_kbps, frame_duration_us: audio_frame_us },
+        match AudioPipeline::start_with_aec(
+            AudioParams {
+                stream_id: 0,
+                bitrate_kbps: cfg.audio_bitrate_kbps,
+                frame_duration_us: audio_frame_us,
+                echo_cancellation: cfg.echo_cancellation,
+            },
             &backends,
             ch.clone(),
+            aec_feed.clone(),
         ) {
             Ok((p, c)) => (Some(p), Some(c)),
             Err(e) => {
@@ -306,7 +336,7 @@ pub(crate) async fn run_session_with_hooks(
         (None, None)
     };
     let mic = if allow_mic && backends.audio_playback.is_some() {
-        match MicPlayback::start(audio_frame_us, &backends) {
+        match MicPlayback::start_with_aec_feed(audio_frame_us, &backends, aec_feed) {
             Ok(m) => Some(m),
             Err(e) => {
                 tracing::warn!(session = sid, "host mic playback unavailable: {e}");
@@ -403,6 +433,24 @@ pub(crate) async fn run_session_with_hooks(
                     }
                 }
             }
+            chat_out = async {
+                match chat_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match chat_out {
+                    Ok(chat_msg) => {
+                        let _ = out.send(Msg::ChatMessage(chat_msg).into());
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(session = sid, skipped, "host outgoing chat broadcast lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        chat_rx = None;
+                    }
+                }
+            }
             msg = reader.recv() => {
                 let msg = match msg {
                     Ok(m) => m,
@@ -442,6 +490,99 @@ pub(crate) async fn run_session_with_hooks(
                     Some(Msg::PrivacyMode(pm)) => {
                         let res = handle_privacy_mode(pm.enable, &auth.permissions, &backends, &mut privacy_guard);
                         let _ = out.send(Msg::PrivacyModeResult(res).into());
+                    }
+                    Some(Msg::ChatMessage(chat)) => {
+                        if !auth.permissions.allow_chat {
+                            tracing::info!(
+                                session = sid,
+                                id = chat.id,
+                                "chat message ignored (allow_chat permission denied)"
+                            );
+                        } else {
+                            let ack_id = chat.id;
+                            if let Some(cb) = &on_event_cb {
+                                cb(HostStatusEvent::ChatReceived {
+                                    peer_device_id: summary.peer_device_id.clone(),
+                                    msg: chat,
+                                });
+                            }
+                            let _ = out.send(Msg::ChatAck(ChatAck { id: ack_id }).into());
+                        }
+                    }
+                    Some(Msg::ChatAck(ack)) => {
+                        if !auth.permissions.allow_chat {
+                            tracing::trace!(
+                                session = sid,
+                                id = ack.id,
+                                "chat ack ignored (allow_chat permission denied)"
+                            );
+                        } else if let Some(cb) = &on_event_cb {
+                            cb(HostStatusEvent::ChatAcked {
+                                peer_device_id: summary.peer_device_id.clone(),
+                                id: ack.id,
+                            });
+                        }
+                    }
+                    Some(Msg::SystemPowerRequest(req)) => {
+                        if !auth.permissions.allow_power {
+                            tracing::info!(
+                                session = sid,
+                                action = req.action,
+                                "system power request denied (allow_power not granted)"
+                            );
+                            let _ = out.send(
+                                Msg::SystemPowerResult(SystemPowerResult {
+                                    action: req.action,
+                                    ok: false,
+                                    error: "permission denied: allow_power not granted".into(),
+                                })
+                                .into(),
+                            );
+                        } else {
+                            match SystemPowerAction::try_from(req.action) {
+                                Ok(action) => {
+                                    let _ = out.send(
+                                        Msg::SystemPowerResult(SystemPowerResult {
+                                            action: req.action,
+                                            ok: true,
+                                            error: String::new(),
+                                        })
+                                        .into(),
+                                    );
+                                    // Flush/yield briefly so the viewer receives SystemPowerResult
+                                    // before OS shutdown/reboot/sleep takes effect.
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    let exec = power_executor.clone();
+                                    let reason = req.reason;
+                                    let delay_secs = req.delay_secs;
+                                    match tokio::task::spawn_blocking(move || {
+                                        exec.execute(action, &reason, delay_secs)
+                                    })
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {
+                                            tracing::info!(session = sid, ?action, "executed remote power action");
+                                        }
+                                        Ok(Err(e)) => {
+                                            tracing::error!(session = sid, ?action, "remote power action failed: {e}");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(session = sid, ?action, "remote power task panicked: {e}");
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    let _ = out.send(
+                                        Msg::SystemPowerResult(SystemPowerResult {
+                                            action: req.action,
+                                            ok: false,
+                                            error: format!("unknown system power action: {}", req.action),
+                                        })
+                                        .into(),
+                                    );
+                                }
+                            }
+                        }
                     }
                     Some(Msg::Input(ev)) => {
                         if let Some(h) = &input_handle { h.inject(ev); }

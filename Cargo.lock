@@ -4336,6 +4336,7 @@ dependencies = [
  "veloxdesk-core-traits",
  "veloxdesk-protocol",
  "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -4476,8 +4477,6 @@ version = "0.5.0"
 dependencies = [
  "bytes",
  "crossbeam-channel",
- "parking_lot",
- "thiserror 2.0.21",
  "tracing",
  "veloxdesk-core-traits",
 ]

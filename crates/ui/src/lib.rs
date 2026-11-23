@@ -5,10 +5,12 @@
 //! persistent [`Settings`]. Rendering is done by `veloxdesk-render` in the video pass.
 
 pub mod auth;
+pub mod chat;
 pub mod connect;
 pub mod files;
 pub mod i18n;
 pub mod icons;
+pub mod power;
 pub mod session;
 pub mod settings;
 pub mod terminal;
@@ -18,6 +20,7 @@ pub mod tunnels;
 pub use auth::{
     AcceptDecision, AcceptPrompt, IncomingSessionInfo, PasswordAction, PasswordPrompt, format_fingerprint,
 };
+pub use chat::{ChatAction, ChatEntry, ChatWindow, format_hhmm};
 pub use connect::{
     ConnectAction, ConnectScreen, ConnectTarget, TailscaleInfo, TailscalePeer, UpdateUiState, format_device_id,
     parse_address, parse_address_i18n, parse_device_id, parse_rendezvous_addr, parse_rendezvous_addr_i18n,
@@ -28,9 +31,13 @@ pub use files::{
     parent_remote_path,
 };
 pub use i18n::{Strings, tr};
+pub use power::{
+    PowerConfirmDialog, PowerConfirmOutcome, ReconnectAction, ReconnectBannerState, ReconnectOverlay,
+    power_action_label, power_action_warning,
+};
 pub use session::{
-    SessionInfo, SessionToolbar, ToolbarAction, settings_window, settings_window_at, settings_window_full,
-    settings_window_with_security,
+    SessionAction, SessionInfo, SessionToolbar, ToolbarAction, format_recording_elapsed, format_recording_size,
+    settings_window, settings_window_at, settings_window_full, settings_window_with_security,
 };
 pub use settings::{
     FpsCap, Language, Mode, PasswordMode, Present, Quality, SavedTrustedPeer, Scale, Settings, StreamSettings,

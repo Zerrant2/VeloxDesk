@@ -33,7 +33,9 @@ mod net {
     use crossbeam_channel::{Receiver, Sender, TrySendError};
     use tokio::sync::{mpsc, watch};
     use tokio::time::{interval, timeout};
-    use veloxdesk_audio::{AudioJitterBuffer, JitterConfig, OpusDecoder, OpusEncoder};
+    use veloxdesk_audio::{
+        AcousticEchoCanceller, AecConfig, AecReferenceFeed, AudioJitterBuffer, JitterConfig, OpusDecoder, OpusEncoder,
+    };
     use veloxdesk_core_traits::audio::{
         AudioCaptureConfig, AudioCodecId, AudioEncoder, AudioEncoderConfig, AudioFormat, EncodedAudio,
     };
@@ -43,11 +45,13 @@ mod net {
     use veloxdesk_crypto::auth::{Argon2Params, derive_password_key, password_proof, sign_pubkey_challenge};
     use veloxdesk_file_transfer::FileTransferClient;
     use veloxdesk_protocol::control::{
-        AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, Close, Envelope, GamepadState,
-        Hello, InputEvent, Ping, PrivacyMode, SessionConfig, SwitchDisplay, VideoCodecCap, VideoConfig, envelope::Msg,
+        AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, ChatAck, ChatMessage, Close,
+        Envelope, GamepadState, Hello, InputEvent, KeyframeRequest, Ping, PrivacyMode, SessionConfig,
+        SwitchDisplay, SystemPowerRequest, VideoCodecCap, VideoConfig, envelope::Msg,
     };
     use veloxdesk_protocol::media::MediaKind;
     use veloxdesk_protocol::{PROTOCOL_VERSION, StreamKind};
+    use veloxdesk_recorder::{RecorderConfig, RecorderStats, SessionRecorder};
     use veloxdesk_render::winit::event_loop::EventLoopProxy;
     use veloxdesk_terminal::{TerminalClient, TerminalEvent};
     use veloxdesk_transport::{
@@ -392,7 +396,13 @@ mod net {
     }
 
     impl AudioPlaybackHandle {
-        fn spawn(cfg: Option<&AudioConfig>, initial_enabled: bool, shared: Arc<SessionShared>) -> Option<Self> {
+        fn spawn(
+            cfg: Option<&AudioConfig>,
+            initial_enabled: bool,
+            shared: Arc<SessionShared>,
+            aec_feed: AecReferenceFeed,
+            aec_enabled: Arc<AtomicBool>,
+        ) -> Option<Self> {
             let fmt = cfg
                 .map(|c| AudioFormat {
                     sample_rate: c.sample_rate.max(8_000),
@@ -407,7 +417,7 @@ mod net {
             let stop_bg = stop.clone();
             let join = std::thread::Builder::new()
                 .name("viewer-audio-out".into())
-                .spawn(move || audio_playback_loop(rx, fmt, frame_us, enabled_bg, stop_bg, shared))
+                .spawn(move || audio_playback_loop(rx, fmt, frame_us, enabled_bg, stop_bg, shared, aec_feed, aec_enabled))
                 .ok()?;
             Some(Self { tx, enabled, stop, join: Some(join) })
         }
@@ -437,6 +447,7 @@ mod net {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn audio_playback_loop(
         rx: Receiver<EncodedAudio>,
         fmt: AudioFormat,
@@ -444,6 +455,8 @@ mod net {
         enabled: Arc<AtomicBool>,
         stop: Arc<AtomicBool>,
         shared: Arc<SessionShared>,
+        aec_feed: AecReferenceFeed,
+        aec_enabled: Arc<AtomicBool>,
     ) {
         let frame_dur = Duration::from_micros(frame_us as u64);
         let mut decoder = match OpusDecoder::new(fmt, frame_dur) {
@@ -498,6 +511,9 @@ mod net {
             match jb.pop_decoded(&mut decoder) {
                 Ok(Some(pcm)) => {
                     if enabled.load(Ordering::Relaxed) {
+                        if aec_enabled.load(Ordering::Relaxed) {
+                            aec_feed.push(&pcm.samples);
+                        }
                         let _ = playback.push(&pcm);
                     }
                 }
@@ -518,14 +534,19 @@ mod net {
     }
 
     impl MicCaptureHandle {
-        fn spawn(ch: Arc<dyn TransportChannel>, initial_enabled: bool) -> Self {
+        fn spawn(
+            ch: Arc<dyn TransportChannel>,
+            initial_enabled: bool,
+            aec_feed: AecReferenceFeed,
+            aec_enabled: Arc<AtomicBool>,
+        ) -> Self {
             let enabled = Arc::new(AtomicBool::new(initial_enabled));
             let stop = Arc::new(AtomicBool::new(false));
             let enabled_bg = enabled.clone();
             let stop_bg = stop.clone();
             let join = std::thread::Builder::new()
                 .name("viewer-mic".into())
-                .spawn(move || mic_capture_loop(ch, enabled_bg, stop_bg))
+                .spawn(move || mic_capture_loop(ch, enabled_bg, stop_bg, aec_feed, aec_enabled))
                 .ok();
             Self { enabled, stop, join }
         }
@@ -551,10 +572,18 @@ mod net {
         }
     }
 
-    fn mic_capture_loop(ch: Arc<dyn TransportChannel>, enabled: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+    fn mic_capture_loop(
+        ch: Arc<dyn TransportChannel>,
+        enabled: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+        aec_feed: AecReferenceFeed,
+        aec_enabled: Arc<AtomicBool>,
+    ) {
         let mut sender = AudioSender::new(ch, 1);
         let mut cap: Option<Box<dyn veloxdesk_core_traits::AudioCapture>> = None;
         let mut enc: Option<OpusEncoder> = None;
+        let mut aec: Option<AcousticEchoCanceller> = None;
+        let mut was_aec_on = aec_enabled.load(Ordering::Relaxed);
 
         while !stop.load(Ordering::Relaxed) {
             if !enabled.load(Ordering::Relaxed) {
@@ -562,6 +591,7 @@ mod net {
                     c.stop();
                 }
                 enc = None;
+                aec = None;
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
@@ -593,6 +623,11 @@ mod net {
                                 tracing::info!(backend = c.backend(), ?fmt, "viewer microphone streaming enabled");
                                 cap = Some(c);
                                 enc = Some(e);
+                                aec = Some(AcousticEchoCanceller::new(AecConfig {
+                                    sample_rate: fmt.sample_rate,
+                                    channels: fmt.channels,
+                                    ..AecConfig::default()
+                                }));
                             }
                             Err(e) => {
                                 tracing::warn!("mic OpusEncoder failed: {e}");
@@ -609,7 +644,19 @@ mod net {
             }
             let (Some(c), Some(e)) = (cap.as_mut(), enc.as_mut()) else { continue };
             match c.read(Duration::from_millis(20)) {
-                Ok(Some(pcm)) => {
+                Ok(Some(mut pcm)) => {
+                    let aec_on = aec_enabled.load(Ordering::Relaxed);
+                    if let Some(canceller) = aec.as_mut() {
+                        if aec_on {
+                            if !was_aec_on {
+                                canceller.reset();
+                            }
+                            canceller.process_capture_with_feed(&mut pcm.samples, &aec_feed);
+                        } else if was_aec_on {
+                            canceller.reset();
+                        }
+                    }
+                    was_aec_on = aec_on;
                     if let Ok(pkts) = e.encode(&pcm) {
                         for pkt in pkts {
                             let _ = sender.send(&pkt);
@@ -830,9 +877,17 @@ mod net {
             }
         };
 
-        // 5b. Audio playback thread, optional microphone thread, and physical gamepad poller (M3).
-        let audio_out = AudioPlaybackHandle::spawn(initial_cfg.audio.as_ref(), opts.audio_enabled, shared.clone());
-        let mic = MicCaptureHandle::spawn(ch.clone(), opts.mic_enabled);
+        // 5b. Audio playback thread, optional microphone thread (with NLMS AEC), and physical gamepad poller (M3/v0.5.0).
+        let aec_feed = AecReferenceFeed::new(48_000 * 2);
+        let aec_enabled = Arc::new(AtomicBool::new(opts.echo_cancellation));
+        let audio_out = AudioPlaybackHandle::spawn(
+            initial_cfg.audio.as_ref(),
+            opts.audio_enabled,
+            shared.clone(),
+            aec_feed.clone(),
+            aec_enabled.clone(),
+        );
+        let mic = MicCaptureHandle::spawn(ch.clone(), opts.mic_enabled, aec_feed.clone(), aec_enabled.clone());
         let (gp_tx, mut gp_rx) = mpsc::unbounded_channel::<GamepadState>();
         let gamepads = GamepadPoller::start(gp_tx, shared.active_gamepads.clone());
         let gp_ch = ch.clone();
@@ -857,6 +912,12 @@ mod net {
             add_tunnel(spec, ch.clone(), &mut tunnels, &mut next_tunnel_id, opts.lang(), &proxy).await;
         }
         let mut term_tx: Option<mpsc::UnboundedSender<TermCtrl>> = None;
+
+        // 5d. Zero re-encode Matroska session recorder (v0.5.0).
+        let mut active_video_cfg: Option<VideoConfig> = initial_cfg.video.clone();
+        let mut active_audio_cfg: Option<AudioConfig> = initial_cfg.audio.clone();
+        let mut recorder: Option<SessionRecorder> = None;
+        let mut last_rec_sync = Instant::now();
 
         // 6. Initialize VideoReceiver + notify UI of initial SessionConfig.
         let mut receiver = VideoReceiver::new();
@@ -889,19 +950,29 @@ mod net {
                                     if let Some((stream_id, pkt)) = AudioReceiver::parse_datagram(&buf)
                                         && stream_id == 0
                                         && pkt.codec == AudioCodecId::Opus
-                                        && let Some(ao) = &audio_out
                                     {
-                                        ao.push(pkt);
+                                        if let Some(rec) = &recorder {
+                                            rec.push_audio(&pkt);
+                                        }
+                                        if let Some(ao) = &audio_out {
+                                            ao.push(pkt);
+                                        }
                                     }
                                 }
                                 Some(MediaKind::Video) | None => {
                                     shared.hud.lock().on_bytes_received(buf.len());
-                                    if let Some(rf) = receiver.push_datagram(&buf, now)
-                                        && !decoder.push_frame(rf)
-                                    {
-                                        receiver.request_keyframe();
+                                    if let Some(rf) = receiver.push_datagram(&buf, now) {
+                                        if let Some(rec) = &recorder {
+                                            rec.push_video(&rf.packet);
+                                        }
+                                        if !decoder.push_frame(rf) {
+                                            receiver.request_keyframe();
+                                        }
                                     }
                                     while let Some(rf) = receiver.pop_frame() {
+                                        if let Some(rec) = &recorder {
+                                            rec.push_video(&rf.packet);
+                                        }
                                         if !decoder.push_frame(rf) {
                                             receiver.request_keyframe();
                                         }
@@ -938,15 +1009,36 @@ mod net {
                             }
                             Some(Msg::SessionConfig(cfg)) => {
                                 if let Some(v) = &cfg.video {
+                                    active_video_cfg = Some(v.clone());
                                     receiver.set_dimensions(v.width, v.height);
                                     decoder.configure(v.clone());
+                                }
+                                if let Some(a) = &cfg.audio {
+                                    active_audio_cfg = Some(a.clone());
                                 }
                                 let _ = proxy.send_event(UserEvent::Session(SessionEvent::Config(Box::new(cfg))));
                             }
                             Some(Msg::VideoConfig(v)) => {
+                                active_video_cfg = Some(v.clone());
                                 receiver.set_dimensions(v.width, v.height);
                                 decoder.configure(v.clone());
                                 let _ = proxy.send_event(UserEvent::Session(SessionEvent::VideoConfig(Box::new(v))));
+                            }
+                            Some(Msg::AudioConfig(a)) => {
+                                active_audio_cfg = Some(a);
+                            }
+                            Some(Msg::Permissions(p)) => {
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::Permissions(p)));
+                            }
+                            Some(Msg::ChatMessage(msg)) => {
+                                let _ = ctrl_out_tx.send(Msg::ChatAck(ChatAck { id: msg.id }).into());
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::ChatReceived(msg)));
+                            }
+                            Some(Msg::ChatAck(ack)) => {
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::ChatAcked(ack.id)));
+                            }
+                            Some(Msg::SystemPowerResult(res)) => {
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::SystemPowerResult(res)));
                             }
                             Some(Msg::CursorShape(cs)) => {
                                 let img = CursorImage {
@@ -1029,6 +1121,10 @@ mod net {
                         Some(SessionCommand::SetMic(on)) => {
                             mic.set_enabled(on);
                         }
+                        Some(SessionCommand::SetEchoCancellation(on)) => {
+                            aec_enabled.store(on, Ordering::Relaxed);
+                            aec_feed.clear();
+                        }
                         Some(SessionCommand::SetClipboardSync(on)) => {
                             if on {
                                 if clip_stop.is_none() {
@@ -1040,6 +1136,87 @@ mod net {
                         }
                         Some(SessionCommand::SetPrivacyMode(enable)) => {
                             let _ = ctrl_out_tx.send(Msg::PrivacyMode(PrivacyMode { enable }).into());
+                        }
+                        Some(SessionCommand::StartRecording { output_path }) => {
+                            if let Some(prev) = recorder.take() {
+                                let _ = prev.stop();
+                            }
+                            let (codec, width, height, fps) = active_video_cfg
+                                .as_ref()
+                                .map(|v| {
+                                    let c = VideoCodec::try_from(v.codec).unwrap_or(VideoCodec::H264);
+                                    let c = if c == VideoCodec::Unspecified { VideoCodec::H264 } else { c };
+                                    (c, v.width.max(2), v.height.max(2), v.fps.max(1))
+                                })
+                                .unwrap_or((VideoCodec::H264, 1920, 1080, 60));
+                            let mut rcfg = RecorderConfig::new(output_path, codec, width, height, fps);
+                            if let Some(a) = &active_audio_cfg {
+                                rcfg.audio_sample_rate = a.sample_rate.max(8_000);
+                                rcfg.audio_channels = a.channels.clamp(1, 2) as u16;
+                            }
+                            match SessionRecorder::start(rcfg) {
+                                Ok(rec) => {
+                                    tracing::info!(path = %rec.stats().output_path.display(), ?codec, width, height, fps, "started zero re-encode session recording");
+                                    *shared.recording.lock() = rec.stats();
+                                    recorder = Some(rec);
+                                    last_rec_sync = Instant::now();
+                                    // Request an immediate IDR keyframe so recording starts cleanly on a keyframe.
+                                    let _ = ctrl_out_tx.send(
+                                        Msg::KeyframeRequest(KeyframeRequest {
+                                            stream_id: 0,
+                                            last_good_frame_id: 0,
+                                        })
+                                        .into(),
+                                    );
+                                    receiver.request_keyframe();
+                                    let _ = proxy.send_event(UserEvent::Frame);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("failed to start recording: {e}");
+                                    let _ = proxy.send_event(UserEvent::Session(SessionEvent::RecordingError(
+                                        e.to_string(),
+                                    )));
+                                }
+                            }
+                        }
+                        Some(SessionCommand::StopRecording) => {
+                            if let Some(rec) = recorder.take() {
+                                match rec.stop() {
+                                    Ok(stats) => {
+                                        tracing::info!(
+                                            path = %stats.output_path.display(),
+                                            bytes = stats.bytes_written,
+                                            video_frames = stats.video_frames,
+                                            audio_packets = stats.audio_packets,
+                                            "finalized session recording"
+                                        );
+                                        *shared.recording.lock() = RecorderStats::default();
+                                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::RecordingStopped(stats)));
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("failed to finalize recording: {e}");
+                                        *shared.recording.lock() = RecorderStats::default();
+                                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::RecordingError(
+                                            e.to_string(),
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        Some(SessionCommand::SendChat { id, sender_name, text, ts_ms }) => {
+                            let _ = ctrl_out_tx.send(
+                                Msg::ChatMessage(ChatMessage { id, sender_name, text, ts_ms }).into(),
+                            );
+                        }
+                        Some(SessionCommand::SystemPower(action)) => {
+                            let _ = ctrl_out_tx.send(
+                                Msg::SystemPowerRequest(SystemPowerRequest {
+                                    action: action as i32,
+                                    reason: "Requested by VeloxDesk viewer".into(),
+                                    delay_secs: 3,
+                                })
+                                .into(),
+                            );
                         }
                         Some(SessionCommand::File(action)) => {
                             spawn_file_action(ft_client.clone(), action, opts.lang(), proxy.clone());
@@ -1105,9 +1282,19 @@ mod net {
                     let fb = receiver.poll_feedback(now);
                     send_feedback(fb, &ctrl_out_tx, &shared);
                     while let Some(rf) = receiver.pop_frame() {
+                        if let Some(rec) = &recorder {
+                            rec.push_video(&rf.packet);
+                        }
                         if !decoder.push_frame(rf) {
                             receiver.request_keyframe();
                         }
+                    }
+                    if let Some(rec) = &recorder
+                        && last_rec_sync.elapsed() >= Duration::from_millis(200)
+                    {
+                        *shared.recording.lock() = rec.stats();
+                        last_rec_sync = Instant::now();
+                        let _ = proxy.send_event(UserEvent::Frame);
                     }
                 }
                 _ = ping_tick.tick() => {
@@ -1120,6 +1307,17 @@ mod net {
         };
 
         // 8. Clean teardown.
+        if let Some(rec) = recorder.take() {
+            match rec.stop() {
+                Ok(stats) => tracing::info!(
+                    path = %stats.output_path.display(),
+                    bytes = stats.bytes_written,
+                    "finalized session recording on disconnect"
+                ),
+                Err(e) => tracing::warn!("failed to finalize recording on disconnect: {e}"),
+            }
+            *shared.recording.lock() = RecorderStats::default();
+        }
         if let Some(stop) = clip_stop.take() {
             let _ = stop.send(true);
         }
@@ -1334,6 +1532,9 @@ mod net {
                         bail!("{reason}");
                     }
                     tracing::info!(session_id = r.session_id, "authenticated with host");
+                    if let Some(perms) = r.permissions {
+                        let _ = proxy.send_event(UserEvent::Session(SessionEvent::Permissions(perms)));
+                    }
                     step_timeout = HANDSHAKE_TIMEOUT;
                 }
                 Some(Msg::SessionConfig(cfg)) => {

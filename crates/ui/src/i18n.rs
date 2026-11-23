@@ -347,6 +347,49 @@ define_strings!(
     toolbar_android_home_tooltip,
     toolbar_android_recents,
     toolbar_android_recents_tooltip,
+
+    // v0.5.0 Echo Cancellation, Recording, Chat, Remote Power, Auto-Reconnect
+    perm_chat,
+    perm_power,
+    settings_echo_cancellation,
+    settings_echo_cancellation_cb,
+    tip_echo_cancellation,
+    tip_echo_cancellation_gaming,
+    settings_recordings_dir,
+    settings_recordings_dir_hint,
+    tip_recordings_dir,
+    toolbar_chat,
+    toolbar_chat_tooltip,
+    toolbar_rec,
+    toolbar_rec_start_tooltip,
+    toolbar_rec_stop_tooltip,
+    toolbar_rec_waiting,
+    toolbar_power,
+    toolbar_power_tooltip,
+    toolbar_power_denied_tooltip,
+    chat_title,
+    host_chat_title,
+    chat_empty,
+    chat_input_hint,
+    chat_send_btn,
+    chat_disabled_notice,
+    chat_delivered_tooltip,
+    chat_sending_tooltip,
+    host_chat_btn,
+    host_chat_tooltip,
+    power_reboot,
+    power_reboot_safe_mode,
+    power_lock_screen,
+    power_sleep,
+    power_confirm_title,
+    power_confirm_btn,
+    power_warn_reboot,
+    power_warn_reboot_safe_mode,
+    power_warn_lock_screen,
+    power_warn_sleep,
+    power_reboot_hint_reconnect,
+    reconnect_title,
+    reconnect_timed_out,
 );
 
 pub const EN: Strings = Strings {
@@ -672,6 +715,49 @@ pub const EN: Strings = Strings {
     toolbar_android_home_tooltip: "Send Android Home navigation key (Meta/Super)",
     toolbar_android_recents: "Recents",
     toolbar_android_recents_tooltip: "Open Android Recent Apps switcher (Alt+Tab)",
+
+    // v0.5.0 Echo Cancellation, Recording, Chat, Remote Power, Auto-Reconnect
+    perm_chat: "Session chat",
+    perm_power: "Remote power (reboot/lock/sleep)",
+    settings_echo_cancellation: "Echo cancellation",
+    settings_echo_cancellation_cb: "Suppress remote audio echo (AEC)",
+    tip_echo_cancellation: "Exclude VeloxDesk playback from host audio capture and run adaptive acoustic echo cancellation on viewer microphone.",
+    tip_echo_cancellation_gaming: "Echo cancellation is always enabled in Gaming mode to prevent voice feedback loops.",
+    settings_recordings_dir: "Recordings folder",
+    settings_recordings_dir_hint: "Default (Videos\\VeloxDesk)",
+    tip_recordings_dir: "Folder where zero re-encode .mkv session recordings are saved. Leave empty to use Videos\\VeloxDesk.",
+    toolbar_chat: "Chat",
+    toolbar_chat_tooltip: "Toggle in-session text chat",
+    toolbar_rec: "REC",
+    toolbar_rec_start_tooltip: "Start zero re-encode .mkv session recording",
+    toolbar_rec_stop_tooltip: "Stop and finalize session recording",
+    toolbar_rec_waiting: "waiting IDR",
+    toolbar_power: "Power",
+    toolbar_power_tooltip: "Remote host power actions (Reboot, Safe Mode, Lock, Sleep)",
+    toolbar_power_denied_tooltip: "Remote power actions are not permitted by the host",
+    chat_title: "Session Chat",
+    host_chat_title: "Host Chat",
+    chat_empty: "No messages yet. Say hello!",
+    chat_input_hint: "Type a message and press Enter…",
+    chat_send_btn: "Send",
+    chat_disabled_notice: "Chat is disabled by host permissions.",
+    chat_delivered_tooltip: "Delivered",
+    chat_sending_tooltip: "Sending…",
+    host_chat_btn: "Chat",
+    host_chat_tooltip: "Open chat with connected viewers",
+    power_reboot: "Reboot",
+    power_reboot_safe_mode: "Reboot Safe Mode",
+    power_lock_screen: "Lock Screen",
+    power_sleep: "Sleep",
+    power_confirm_title: "Confirm Remote Power Action",
+    power_confirm_btn: "Confirm",
+    power_warn_reboot: "This will immediately reboot the remote host. Unsaved work on the remote computer may be lost.",
+    power_warn_reboot_safe_mode: "This will reboot the remote host into Safe Mode with Networking. Unsaved work may be lost.",
+    power_warn_lock_screen: "This will lock the remote host user session screen.",
+    power_warn_sleep: "This will put the remote host to sleep and disconnect the active session.",
+    power_reboot_hint_reconnect: "VeloxDesk will automatically retry reconnecting while the host restarts (up to 5 minutes).",
+    reconnect_title: "Reconnecting to remote host…",
+    reconnect_timed_out: "Auto-reconnect timed out after 5 minutes.",
 };
 
 pub const RU: Strings = Strings {
@@ -997,6 +1083,49 @@ pub const RU: Strings = Strings {
     toolbar_android_home_tooltip: "Отправить кнопку «Домой» для Android (Meta/Super)",
     toolbar_android_recents: "Недавние",
     toolbar_android_recents_tooltip: "Открыть список недавних приложений Android (Alt+Tab)",
+
+    // v0.5.0 Echo Cancellation, Recording, Chat, Remote Power, Auto-Reconnect
+    perm_chat: "Чат в сеансе",
+    perm_power: "Питание хоста (перезагрузка/блокировка/сон)",
+    settings_echo_cancellation: "Подавление эха",
+    settings_echo_cancellation_cb: "Подавлять эхо удалённого звука (AEC)",
+    tip_echo_cancellation: "Исключает звук VeloxDesk из захвата на хосте и включает адаптивное акустическое эхоподавление для микрофона.",
+    tip_echo_cancellation_gaming: "В игровом режиме подавление эха всегда включено для предотвращения акустической петли.",
+    settings_recordings_dir: "Папка записей",
+    settings_recordings_dir_hint: "По умолчанию (Videos\\VeloxDesk)",
+    tip_recordings_dir: "Папка для сохранения записей сеанса в формате .mkv без перекодирования. Оставьте пустой для Videos\\VeloxDesk.",
+    toolbar_chat: "Чат",
+    toolbar_chat_tooltip: "Открыть или скрыть текстовый чат сеанса",
+    toolbar_rec: "REC",
+    toolbar_rec_start_tooltip: "Начать запись сеанса в .mkv без перекодирования",
+    toolbar_rec_stop_tooltip: "Остановить и сохранить запись сеанса",
+    toolbar_rec_waiting: "ожидание IDR",
+    toolbar_power: "Питание",
+    toolbar_power_tooltip: "Управление питанием удалённого хоста (Перезагрузка, Безопасный режим, Блокировка, Сон)",
+    toolbar_power_denied_tooltip: "Управление питанием запрещено настройками разрешений хоста",
+    chat_title: "Чат сеанса",
+    host_chat_title: "Чат хоста",
+    chat_empty: "Сообщений пока нет. Напишите что-нибудь!",
+    chat_input_hint: "Введите сообщение и нажмите Enter…",
+    chat_send_btn: "Отправить",
+    chat_disabled_notice: "Чат отключён разрешениями хоста.",
+    chat_delivered_tooltip: "Доставлено",
+    chat_sending_tooltip: "Отправка…",
+    host_chat_btn: "Чат",
+    host_chat_tooltip: "Открыть чат с подключёнными пользователями",
+    power_reboot: "Перезагрузить",
+    power_reboot_safe_mode: "Перезагрузка в безопасный режим",
+    power_lock_screen: "Заблокировать экран",
+    power_sleep: "Сон",
+    power_confirm_title: "Подтвердите действие с питанием",
+    power_confirm_btn: "Подтвердить",
+    power_warn_reboot: "Удалённый хост будет немедленно перезагружен. Несохранённые данные на удалённом компьютере могут быть потеряны.",
+    power_warn_reboot_safe_mode: "Удалённый хост будет перезагружен в безопасный режим с загрузкой сетевых драйверов. Несохранённые данные могут быть потеряны.",
+    power_warn_lock_screen: "Экран удалённого хоста будет заблокирован.",
+    power_warn_sleep: "Удалённый хост перейдёт в спящий режим, текущий сеанс будет завершён.",
+    power_reboot_hint_reconnect: "VeloxDesk будет автоматически пытаться переподключиться, пока хост перезагружается (до 5 минут).",
+    reconnect_title: "Переподключение к удалённому хосту…",
+    reconnect_timed_out: "Автопереподключение не удалось за 5 минут.",
 };
 
 /// Return the static localization table for `lang`.
@@ -1509,16 +1638,73 @@ impl Strings {
             }
         }
     }
+
+    pub fn fmt_chat_with_unread(&self, base: &str, unread: usize) -> String {
+        if unread == 0 {
+            base.to_string()
+        } else {
+            format!("{base} ({unread})")
+        }
+    }
+
+    pub fn fmt_power_confirm_target(&self, host: &str, action_label: &str) -> String {
+        let h = if host.trim().is_empty() {
+            if self.is_ru() { "удалённый хост" } else { "remote host" }
+        } else {
+            host.trim()
+        };
+        if self.is_ru() {
+            format!("Действие «{action_label}» для {h}")
+        } else {
+            format!("{action_label} on {h}")
+        }
+    }
+
+    pub fn fmt_reconnect_target(&self, target: &str) -> String {
+        if self.is_ru() {
+            format!("Хост: {target}")
+        } else {
+            format!("Target: {target}")
+        }
+    }
+
+    pub fn fmt_reconnect_progress(&self, attempt: u32, next_retry_secs: u64, elapsed_secs: u64, max_secs: u64) -> String {
+        let el_m = elapsed_secs / 60;
+        let el_s = elapsed_secs % 60;
+        let max_m = max_secs / 60;
+        let max_s = max_secs % 60;
+        if self.is_ru() {
+            if next_retry_secs > 0 {
+                format!("Попытка #{attempt} · повтор через {next_retry_secs}с · {el_m}:{el_s:02} / {max_m}:{max_s:02}")
+            } else {
+                format!("Попытка #{attempt} · подключение… · {el_m}:{el_s:02} / {max_m}:{max_s:02}")
+            }
+        } else if next_retry_secs > 0 {
+            format!("Attempt #{attempt} · retry in {next_retry_secs}s · {el_m}:{el_s:02} / {max_m}:{max_s:02}")
+        } else {
+            format!("Attempt #{attempt} · connecting… · {el_m}:{el_s:02} / {max_m}:{max_s:02}")
+        }
+    }
+
+    pub fn fmt_power_failed(&self, err: &str) -> String {
+        if self.is_ru() {
+            format!("Ошибка управления питанием: {err}")
+        } else {
+            format!("Remote power action failed: {err}")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use veloxdesk_protocol::control::{DisplayInfo, FileEntry, Permissions};
+    use veloxdesk_protocol::control::{ChatMessage, DisplayInfo, FileEntry, Permissions, SystemPowerAction};
 
     use super::*;
     use crate::auth::{AcceptPrompt, IncomingSessionInfo, PasswordPrompt};
+    use crate::chat::ChatWindow;
     use crate::connect::{ConnectScreen, TailscaleInfo, TailscalePeer, parse_host_port_i18n, parse_target_i18n};
     use crate::files::FileManagerWindow;
+    use crate::power::{PowerConfirmDialog, ReconnectBannerState, ReconnectOverlay};
     use crate::session::{SessionInfo, SessionToolbar, settings_window_at};
     use crate::settings::{FpsCap, Mode, Present, Quality, Scale, Settings};
     use crate::terminal::TerminalWindow;
@@ -1689,10 +1875,38 @@ mod tests {
             files_open: true,
             terminal_open: true,
             tunnels_open: true,
+            chat_open: true,
+            chat_unread: 3,
+            allow_chat: true,
+            allow_power: true,
+            recording_active: true,
+            recording_waiting_keyframe: false,
+            recording_elapsed_ms: 95_000,
+            recording_bytes: 12_400_000,
         };
 
-        let mut toolbar_collapsed = SessionToolbar { expanded: false };
-        let mut toolbar_expanded = SessionToolbar { expanded: true };
+        let mut toolbar_collapsed = SessionToolbar { expanded: false, ..Default::default() };
+        let mut toolbar_expanded = SessionToolbar { expanded: true, ..Default::default() };
+        let mut chat = ChatWindow::new("ru-chat", false);
+        chat.set_open(true);
+        chat.push_incoming(ChatMessage {
+            id: 1,
+            sender_name: "Хост".into(),
+            text: "Привет!".into(),
+            ts_ms: 45_000_000,
+        });
+        chat.push_outgoing(2, "Я".into(), "Ответ".into(), 45_060_000);
+        chat.mark_acked(2);
+        let power_dlg = PowerConfirmDialog::new(SystemPowerAction::RebootSafeMode, "Хост".into());
+        let reconnect_state = ReconnectBannerState {
+            active: true,
+            target: "10.0.0.5:21118".into(),
+            attempt: 2,
+            elapsed_secs: 15,
+            max_secs: 300,
+            next_retry_secs: 4,
+            last_error: None,
+        };
         let mut settings_open = true;
         let mut files = FileManagerWindow {
             open: true,
@@ -1754,6 +1968,9 @@ mod tests {
                 let _ = pw.show_for(ui.ctx(), settings.language);
                 let _ = accept.show_for(ui.ctx(), settings.language);
                 let _ = term.show_for(ui.ctx(), settings.language);
+                let _ = chat.show_for(ui.ctx(), settings.language);
+                let _ = power_dlg.show_for(ui.ctx(), settings.language);
+                let _ = ReconnectOverlay::show_for(ui.ctx(), &reconnect_state, settings.language);
             });
             out2.textures_delta.clear();
             texts2.clear();

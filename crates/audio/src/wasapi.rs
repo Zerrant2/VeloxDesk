@@ -1,16 +1,24 @@
 //! Windows WASAPI low-latency audio loopback capture, microphone capture, and playback.
 
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::{Condvar, Mutex};
 use veloxdesk_core_traits::audio::{AudioCapture, AudioCaptureConfig, AudioFormat, AudioFrame, AudioPlayback};
 use veloxdesk_core_traits::{CoreError, Result, Timestamp};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, E_NOINTERFACE, E_POINTER, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree};
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-use windows::core::HSTRING;
+use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::System::Com::{
+    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, IAgileObject,
+    IAgileObject_Impl,
+};
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitForSingleObject};
+use windows::Win32::System::Variant::VT_BLOB;
+use windows::core::{HRESULT, HSTRING, IUnknown, Interface, Ref, implement};
 
 use crate::pcm::{LinearResampler, SampleEncoding, remix_channels};
 
@@ -125,6 +133,128 @@ fn make_float_waveformat(format: AudioFormat) -> WAVEFORMATEXTENSIBLE {
     }
 }
 
+fn make_plain_pcm16_waveformat(format: AudioFormat) -> WAVEFORMATEX {
+    let channels = format.channels.max(1);
+    let block_align = channels * 2;
+    WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_PCM_TAG,
+        nChannels: channels,
+        nSamplesPerSec: format.sample_rate,
+        nAvgBytesPerSec: format.sample_rate * block_align as u32,
+        nBlockAlign: block_align,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    }
+}
+
+struct SendAudioClient(IAudioClient);
+
+// SAFETY: WASAPI COM IAudioClient is MTA free-threaded and transferred once on activation completion.
+unsafe impl Send for SendAudioClient {}
+
+type ActivationSignal = Arc<(Mutex<Option<windows::core::Result<SendAudioClient>>>, Condvar)>;
+
+#[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
+struct ProcessLoopbackActivationHandler {
+    signal: ActivationSignal,
+}
+
+impl IAgileObject_Impl for ProcessLoopbackActivationHandler_Impl {}
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for ProcessLoopbackActivationHandler_Impl {
+    fn ActivateCompleted(
+        &self,
+        activate_operation: Ref<'_, IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
+        let outcome = match activate_operation.as_ref() {
+            Some(op) => {
+                let mut hr = HRESULT(0);
+                let mut iface: Option<IUnknown> = None;
+                // SAFETY: valid COM out-parameters for GetActivateResult.
+                unsafe {
+                    match op.GetActivateResult(&mut hr, &mut iface) {
+                        Ok(()) => {
+                            if hr.is_err() {
+                                Err(windows::core::Error::from(hr))
+                            } else if let Some(unk) = iface {
+                                unk.cast::<IAudioClient>().map(SendAudioClient)
+                            } else {
+                                Err(windows::core::Error::from(E_NOINTERFACE))
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+            None => Err(windows::core::Error::from(E_POINTER)),
+        };
+
+        let mut slot = self.signal.0.lock();
+        *slot = Some(outcome);
+        self.signal.1.notify_all();
+        Ok(())
+    }
+}
+
+/// Activate a Windows 10 2004+ / 11 process-loopback `IAudioClient` excluding `target_pid`'s
+/// process tree (`PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`).
+fn activate_process_loopback_client(target_pid: u32) -> Result<IAudioClient> {
+    ensure_com();
+
+    let mut activation_params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: target_pid,
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+
+    // Wrap in ManuallyDrop so Drop never calls PropVariantClear/CoTaskMemFree on our stack pointer.
+    let mut prop = ManuallyDrop::new(PROPVARIANT::default());
+    // SAFETY: constructing a VT_BLOB PROPVARIANT referencing `activation_params`, which stays
+    // pinned on the stack until ActivateAudioInterfaceAsync finishes and completes.
+    unsafe {
+        let inner = &mut *prop.Anonymous.Anonymous;
+        inner.vt = VT_BLOB;
+        inner.Anonymous.blob = BLOB {
+            cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+            pBlobData: (&mut activation_params as *mut AUDIOCLIENT_ACTIVATION_PARAMS).cast::<u8>(),
+        };
+    }
+
+    let signal: ActivationSignal = Arc::new((Mutex::new(None), Condvar::new()));
+    let handler: IActivateAudioInterfaceCompletionHandler =
+        ProcessLoopbackActivationHandler { signal: Arc::clone(&signal) }.into();
+
+    // SAFETY: valid VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK path, IID, PROPVARIANT, and agile handler.
+    let _async_op = unsafe {
+        ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&*prop as *const PROPVARIANT),
+            &handler,
+        )
+        .map_err(wasapi_err("ActivateAudioInterfaceAsync(process-loopback)"))?
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut guard = signal.0.lock();
+    while guard.is_none() {
+        let wait_res = signal.1.wait_until(&mut guard, deadline);
+        if wait_res.timed_out() && guard.is_none() {
+            return Err(CoreError::platform("ActivateAudioInterfaceAsync(process-loopback) timed out"));
+        }
+    }
+
+    let client = guard
+        .take()
+        .ok_or_else(|| CoreError::platform("process loopback activation completed without result"))?
+        .map_err(wasapi_err("ActivateAudioInterfaceAsync::GetActivateResult"))?;
+    Ok(client.0)
+}
+
 struct CaptureState {
     client: IAudioClient,
     capture: IAudioCaptureClient,
@@ -133,6 +263,7 @@ struct CaptureState {
     out_fmt: AudioFormat,
     encoding: SampleEncoding,
     resampler: LinearResampler,
+    process_loopback_active: bool,
     raw_f32: Vec<f32>,
     remixed: Vec<f32>,
     resampled: Vec<f32>,
@@ -153,30 +284,98 @@ impl Drop for CaptureState {
     }
 }
 
-/// Windows WASAPI audio capture (supports both system loopback and microphone input).
+/// Windows WASAPI audio capture (supports system loopback, process-excluding loopback,
+/// and microphone input).
 pub struct WasapiCapture {
     default_microphone: bool,
+    exclude_self_process: bool,
     state: Option<CaptureState>,
 }
 
 impl WasapiCapture {
     pub fn loopback() -> Self {
-        Self { default_microphone: false, state: None }
+        Self { default_microphone: false, exclude_self_process: false, state: None }
+    }
+
+    /// Create a WASAPI system loopback capture that excludes the current process tree
+    /// on Windows 10 2004+ / 11 (transparently falling back to standard loopback if
+    /// process loopback activation is unsupported).
+    pub fn loopback_excluding_self() -> Self {
+        Self { default_microphone: false, exclude_self_process: true, state: None }
     }
 
     pub fn microphone() -> Self {
-        Self { default_microphone: true, state: None }
-    }
-}
-
-impl AudioCapture for WasapiCapture {
-    fn backend(&self) -> &'static str {
-        if self.default_microphone { "wasapi-mic" } else { "wasapi-loopback" }
+        Self { default_microphone: true, exclude_self_process: false, state: None }
     }
 
-    fn start(&mut self, cfg: &AudioCaptureConfig) -> Result<AudioFormat> {
-        self.stop();
-        let is_mic = cfg.microphone || self.default_microphone;
+    /// Returns `true` if Windows Process Loopback Exclusion is currently active.
+    pub fn is_process_loopback_active(&self) -> bool {
+        self.state.as_ref().is_some_and(|s| s.process_loopback_active)
+    }
+
+    fn start_process_loopback(&mut self, cfg: &AudioCaptureConfig) -> Result<AudioFormat> {
+        // SAFETY: GetCurrentProcessId is always safe to call.
+        let pid = unsafe { GetCurrentProcessId() };
+        let client = activate_process_loopback_client(pid)?;
+
+        let desired_fmt = if cfg.format.sample_rate > 0 && cfg.format.channels > 0 {
+            cfg.format
+        } else {
+            AudioFormat::STEREO_48K
+        };
+        let buf_hns = (cfg.chunk.as_nanos() / 100).clamp(200_000, 1_000_000) as i64;
+        // Process loopback virtual devices do not implement GetMixFormat(); initialize directly
+        // with our desired format (try 32-bit float first, fall back to 16-bit PCM).
+        let float_wf = make_float_waveformat(desired_fmt);
+        let pcm16_wf = make_plain_pcm16_waveformat(desired_fmt);
+
+        // SAFETY: WASAPI IAudioClient::Initialize / GetService / Start on activated process loopback client.
+        unsafe {
+            let encoding = if client
+                .Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, buf_hns, 0, &float_wf.Format, None)
+                .is_ok()
+            {
+                SampleEncoding::F32
+            } else {
+                client
+                    .Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, buf_hns, 0, &pcm16_wf, None)
+                    .map_err(wasapi_err("IAudioClient::Initialize(process-loopback)"))?;
+                SampleEncoding::I16
+            };
+
+            let capture: IAudioCaptureClient =
+                client.GetService().map_err(wasapi_err("GetService(IAudioCaptureClient, process-loopback)"))?;
+            client.Start().map_err(wasapi_err("IAudioClient::Start(process-loopback)"))?;
+
+            let resampler =
+                LinearResampler::new(desired_fmt.sample_rate, desired_fmt.sample_rate, desired_fmt.channels as usize);
+
+            tracing::info!(
+                backend = "wasapi-process-loopback",
+                excluded_pid = pid,
+                format = ?desired_fmt,
+                encoding = ?encoding,
+                "WASAPI process-excluding loopback capture started"
+            );
+
+            self.state = Some(CaptureState {
+                client,
+                capture,
+                event: None,
+                native_fmt: desired_fmt,
+                out_fmt: desired_fmt,
+                encoding,
+                resampler,
+                process_loopback_active: true,
+                raw_f32: Vec::new(),
+                remixed: Vec::new(),
+                resampled: Vec::new(),
+            });
+            Ok(desired_fmt)
+        }
+    }
+
+    fn start_standard(&mut self, cfg: &AudioCaptureConfig, is_mic: bool) -> Result<AudioFormat> {
         let flow = if is_mic { eCapture } else { eRender };
         let device = pick_device(flow, cfg.device.as_deref())?;
 
@@ -194,7 +393,7 @@ impl AudioCapture for WasapiCapture {
             };
 
             let buf_hns = (cfg.chunk.as_nanos() / 100).clamp(200_000, 1_000_000) as i64; // 20–100 ms ring
-            let mut flags = if is_mic {
+            let flags = if is_mic {
                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK
             } else {
                 // Loopback does NOT signal event callback during silence on Windows; poll instead.
@@ -223,7 +422,6 @@ impl AudioCapture for WasapiCapture {
                 let _ = CloseHandle(h);
                 return Err(wasapi_err("SetEventHandle")(e));
             }
-            let _ = &mut flags;
 
             let capture: IAudioCaptureClient = client.GetService().map_err(wasapi_err("GetService(IAudioCaptureClient)"))?;
             client.Start().map_err(wasapi_err("IAudioClient::Start"))?;
@@ -232,7 +430,7 @@ impl AudioCapture for WasapiCapture {
             let resampler = LinearResampler::new(native_fmt.sample_rate, out_fmt.sample_rate, out_fmt.channels as usize);
 
             tracing::info!(
-                backend = self.backend(),
+                backend = if is_mic { "wasapi-mic" } else { "wasapi-loopback" },
                 native = ?native_fmt,
                 output = ?out_fmt,
                 "WASAPI capture started"
@@ -246,12 +444,42 @@ impl AudioCapture for WasapiCapture {
                 out_fmt,
                 encoding,
                 resampler,
+                process_loopback_active: false,
                 raw_f32: Vec::new(),
                 remixed: Vec::new(),
                 resampled: Vec::new(),
             });
             Ok(out_fmt)
         }
+    }
+}
+
+impl AudioCapture for WasapiCapture {
+    fn backend(&self) -> &'static str {
+        if self.default_microphone {
+            "wasapi-mic"
+        } else if self.is_process_loopback_active() {
+            "wasapi-process-loopback"
+        } else {
+            "wasapi-loopback"
+        }
+    }
+
+    fn start(&mut self, cfg: &AudioCaptureConfig) -> Result<AudioFormat> {
+        self.stop();
+        let is_mic = cfg.microphone || self.default_microphone;
+        if !is_mic && self.exclude_self_process && cfg.device.as_deref().unwrap_or("").is_empty() {
+            match self.start_process_loopback(cfg) {
+                Ok(fmt) => return Ok(fmt),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "WASAPI process loopback exclusion unavailable; falling back to standard WASAPI loopback"
+                    );
+                }
+            }
+        }
+        self.start_standard(cfg, is_mic)
     }
 
     fn read(&mut self, timeout: Duration) -> Result<Option<AudioFrame>> {

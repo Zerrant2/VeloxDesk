@@ -175,6 +175,7 @@ pub struct HostConfigFile {
     pub audio_bitrate_kbps: Option<u32>,
     pub audio_frame_ms: Option<f32>,
     pub allow_mic: Option<bool>,
+    pub echo_cancellation: Option<bool>,
     pub ipc_port: Option<u16>,
 }
 
@@ -224,7 +225,7 @@ impl HostConfig {
         }
         set!(bind, max_fps, bitrate_kbps, min_bitrate_kbps, prefer_hw, prefer_gpu, idle_fps,
              fec_parity_percent, max_sessions, allow_input, ten_bit, audio_enabled, audio_bitrate_kbps,
-             audio_frame_ms, allow_mic);
+             audio_frame_ms, allow_mic, echo_cancellation);
         if let Some(ch) = &file.chroma {
             self.chroma = parse_chroma(ch)?;
         }
@@ -327,6 +328,7 @@ impl HostConfig {
             audio_bitrate_kbps: Some(self.audio_bitrate_kbps),
             audio_frame_ms: Some(self.audio_frame_ms),
             allow_mic: Some(self.allow_mic),
+            echo_cancellation: Some(self.echo_cancellation),
             ipc_port: self.ipc_port,
         };
         toml::to_string(&f).unwrap_or_default()
@@ -439,6 +441,12 @@ pub struct HostArgs {
     /// Allow viewer microphone audio playback on the host.
     #[arg(long)]
     pub allow_mic: bool,
+    /// Disable echo cancellation (Windows process loopback exclusion + NLMS AEC).
+    #[arg(long, conflicts_with = "echo_cancellation")]
+    pub no_echo_cancellation: bool,
+    /// Explicitly enable echo cancellation (overrides config file).
+    #[arg(long, conflicts_with = "no_echo_cancellation")]
+    pub echo_cancellation: bool,
     /// Portable mode: read/write config and identity next to the executable instead of AppData.
     #[arg(long)]
     pub portable: bool,
@@ -517,6 +525,11 @@ impl HostArgs {
         }
         if self.allow_mic {
             cfg.allow_mic = true;
+        }
+        if self.no_echo_cancellation {
+            cfg.echo_cancellation = false;
+        } else if self.echo_cancellation {
+            cfg.echo_cancellation = true;
         }
         if let Some(port) = self.ipc_port {
             cfg.ipc_port = Some(port);
@@ -691,6 +704,39 @@ mod tests {
         assert_eq!(cfg.max_fps, 144);
         assert_eq!(cfg.identity_path, Some(dir.join("identity.key")));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn echo_cancellation_toml_and_cli_flags() {
+        // Default is enabled.
+        let def = HostConfig::default();
+        assert!(def.echo_cancellation);
+
+        // TOML roundtrip with echo_cancellation = false.
+        let c = HostConfig::from_toml_str("echo_cancellation = false\n").unwrap();
+        assert!(!c.echo_cancellation);
+        let back = HostConfig::from_toml_str(&c.to_toml()).unwrap();
+        assert!(!back.echo_cancellation);
+
+        // CLI --no-echo-cancellation disables default.
+        let cli_off = Cli::try_parse_from(["veloxdesk", "--host", "--no-echo-cancellation"]).unwrap();
+        assert!(!cli_off.h.resolve().unwrap().echo_cancellation);
+
+        // CLI --echo-cancellation overrides TOML echo_cancellation = false.
+        let dir = std::env::temp_dir().join(format!("vdk-aec-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("host.toml");
+        std::fs::write(&path, "echo_cancellation = false\n").unwrap();
+        let cli_on = Cli::try_parse_from([
+            "veloxdesk",
+            "--host",
+            "--config",
+            path.to_str().unwrap(),
+            "--echo-cancellation",
+        ])
+        .unwrap();
+        assert!(cli_on.h.resolve().unwrap().echo_cancellation);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

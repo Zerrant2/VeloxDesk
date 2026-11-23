@@ -9,6 +9,7 @@ import android.util.Log
 import android.view.WindowManager
 import androidx.core.content.ContextCompat
 import dev.veloxdesk.bridge.BridgeConstants
+import dev.veloxdesk.bridge.ChatState
 import dev.veloxdesk.bridge.HostApprovalRequest
 import dev.veloxdesk.bridge.HostPasswordMode
 import dev.veloxdesk.bridge.HostSavedTrustedPeer
@@ -146,6 +147,7 @@ object HostController {
                 it.copy(
                     activePeerDeviceId = peerDeviceId,
                     activePeerName = peerName.ifBlank { peerDeviceId },
+                    chat = ChatState(),
                 )
             }
             val enc = encoder
@@ -164,6 +166,7 @@ object HostController {
                 it.copy(
                     activePeerDeviceId = null,
                     activePeerName = null,
+                    chat = ChatState(),
                 )
             }
             VeloxAccessibilityService.resetState()
@@ -210,6 +213,27 @@ object HostController {
             clipboard?.onRemoteClipboardText(text)
         }
 
+        override fun onHostChatMessage(
+            peerDeviceId: String,
+            id: Long,
+            senderName: String,
+            text: String,
+            tsMs: Long,
+        ) {
+            val resolvedSender = senderName.trim().ifEmpty {
+                _uiState.value.activePeerName?.ifBlank { null } ?: peerDeviceId.ifBlank { "Viewer" }
+            }
+            _uiState.update { state ->
+                state.copy(chat = state.chat.onIncomingReceived(id, resolvedSender, text, tsMs))
+            }
+        }
+
+        override fun onHostChatAck(peerDeviceId: String, id: Long) {
+            _uiState.update { state ->
+                state.copy(chat = state.chat.onAckReceived(id))
+            }
+        }
+
         override fun onHostError(message: String) {
             Log.e(TAG, "Rust host error: $message")
             _uiState.update { it.copy(error = message, isStarting = false) }
@@ -223,6 +247,7 @@ object HostController {
                     isStarting = false,
                     activePeerDeviceId = null,
                     activePeerName = null,
+                    chat = ChatState(),
                 )
             }
         }
@@ -387,6 +412,30 @@ object HostController {
 
     fun clearError() {
         _uiState.update { it.copy(error = null) }
+    }
+
+    fun setChatOpen(open: Boolean) {
+        _uiState.update { it.copy(chat = it.chat.setOpen(open)) }
+    }
+
+    fun sendChatMessage(rawText: String) {
+        val text = rawText.trim()
+        if (text.isEmpty()) return
+        val handle = nativeHandle
+        if (handle == 0L || !VeloxNative.isLoaded) return
+        val sender = (Build.MODEL ?: "Android").trim().ifEmpty { "Android" }
+        val id = try {
+            VeloxNative.nativeHostSendChat(handle, sender, text)
+        } catch (t: Throwable) {
+            Log.w(TAG, "nativeHostSendChat failed: ${t.message}")
+            0L
+        }
+        if (id > 0L) {
+            val nowMs = System.currentTimeMillis()
+            _uiState.update { state ->
+                state.copy(chat = state.chat.onOutgoingSent(id, sender, text, nowMs))
+            }
+        }
     }
 
     internal fun consumePendingStart(): PendingHostStart? {
@@ -580,6 +629,7 @@ object HostController {
                 isStarting = false,
                 activePeerDeviceId = null,
                 activePeerName = null,
+                chat = ChatState(),
             )
         }
         VeloxAccessibilityService.resetState()

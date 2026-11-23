@@ -173,6 +173,8 @@ pub enum ConnectAction {
     DismissUpdate,
     /// Trigger an on-demand GitHub Releases update check.
     CheckForUpdates,
+    /// Open or close the local embedded-host chat panel (v0.5.0).
+    ToggleHostChat,
 }
 
 #[derive(Debug, Default)]
@@ -208,6 +210,10 @@ pub struct ConnectScreen {
     pub update_state: UpdateUiState,
     /// Whether the user clicked "Later" / "Dismiss" on the current update banner.
     pub update_dismissed: bool,
+    /// Whether the embedded-host chat window is currently open.
+    pub host_chat_open: bool,
+    /// Number of unread incoming chat messages on the embedded host.
+    pub host_chat_unread: usize,
 }
 
 impl ConnectScreen {
@@ -533,6 +539,21 @@ impl ConnectScreen {
                 if ui.add(egui::Button::new(toggle_text).min_size(egui::vec2(120.0, 28.0))).clicked() {
                     *action = Some(ConnectAction::ToggleHost(!self.host_running));
                 }
+                if self.host_running || self.host_chat_unread > 0 {
+                    let chat_label = t.fmt_chat_with_unread(t.host_chat_btn, self.host_chat_unread);
+                    let chat_btn = if self.host_chat_unread > 0 && !self.host_chat_open {
+                        egui::Button::new(
+                            egui::RichText::new(chat_label).strong().color(pal.badge_active_text),
+                        )
+                        .fill(pal.badge_active_bg)
+                        .min_size(egui::vec2(84.0, 28.0))
+                    } else {
+                        egui::Button::new(chat_label).min_size(egui::vec2(84.0, 28.0))
+                    };
+                    if ui.add(chat_btn).on_hover_text(t.host_chat_tooltip).clicked() {
+                        *action = Some(ConnectAction::ToggleHostChat);
+                    }
+                }
             });
 
             ui.add_space(6.0);
@@ -585,6 +606,7 @@ impl ConnectScreen {
                         .selectable_value(&mut settings.mode, Mode::Gaming, Mode::Gaming.label_for(lang))
                         .changed();
                 if changed {
+                    settings.set_mode(settings.mode);
                     settings.save_to_or_default(self.settings_path.as_deref());
                 }
             });

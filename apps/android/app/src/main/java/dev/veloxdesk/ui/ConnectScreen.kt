@@ -31,6 +31,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Chat
 import androidx.compose.material.icons.automirrored.rounded.ScreenShare
 import androidx.compose.material.icons.automirrored.rounded.StopScreenShare
 import androidx.compose.material.icons.rounded.BrightnessAuto
@@ -63,6 +64,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -126,6 +128,7 @@ fun ConnectScreen(
     onRotateOtp: () -> Unit,
     onDismissHostError: () -> Unit,
     onEnableAccessibility: () -> Unit,
+    onOpenHostChat: () -> Unit,
     onModeSelected: (Int) -> Unit,
     onConnect: (target: String, mode: Int) -> Unit,
     onRemoveRecent: (target: String) -> Unit,
@@ -256,6 +259,7 @@ fun ConnectScreen(
                 onStopSharing = onStopSharing,
                 onDismissHostError = onDismissHostError,
                 onEnableAccessibility = onEnableAccessibility,
+                onOpenHostChat = onOpenHostChat,
             )
 
             // "Connect to Remote Device" card
@@ -505,6 +509,7 @@ private fun ShareThisDeviceCard(
     onStopSharing: () -> Unit,
     onDismissHostError: () -> Unit,
     onEnableAccessibility: () -> Unit,
+    onOpenHostChat: () -> Unit,
 ) {
     val colors = VeloxTheme.colors
     val statusText = when {
@@ -805,6 +810,38 @@ private fun ShareThisDeviceCard(
                         fontWeight = FontWeight.Bold,
                         fontSize = 15.sp,
                     )
+                }
+
+                // Host <-> Viewer Chat button when a remote viewer is connected
+                if (hostState.activePeerDeviceId != null) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = onOpenHostChat,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (hostState.chat.unreadCount > 0) colors.primary else colors.border,
+                        ),
+                        contentPadding = PaddingValues(vertical = 11.dp, horizontal = 14.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.Chat,
+                            contentDescription = null,
+                            tint = colors.primary,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = str(R.string.chat_open_button),
+                            color = colors.textPrimary,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        if (hostState.chat.unreadCount > 0) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            UnreadCountBadge(count = hostState.chat.unreadCount)
+                        }
+                    }
                 }
             } else {
                 Button(

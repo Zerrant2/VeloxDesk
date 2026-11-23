@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use veloxdesk_audio::pcm::{LinearResampler, remix_channels};
-use veloxdesk_audio::{AudioJitterBuffer, JitterConfig, JitterPop, OpusDecoder};
+use veloxdesk_audio::{
+    AcousticEchoCanceller, AecConfig, AecReferenceFeed, AudioJitterBuffer, JitterConfig, JitterPop, OpusDecoder,
+};
 use veloxdesk_core_traits::audio::{
     AudioCaptureConfig, AudioCodecId, AudioDecoder, AudioEncoderConfig, AudioFormat, AudioFrame, EncodedAudio,
 };
@@ -26,6 +28,8 @@ pub struct AudioParams {
     pub stream_id: u8,
     pub bitrate_kbps: u32,
     pub frame_duration_us: u32,
+    /// Enable Windows process loopback exclusion and optional NLMS AEC when mic playback is active.
+    pub echo_cancellation: bool,
 }
 
 /// Running host system-audio capture → Opus encode → QUIC datagram thread.
@@ -43,6 +47,17 @@ impl AudioPipeline {
         backends: &HostBackends,
         channel: Arc<dyn TransportChannel>,
     ) -> Result<(Self, AudioConfig)> {
+        Self::start_with_aec(params, backends, channel, None)
+    }
+
+    /// Like [`Self::start`], optionally connecting an [`AecReferenceFeed`] from [`MicPlayback`]
+    /// so NLMS [`AcousticEchoCanceller`] suppresses echoed viewer microphone audio.
+    pub fn start_with_aec(
+        params: AudioParams,
+        backends: &HostBackends,
+        channel: Arc<dyn TransportChannel>,
+        aec_ref: Option<AecReferenceFeed>,
+    ) -> Result<(Self, AudioConfig)> {
         let cap_factory = backends
             .audio_capture
             .as_ref()
@@ -53,7 +68,11 @@ impl AudioPipeline {
             .ok_or_else(|| CoreError::unsupported("audio encoder backend not configured"))?;
 
         let frame_duration = Duration::from_micros(params.frame_duration_us as u64);
-        let mut capture = cap_factory()?;
+        let mut capture = if Arc::ptr_eq(cap_factory, &crate::host::system_audio_capture_factory()) {
+            veloxdesk_audio::create_loopback_capture_with_options(params.echo_cancellation)?
+        } else {
+            cap_factory()?
+        };
         let cap_fmt = capture.start(&AudioCaptureConfig {
             format: AudioFormat::STEREO_48K,
             chunk: frame_duration,
@@ -83,6 +102,7 @@ impl AudioPipeline {
         let stop_bg = stop.clone();
         let red_bg = redundant.clone();
         let mut sender = AudioSender::new(channel, params.stream_id);
+        let use_aec = params.echo_cancellation && aec_ref.is_some();
 
         let thread = std::thread::Builder::new()
             .name("vdk-audio-tx".into())
@@ -90,7 +110,15 @@ impl AudioPipeline {
                 let mut resampler = (cap_fmt.sample_rate != enc_fmt.sample_rate).then(|| {
                     LinearResampler::new(cap_fmt.sample_rate, enc_fmt.sample_rate, enc_fmt.channels as usize)
                 });
+                let mut aec = use_aec.then(|| {
+                    AcousticEchoCanceller::new(AecConfig {
+                        sample_rate: enc_fmt.sample_rate,
+                        channels: enc_fmt.channels,
+                        ..AecConfig::default()
+                    })
+                });
                 let mut scratch = Vec::new();
+                let mut aec_ref_scratch = Vec::new();
                 while !stop_bg.load(Ordering::Relaxed) {
                     let want_red = red_bg.load(Ordering::Relaxed);
                     if sender.is_redundant() != want_red {
@@ -112,6 +140,20 @@ impl AudioPipeline {
                                 rs.process(&frame.samples, &mut scratch);
                                 std::mem::swap(&mut frame.samples, &mut scratch);
                                 frame.format.sample_rate = enc_fmt.sample_rate;
+                            }
+                            if let (Some(aec), Some(feed)) = (aec.as_mut(), aec_ref.as_ref()) {
+                                if enc_fmt.channels == 2 {
+                                    aec.process_capture_with_feed(&mut frame.samples, feed);
+                                } else {
+                                    // MicPlayback feeds stereo 48 kHz reference samples; downmix to mono.
+                                    aec_ref_scratch.clear();
+                                    feed.drain_into(&mut aec_ref_scratch, frame.samples.len() * 2);
+                                    if !aec_ref_scratch.is_empty() {
+                                        remix_channels(&aec_ref_scratch, 2, 1, &mut scratch);
+                                        aec.push_reference(&scratch);
+                                    }
+                                    aec.process_capture(&mut frame.samples);
+                                }
                             }
                             match encoder.encode(&frame) {
                                 Ok(pkts) => {
@@ -181,6 +223,16 @@ impl MicHandle {
 
 impl MicPlayback {
     pub fn start(frame_duration_us: u32, backends: &HostBackends) -> Result<Self> {
+        Self::start_with_aec_feed(frame_duration_us, backends, None)
+    }
+
+    /// Start viewer-microphone playback and optionally feed decoded speaker samples into
+    /// `aec_ref` for [`AudioPipeline`] echo cancellation.
+    pub fn start_with_aec_feed(
+        frame_duration_us: u32,
+        backends: &HostBackends,
+        aec_ref: Option<AecReferenceFeed>,
+    ) -> Result<Self> {
         let pb_factory = backends
             .audio_playback
             .as_ref()
@@ -229,6 +281,9 @@ impl MicPlayback {
                         JitterPop::Buffering => None,
                     };
                     if let Some(pcm) = frame {
+                        if let Some(feed) = &aec_ref {
+                            feed.push(&pcm.samples);
+                        }
                         let _ = playback.push(&pcm);
                     }
                     std::thread::sleep(tick);
@@ -359,9 +414,12 @@ mod tests {
         backends.audio_encoder =
             Some(Arc::new(|cfg| Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?) as Box<dyn AudioEncoder>)));
 
-        let (pipe, wire) =
-            AudioPipeline::start(AudioParams { stream_id: 0, bitrate_kbps: 128, frame_duration_us: 5_000 }, &backends, ch)
-                .unwrap();
+        let (pipe, wire) = AudioPipeline::start(
+            AudioParams { stream_id: 0, bitrate_kbps: 128, frame_duration_us: 5_000, echo_cancellation: true },
+            &backends,
+            ch,
+        )
+        .unwrap();
         assert_eq!(wire.sample_rate, 48_000);
         assert_eq!(wire.channels, 2);
         assert_eq!(wire.frame_duration_us, 5_000);
@@ -379,5 +437,97 @@ mod tests {
         assert_eq!(sid, 0);
         assert_eq!(pkt.codec, AudioCodecId::Opus);
         assert_eq!(pkt.duration_us, 5_000);
+    }
+
+    #[test]
+    fn audio_pipeline_with_aec_reference_feed_runs_cleanly() {
+        use bytes::Bytes;
+        use std::sync::Mutex;
+        use veloxdesk_core_traits::Timestamp;
+        use veloxdesk_core_traits::audio::{AudioCapture, AudioEncoder};
+        use veloxdesk_core_traits::transport::{RecvStream, SendStream, TransportStats};
+        use veloxdesk_protocol::StreamKind;
+
+        struct ToneCapture;
+        impl AudioCapture for ToneCapture {
+            fn backend(&self) -> &'static str {
+                "tone"
+            }
+            fn start(&mut self, cfg: &AudioCaptureConfig) -> Result<AudioFormat> {
+                Ok(cfg.format)
+            }
+            fn read(&mut self, _timeout: Duration) -> Result<Option<AudioFrame>> {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(Some(AudioFrame {
+                    format: AudioFormat::STEREO_48K,
+                    samples: vec![0.15f32; 240 * 2],
+                    capture_ts: Timestamp::now(),
+                }))
+            }
+            fn stop(&mut self) {}
+        }
+
+        struct SinkChannel(Arc<Mutex<Vec<Bytes>>>);
+        #[async_trait::async_trait]
+        impl TransportChannel for SinkChannel {
+            fn max_datagram_size(&self) -> Option<usize> {
+                Some(1200)
+            }
+            fn send_datagram(&self, data: Bytes) -> Result<()> {
+                self.0.lock().unwrap().push(data);
+                Ok(())
+            }
+            async fn recv_datagram(&self) -> Result<Bytes> {
+                std::future::pending().await
+            }
+            async fn open_bi(&self, _: StreamKind) -> Result<(SendStream, RecvStream)> {
+                Err(CoreError::Closed)
+            }
+            async fn open_uni(&self, _: StreamKind) -> Result<SendStream> {
+                Err(CoreError::Closed)
+            }
+            async fn accept_bi(&self) -> Result<(StreamKind, SendStream, RecvStream)> {
+                Err(CoreError::Closed)
+            }
+            async fn accept_uni(&self) -> Result<(StreamKind, RecvStream)> {
+                Err(CoreError::Closed)
+            }
+            fn stats(&self) -> TransportStats {
+                TransportStats::default()
+            }
+            fn peer_public_key(&self) -> Option<[u8; 32]> {
+                None
+            }
+            fn close(&self, _: u32, _: &str) {}
+        }
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let ch: Arc<dyn TransportChannel> = Arc::new(SinkChannel(sent.clone()));
+        let mut backends = crate::HostBackends::system().without_audio();
+        backends.audio_capture = Some(Arc::new(|| Ok(Box::new(ToneCapture))));
+        backends.audio_encoder =
+            Some(Arc::new(|cfg| Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?) as Box<dyn AudioEncoder>)));
+
+        let feed = AecReferenceFeed::new(4_800);
+        feed.push(&vec![0.1f32; 480]);
+        let (pipe, _) = AudioPipeline::start_with_aec(
+            AudioParams { stream_id: 0, bitrate_kbps: 128, frame_duration_us: 5_000, echo_cancellation: true },
+            &backends,
+            ch,
+            Some(feed.clone()),
+        )
+        .unwrap();
+
+        for _ in 0..50 {
+            if sent.lock().unwrap().len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pipe.stop();
+        assert!(sent.lock().unwrap().len() >= 2);
+        // Reference samples pushed before capture should have been drained by the AEC loop.
+        let mut rem = Vec::new();
+        assert_eq!(feed.drain_into(&mut rem, 480), 0);
     }
 }

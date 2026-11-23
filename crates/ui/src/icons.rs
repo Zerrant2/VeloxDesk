@@ -9,6 +9,17 @@ pub fn status_dot(painter: &egui::Painter, rect: egui::Rect, color: egui::Color3
     painter.circle_filled(rect.center(), r, color);
 }
 
+/// Draw a checkmark inside `rect` (e.g. chat delivery acknowledgement).
+pub fn check(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let r = rect.shrink(rect.width().min(rect.height()) * 0.14);
+    let stroke = egui::Stroke::new((r.width().min(r.height()) * 0.18).max(1.4), color);
+    let p1 = egui::pos2(r.left(), r.top() + r.height() * 0.56);
+    let p2 = egui::pos2(r.left() + r.width() * 0.38, r.bottom());
+    let p3 = egui::pos2(r.right(), r.top() + r.height() * 0.14);
+    painter.line_segment([p1, p2], stroke);
+    painter.line_segment([p2, p3], stroke);
+}
+
 /// Draw a diagonal cross (`X`) icon inside `rect`.
 pub fn close_cross(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let min_dim = rect.width().min(rect.height());
@@ -229,11 +240,27 @@ pub fn recents_atom(size: f32) -> egui::Atom<'static> {
     })
 }
 
+/// Paint-based [`egui::Atom`] for [`status_dot`] tinted with an explicit `color`.
+pub fn status_dot_atom(size: f32, color: egui::Color32) -> egui::Atom<'static> {
+    egui::Atom::paint(egui::vec2(size, size), move |ui, args| {
+        status_dot(ui.painter(), args.rect, color);
+    })
+}
+
 /// Standalone colored status dot widget.
 pub fn status_dot_widget(ui: &mut egui::Ui, diameter: f32, color: egui::Color32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         status_dot(ui.painter(), rect, color);
+    }
+    resp
+}
+
+/// Standalone colored checkmark widget (e.g. chat delivery receipt).
+pub fn check_widget(ui: &mut egui::Ui, size: f32, color: egui::Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        check(ui.painter(), rect, color);
     }
     resp
 }
@@ -256,13 +283,15 @@ pub fn icon_small_button(ui: &mut egui::Ui, min_size: egui::Vec2, atom: egui::At
 mod tests {
     use super::*;
     use crate::auth::{AcceptPrompt, IncomingSessionInfo, PasswordPrompt};
+    use crate::chat::ChatWindow;
     use crate::connect::{ConnectScreen, TailscaleInfo, TailscalePeer};
     use crate::files::FileManagerWindow;
+    use crate::power::{PowerConfirmDialog, ReconnectBannerState, ReconnectOverlay};
     use crate::session::{SessionInfo, SessionToolbar, settings_window};
     use crate::settings::Settings;
     use crate::terminal::TerminalWindow;
     use crate::tunnels::{ActiveTunnel, TunnelsWindow};
-    use veloxdesk_protocol::control::{DisplayInfo, FileEntry, Permissions};
+    use veloxdesk_protocol::control::{ChatMessage, DisplayInfo, FileEntry, Permissions, SystemPowerAction};
 
     const FORBIDDEN_MISSING_GLYPHS: [char; 8] = [
         '\u{25CF}', // black circle
@@ -438,10 +467,38 @@ mod tests {
             files_open: true,
             terminal_open: true,
             tunnels_open: true,
+            chat_open: true,
+            chat_unread: 2,
+            allow_chat: true,
+            allow_power: true,
+            recording_active: true,
+            recording_waiting_keyframe: false,
+            recording_elapsed_ms: 95_000,
+            recording_bytes: 12_400_000,
         };
 
-        let mut toolbar_collapsed = SessionToolbar { expanded: false };
-        let mut toolbar_expanded = SessionToolbar { expanded: true };
+        let mut toolbar_collapsed = SessionToolbar { expanded: false, ..Default::default() };
+        let mut toolbar_expanded = SessionToolbar { expanded: true, ..Default::default() };
+        let mut chat = ChatWindow::new("glyph-chat", false);
+        chat.set_open(true);
+        chat.push_incoming(ChatMessage {
+            id: 1,
+            sender_name: "Host".into(),
+            text: "Hello / Привет".into(),
+            ts_ms: 45_000_000,
+        });
+        chat.push_outgoing(2, "Me".into(), "Reply".into(), 45_060_000);
+        chat.mark_acked(2);
+        let power_dlg = PowerConfirmDialog::new(SystemPowerAction::Reboot, "Host".into());
+        let reconnect_state = ReconnectBannerState {
+            active: true,
+            target: "10.0.0.5:21118".into(),
+            attempt: 2,
+            elapsed_secs: 10,
+            max_secs: 300,
+            next_retry_secs: 4,
+            last_error: Some("restarting".into()),
+        };
         let mut settings_open = true;
         let mut files = FileManagerWindow {
             open: true,
@@ -504,6 +561,9 @@ mod tests {
                 let _ = pw.show(ui.ctx());
                 let _ = accept.show(ui.ctx());
                 let _ = term.show(ui.ctx());
+                let _ = chat.show(ui.ctx());
+                let _ = power_dlg.show(ui.ctx());
+                let _ = ReconnectOverlay::show(ui.ctx(), &reconnect_state);
             });
             out2.textures_delta.clear();
             for clipped in &out2.shapes {

@@ -231,6 +231,9 @@ impl AcceptPrompt {
                     ui.checkbox(&mut self.permissions.terminal, t.perm_terminal);
                     ui.checkbox(&mut self.permissions.privacy_mode, t.perm_privacy_mode);
                     ui.end_row();
+                    ui.checkbox(&mut self.permissions.allow_chat, t.perm_chat);
+                    ui.checkbox(&mut self.permissions.allow_power, t.perm_power);
+                    ui.end_row();
                     ui.checkbox(&mut self.permissions.restart, t.perm_restart);
                     ui.end_row();
                 });

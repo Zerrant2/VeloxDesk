@@ -1,6 +1,7 @@
 //! Interface between the winit/render thread and a remote session (network + decode).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32};
 
@@ -9,7 +10,11 @@ use veloxdesk_core_traits::Timestamp;
 use veloxdesk_core_traits::time::ClockSync;
 use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
-use veloxdesk_protocol::control::{DisplayInfo, FileEntry, InputEvent, SessionConfig, SessionMode, VideoConfig};
+use veloxdesk_protocol::control::{
+    ChatMessage, DisplayInfo, FileEntry, InputEvent, Permissions, SessionConfig, SessionMode, SystemPowerAction,
+    SystemPowerResult, VideoConfig,
+};
+use veloxdesk_recorder::RecorderStats;
 use veloxdesk_ui::{
     ActiveTunnel, ConnectTarget, FileAction, TerminalAction, TransferProgress, TunnelAction, TunnelSpec,
 };
@@ -40,9 +45,15 @@ pub enum SessionEvent {
         error: Option<String>,
     },
     Config(Box<SessionConfig>),
+    Permissions(Permissions),
     VideoConfig(Box<VideoConfig>),
     DisplayList(Vec<DisplayInfo>),
     PrivacyMode { enabled: bool, error: Option<String> },
+    ChatReceived(ChatMessage),
+    ChatAcked(u64),
+    SystemPowerResult(SystemPowerResult),
+    RecordingStopped(RecorderStats),
+    RecordingError(String),
     FileListing { path: String, entries: Vec<FileEntry> },
     FileProgress(Option<TransferProgress>),
     FileStatus(String),
@@ -72,8 +83,13 @@ pub enum SessionCommand {
     SetMaxBitrate(u32),
     SetAudio(bool),
     SetMic(bool),
+    SetEchoCancellation(bool),
     SetClipboardSync(bool),
     SetPrivacyMode(bool),
+    StartRecording { output_path: PathBuf },
+    StopRecording,
+    SendChat { id: u64, sender_name: String, text: String, ts_ms: u64 },
+    SystemPower(SystemPowerAction),
     File(FileAction),
     Terminal(TerminalAction),
     Tunnel(TunnelAction),
@@ -94,6 +110,8 @@ pub struct SessionShared {
     pub audio_buf_us: AtomicU32,
     /// Number of currently attached local physical gamepads (0..=4).
     pub active_gamepads: Arc<AtomicU8>,
+    /// Live snapshot of the zero re-encode client-side session recorder (v0.5.0).
+    pub recording: Mutex<RecorderStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +128,7 @@ pub struct ConnectOptions {
     pub prefer_gpu_decode: bool,
     pub audio_enabled: bool,
     pub mic_enabled: bool,
+    pub echo_cancellation: bool,
     pub clipboard_sync: bool,
     pub initial_tunnels: Vec<TunnelSpec>,
     pub hdr_10bit: bool,

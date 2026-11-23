@@ -2,11 +2,12 @@
 
 use std::path::Path;
 
-use veloxdesk_protocol::control::DisplayInfo;
+use veloxdesk_protocol::control::{DisplayInfo, SystemPowerAction};
 
 use crate::auth::format_fingerprint;
 use crate::connect::{UpdateUiState, format_device_id};
 use crate::i18n::tr;
+use crate::power::{PowerConfirmDialog, PowerConfirmOutcome, power_action_label};
 use crate::settings::{FpsCap, Language, Mode, PasswordMode, Present, Quality, Scale, Settings, ThemePreference};
 
 /// What the toolbar / settings window asks the application to do.
@@ -22,12 +23,16 @@ pub enum ToolbarAction {
     SetScale(Scale),
     SetAudio(bool),
     SetMic(bool),
+    SetEchoCancellation(bool),
     SetClipboardSync(bool),
     SetPrivacyMode(bool),
     SetHud(bool),
     ToggleFiles,
     ToggleTerminal,
     ToggleTunnels,
+    ToggleChat,
+    ToggleRecording,
+    SystemPower(SystemPowerAction),
     TogglePointerLock,
     ToggleHud,
     ToggleFullscreen,
@@ -45,8 +50,44 @@ pub enum ToolbarAction {
     Disconnect,
 }
 
+/// Alias for [`ToolbarAction`] for callers referring to session toolbar actions.
+pub type SessionAction = ToolbarAction;
+
+/// Format recording elapsed duration in milliseconds as `MM:SS` (or `H:MM:SS` once >= 1 hour).
+pub fn format_recording_elapsed(elapsed_ms: u64) -> String {
+    let total_secs = elapsed_ms / 1000;
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    }
+}
+
+/// Format recording file size cleanly (`12.4 MB` / `12.4 МБ`, decimal megabytes for media files).
+pub fn format_recording_size(bytes: u64, lang: Language) -> String {
+    const KB: f64 = 1_000.0;
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    let b = bytes as f64;
+    let ru = lang == Language::Ru;
+    if b >= GB {
+        if ru { format!("{:.2} ГБ", b / GB) } else { format!("{:.2} GB", b / GB) }
+    } else if b >= MB {
+        if ru { format!("{:.1} МБ", b / MB) } else { format!("{:.1} MB", b / MB) }
+    } else if b >= KB {
+        if ru { format!("{:.0} КБ", b / KB) } else { format!("{:.0} KB", b / KB) }
+    } else if ru {
+        format!("{bytes} Б")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Session information shown in the toolbar.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub host_name: String,
     pub host_os: String,
@@ -59,11 +100,46 @@ pub struct SessionInfo {
     pub files_open: bool,
     pub terminal_open: bool,
     pub tunnels_open: bool,
+    pub chat_open: bool,
+    pub chat_unread: usize,
+    pub allow_chat: bool,
+    pub allow_power: bool,
+    pub recording_active: bool,
+    pub recording_waiting_keyframe: bool,
+    pub recording_elapsed_ms: u64,
+    pub recording_bytes: u64,
+}
+
+impl Default for SessionInfo {
+    fn default() -> Self {
+        Self {
+            host_name: String::new(),
+            host_os: String::new(),
+            displays: Vec::new(),
+            active_display: 0,
+            hud_visible: false,
+            pointer_locked: false,
+            active_gamepads: 0,
+            privacy_mode: false,
+            files_open: false,
+            terminal_open: false,
+            tunnels_open: false,
+            chat_open: false,
+            chat_unread: 0,
+            allow_chat: true,
+            allow_power: false,
+            recording_active: false,
+            recording_waiting_keyframe: false,
+            recording_elapsed_ms: 0,
+            recording_bytes: 0,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct SessionToolbar {
     pub expanded: bool,
+    pub power_confirm: Option<PowerConfirmDialog>,
 }
 
 impl SessionToolbar {
@@ -90,6 +166,30 @@ impl SessionToolbar {
                             if info.pointer_locked {
                                 ui.colored_label(pal.success, t.pointer_locked_pill);
                             }
+                            if info.recording_active {
+                                let elapsed = format_recording_elapsed(info.recording_elapsed_ms);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    crate::icons::status_dot_widget(ui, 8.0, pal.danger);
+                                    ui.colored_label(
+                                        pal.danger,
+                                        egui::RichText::new(format!("{} {elapsed}", t.toolbar_rec)).strong().small(),
+                                    );
+                                });
+                            }
+                            if info.chat_unread > 0 {
+                                let badge_btn = egui::Button::new(
+                                    egui::RichText::new(t.fmt_chat_with_unread(t.toolbar_chat, info.chat_unread))
+                                        .strong()
+                                        .small()
+                                        .color(pal.badge_active_text),
+                                )
+                                .fill(pal.badge_active_bg)
+                                .small();
+                                if ui.add(badge_btn).on_hover_text(t.toolbar_chat_tooltip).clicked() {
+                                    out.push(ToolbarAction::ToggleChat);
+                                }
+                            }
                         });
                         return;
                     }
@@ -113,7 +213,7 @@ impl SessionToolbar {
                                 if ui.selectable_label(settings.mode == m, m.label_for(lang)).clicked()
                                     && settings.mode != m
                                 {
-                                    settings.mode = m;
+                                    settings.set_mode(m);
                                     out.push(ToolbarAction::SetMode(m));
                                 }
                             }
@@ -226,6 +326,84 @@ impl SessionToolbar {
                             {
                                 out.push(ToolbarAction::ToggleTunnels);
                             }
+                            {
+                                let chat_label = t.fmt_chat_with_unread(t.toolbar_chat, info.chat_unread);
+                                let chat_clicked = if info.chat_unread > 0 && !info.chat_open {
+                                    ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new(chat_label)
+                                                .strong()
+                                                .color(pal.badge_active_text),
+                                        )
+                                        .fill(pal.badge_active_bg)
+                                        .small(),
+                                    )
+                                    .on_hover_text(t.toolbar_chat_tooltip)
+                                    .clicked()
+                                } else {
+                                    ui.selectable_label(info.chat_open, chat_label)
+                                        .on_hover_text(t.toolbar_chat_tooltip)
+                                        .clicked()
+                                };
+                                if chat_clicked {
+                                    out.push(ToolbarAction::ToggleChat);
+                                }
+                            }
+                            {
+                                let rec_clicked = if info.recording_active {
+                                    let elapsed = format_recording_elapsed(info.recording_elapsed_ms);
+                                    let detail = if info.recording_waiting_keyframe {
+                                        format!("{} {elapsed} · {}", t.toolbar_rec, t.toolbar_rec_waiting)
+                                    } else {
+                                        let size = format_recording_size(info.recording_bytes, lang);
+                                        format!("{} {elapsed} · {size}", t.toolbar_rec)
+                                    };
+                                    ui.add(
+                                        egui::Button::new((
+                                            crate::icons::status_dot_atom(9.0, pal.danger),
+                                            egui::RichText::new(detail).strong().color(pal.error_banner_text),
+                                        ))
+                                        .fill(pal.error_banner_bg)
+                                        .stroke(egui::Stroke::new(1.0, pal.error_banner_stroke))
+                                        .small(),
+                                    )
+                                    .on_hover_text(t.toolbar_rec_stop_tooltip)
+                                    .clicked()
+                                } else {
+                                    ui.add(
+                                        egui::Button::new((
+                                            crate::icons::status_dot_atom(8.0, pal.danger),
+                                            t.toolbar_rec,
+                                        ))
+                                        .small(),
+                                    )
+                                    .on_hover_text(t.toolbar_rec_start_tooltip)
+                                    .clicked()
+                                };
+                                if rec_clicked {
+                                    out.push(ToolbarAction::ToggleRecording);
+                                }
+                            }
+                            if info.allow_power {
+                                let menu_resp = ui.menu_button(t.toolbar_power, |ui| {
+                                    for act in [
+                                        SystemPowerAction::Reboot,
+                                        SystemPowerAction::RebootSafeMode,
+                                        SystemPowerAction::LockScreen,
+                                        SystemPowerAction::Sleep,
+                                    ] {
+                                        if ui.button(power_action_label(act, lang)).clicked() {
+                                            self.power_confirm =
+                                                Some(PowerConfirmDialog::new(act, info.host_name.clone()));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                                menu_resp.response.on_hover_text(t.toolbar_power_tooltip);
+                            } else {
+                                ui.add_enabled(false, egui::Button::new(t.toolbar_power).small())
+                                    .on_disabled_hover_text(t.toolbar_power_denied_tooltip);
+                            }
                             if ui
                                 .selectable_label(info.privacy_mode, t.toolbar_privacy)
                                 .on_hover_text(t.toolbar_privacy_tooltip)
@@ -296,6 +474,14 @@ impl SessionToolbar {
                         });
                     });
             });
+        if let Some(dialog) = self.power_confirm.clone()
+            && let Some(outcome) = dialog.show_for(ui.ctx(), lang)
+        {
+            self.power_confirm = None;
+            if let PowerConfirmOutcome::Confirmed(action) = outcome {
+                out.push(ToolbarAction::SystemPower(action));
+            }
+        }
         out
     }
 }
@@ -406,6 +592,9 @@ pub fn settings_window_with_security(
                             .on_hover_text(t.tip_default_mode)
                             .changed();
                         if d_changed || g_changed {
+                            if settings.mode == Mode::Gaming {
+                                settings.echo_cancellation = true;
+                            }
                             editing_mode = settings.mode;
                         }
                     });
@@ -420,6 +609,8 @@ pub fn settings_window_with_security(
                     });
                     ui.end_row();
 
+                    let gaming_locked_aec = settings.mode == Mode::Gaming || editing_mode == Mode::Gaming;
+                    let mut aec_value = settings.echo_cancellation;
                     let prof = settings.profile_mut(editing_mode);
 
                     ui.label(t.settings_quality).on_hover_text(t.tip_quality);
@@ -461,6 +652,19 @@ pub fn settings_window_with_security(
                             .on_hover_text(t.tip_remote_audio);
                         ui.checkbox(&mut prof.mic_enabled, t.settings_microphone)
                             .on_hover_text(t.tip_microphone);
+                        let aec_tip = if gaming_locked_aec {
+                            t.tip_echo_cancellation_gaming
+                        } else {
+                            t.tip_echo_cancellation
+                        };
+                        if gaming_locked_aec {
+                            let mut always_on = true;
+                            ui.add_enabled(false, egui::Checkbox::new(&mut always_on, t.settings_echo_cancellation))
+                                .on_disabled_hover_text(aec_tip);
+                        } else {
+                            ui.checkbox(&mut aec_value, t.settings_echo_cancellation)
+                                .on_hover_text(aec_tip);
+                        }
                     });
                     ui.end_row();
 
@@ -508,6 +712,10 @@ pub fn settings_window_with_security(
                         .on_hover_text(t.tip_clipboard);
                     ui.end_row();
 
+                    if !gaming_locked_aec {
+                        settings.echo_cancellation = aec_value;
+                    }
+
                     ui.label(t.settings_rendezvous_server).on_hover_text(t.tip_rendezvous_server);
                     ui.add(
                         egui::TextEdit::singleline(&mut settings.rendezvous_server)
@@ -515,6 +723,15 @@ pub fn settings_window_with_security(
                             .desired_width(200.0),
                     )
                     .on_hover_text(t.tip_rendezvous_server);
+                    ui.end_row();
+
+                    ui.label(t.settings_recordings_dir).on_hover_text(t.tip_recordings_dir);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut settings.recordings_dir)
+                            .hint_text(t.settings_recordings_dir_hint)
+                            .desired_width(200.0),
+                    )
+                    .on_hover_text(t.tip_recordings_dir);
                     ui.end_row();
 
                     let version_text = build_display
@@ -727,6 +944,9 @@ pub fn settings_window_with_security(
         if settings.require_accept != before.require_accept {
             out.push(ToolbarAction::SetRequireAccept(settings.require_accept));
         }
+        if settings.echo_cancellation != before.echo_cancellation && settings.mode == before.mode {
+            out.push(ToolbarAction::SetEchoCancellation(settings.echo_cancellation));
+        }
         if settings.mode != before.mode {
             out.push(ToolbarAction::SetMode(settings.mode));
         } else {
@@ -831,7 +1051,7 @@ mod tests {
     #[test]
     fn widgets_render_headless() {
         let mut settings = Settings::default();
-        let mut tb = SessionToolbar { expanded: true };
+        let mut tb = SessionToolbar { expanded: true, ..Default::default() };
         let info = SessionInfo {
             host_name: "host".into(),
             host_os: "windows".into(),
@@ -847,6 +1067,12 @@ mod tests {
             files_open: false,
             terminal_open: false,
             tunnels_open: false,
+            allow_power: true,
+            recording_active: true,
+            recording_elapsed_ms: 83_000,
+            recording_bytes: 12_400_000,
+            chat_unread: 2,
+            ..Default::default()
         };
         let mut screen = crate::connect::ConnectScreen::new(&settings);
         let mut open = true;
@@ -866,7 +1092,7 @@ mod tests {
         let info = SessionInfo::default();
         let mut settings = Settings { mode: Mode::Gaming, ..Default::default() };
         let desktop_before = settings.desktop;
-        let mut tb = SessionToolbar { expanded: true };
+        let mut tb = SessionToolbar { expanded: true, ..Default::default() };
 
         let mut out = ctx.run_ui(
             egui::RawInput {
@@ -1070,6 +1296,9 @@ mod tests {
             ("tip_pw_clear", en.tip_pw_clear, ru.tip_pw_clear),
             ("tip_settings_require_accept", en.tip_settings_require_accept, ru.tip_settings_require_accept),
             ("tip_trusted_devices", en.tip_trusted_devices, ru.tip_trusted_devices),
+            ("tip_echo_cancellation", en.tip_echo_cancellation, ru.tip_echo_cancellation),
+            ("tip_echo_cancellation_gaming", en.tip_echo_cancellation_gaming, ru.tip_echo_cancellation_gaming),
+            ("tip_recordings_dir", en.tip_recordings_dir, ru.tip_recordings_dir),
         ];
         for (name, e, r) in pairs {
             assert!(!e.trim().is_empty(), "{name} EN empty");
@@ -1228,7 +1457,7 @@ mod tests {
         {
             let ctx = egui::Context::default();
             let mut settings = Settings::default();
-            let mut tb = SessionToolbar { expanded: true };
+            let mut tb = SessionToolbar { expanded: true, ..Default::default() };
             let win_info = SessionInfo { host_name: "win-pc".into(), host_os: "windows".into(), ..Default::default() };
             let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
                 let _ = tb.show(ui, &win_info, &mut settings);
@@ -1243,7 +1472,7 @@ mod tests {
             let t = tr(lang);
             let ctx = egui::Context::default();
             let mut settings = Settings { language: lang, ..Default::default() };
-            let mut tb = SessionToolbar { expanded: true };
+            let mut tb = SessionToolbar { expanded: true, ..Default::default() };
             let android_info = SessionInfo {
                 host_name: "Pixel-9".into(),
                 host_os: "Android".into(),
@@ -1294,5 +1523,74 @@ mod tests {
                 assert_eq!(emitted, vec![expected], "button {label:?} ({lang:?})");
             }
         }
+    }
+
+    #[test]
+    fn recording_duration_and_size_formatting() {
+        assert_eq!(format_recording_elapsed(0), "00:00");
+        assert_eq!(format_recording_elapsed(65_000), "01:05");
+        assert_eq!(format_recording_elapsed(3_661_000), "1:01:01");
+        assert_eq!(format_recording_size(512, Language::En), "512 B");
+        assert_eq!(format_recording_size(12_400_000, Language::En), "12.4 MB");
+        assert_eq!(format_recording_size(12_400_000, Language::Ru), "12.4 МБ");
+    }
+
+    #[test]
+    fn power_confirm_modal_gates_system_power_action() {
+        let ctx = egui::Context::default();
+        let make_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            events,
+            ..Default::default()
+        };
+        let mut settings = Settings::default();
+        let info = SessionInfo { host_name: "HostPC".into(), allow_power: true, ..Default::default() };
+        let mut tb = SessionToolbar {
+            expanded: true,
+            power_confirm: Some(PowerConfirmDialog::new(SystemPowerAction::Reboot, "HostPC".into())),
+        };
+        let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+            let actions = tb.show(ui, &info, &mut settings);
+            assert!(actions.is_empty());
+        });
+        out.textures_delta.clear();
+        out = ctx.run_ui(make_input(Vec::new()), |ui| {
+            let actions = tb.show(ui, &info, &mut settings);
+            assert!(actions.is_empty());
+        });
+        out.textures_delta.clear();
+        let mut confirm_rects = Vec::new();
+        for c in &out.shapes {
+            find_all_text_rects(&c.shape, "Confirm", &mut confirm_rects);
+        }
+        // Pick the bottom-most "Confirm" rect (the Confirm button, not the window title bar).
+        let confirm_pos = confirm_rects
+            .into_iter()
+            .max_by(|a, b| a.center().y.total_cmp(&b.center().y))
+            .expect("Confirm button in PowerConfirmDialog")
+            .center();
+        let mut emitted = Vec::new();
+        for pressed in [true, false] {
+            let mut c = ctx.run_ui(
+                make_input(vec![
+                    egui::Event::PointerMoved(confirm_pos),
+                    egui::Event::PointerButton {
+                        pos: confirm_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]),
+                |ui| {
+                    let a = tb.show(ui, &info, &mut settings);
+                    if !a.is_empty() {
+                        emitted = a;
+                    }
+                },
+            );
+            c.textures_delta.clear();
+        }
+        assert_eq!(emitted, vec![ToolbarAction::SystemPower(SystemPowerAction::Reboot)]);
+        assert!(tb.power_confirm.is_none());
     }
 }

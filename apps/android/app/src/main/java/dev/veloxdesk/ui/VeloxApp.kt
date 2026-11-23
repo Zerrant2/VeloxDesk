@@ -222,6 +222,9 @@ fun VeloxApp(
                     onToggleAudio = sessionViewModel::toggleAudio,
                     onToggleClipboard = sessionViewModel::toggleClipboard,
                     onToggleHud = sessionViewModel::toggleHud,
+                    onToggleChat = sessionViewModel::toggleChat,
+                    onCloseChat = { sessionViewModel.setChatOpen(false) },
+                    onSendChatMessage = sessionViewModel::sendChatMessage,
                     onSelectBitrate = sessionViewModel::setMaxBitrate,
                     onSwitchDisplay = sessionViewModel::switchDisplay,
                     onSpecialKeyPressed = sessionViewModel::onSpecialKeyPressed,
@@ -319,6 +322,7 @@ fun VeloxApp(
                             onRotateOtp = HostController::rotateOtp,
                             onDismissHostError = HostController::clearError,
                             onEnableAccessibility = { VeloxAccessibilityService.openSettings(context) },
+                            onOpenHostChat = { HostController.setChatOpen(true) },
                             onModeSelected = preferences::setLastMode,
                             onConnect = { target, mode ->
                                 preferences.setLastMode(mode)
@@ -368,6 +372,17 @@ fun VeloxApp(
                             rememberPeer = false,
                         )
                     },
+                )
+            }
+
+            // Global Android Host in-session chat dialog (PC/Phone viewer <-> Android host)
+            val activePeerId = hostState.activePeerDeviceId
+            if (hostState.chat.isOpen && activePeerId != null) {
+                HostChatDialog(
+                    peerName = hostState.activePeerName?.ifBlank { null } ?: activePeerId,
+                    messages = hostState.chat.messages,
+                    onSendMessage = HostController::sendChatMessage,
+                    onDismiss = { HostController.setChatOpen(false) },
                 )
             }
         }

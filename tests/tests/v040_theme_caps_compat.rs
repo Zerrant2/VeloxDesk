@@ -353,7 +353,7 @@ fn v040_headless_render_dark_and_light_en_ru_with_glyphs_and_android_nav() {
                 }],
                 ..Default::default()
             };
-            let mut tb_win = SessionToolbar { expanded: true };
+            let mut tb_win = SessionToolbar { expanded: true, ..Default::default() };
             let mut out_win = tctx_win.run_ui(make_input(viewport, 0.0, Vec::new()), |ui| {
                 let _ = tb_win.show(ui, &win_info, &mut settings);
             });
@@ -382,7 +382,7 @@ fn v040_headless_render_dark_and_light_en_ru_with_glyphs_and_android_nav() {
                 }],
                 ..Default::default()
             };
-            let mut tb_and = SessionToolbar { expanded: true };
+            let mut tb_and = SessionToolbar { expanded: true, ..Default::default() };
             let mut out_and = tctx_and.run_ui(make_input(viewport, 0.0, Vec::new()), |ui| {
                 let _ = tb_and.show(ui, &and_info, &mut settings);
             });

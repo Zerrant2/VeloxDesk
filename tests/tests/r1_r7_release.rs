@@ -231,7 +231,7 @@ fn r1_fullscreen_exit_failsafe_and_toolbar_disconnect() {
             }],
             ..Default::default()
         };
-        let mut tb = SessionToolbar { expanded: true };
+        let mut tb = SessionToolbar { expanded: true, ..Default::default() };
         let mut warm = tb_ctx.run_ui(make_input(viewport, Some(0.0), Vec::new()), |ui| {
             let _ = tb.show(ui, &info, &mut settings);
         });
@@ -457,9 +457,10 @@ fn r2_headless_render_all_ui_components_en_and_ru_with_glyph_check() {
             files_open: true,
             terminal_open: true,
             tunnels_open: true,
+            ..Default::default()
         };
-        let mut tb_collapsed = SessionToolbar { expanded: false };
-        let mut tb_expanded = SessionToolbar { expanded: true };
+        let mut tb_collapsed = SessionToolbar { expanded: false, ..Default::default() };
+        let mut tb_expanded = SessionToolbar { expanded: true, ..Default::default() };
         let mut settings_open = true;
         let mut pw = PasswordPrompt::new(
             "123456789".into(),
@@ -877,11 +878,14 @@ fn r6_r7_version_display_build_script_and_update_actions() {
     assert!(!is_valid_build_display(&format!("v{pkg_ver} (12345)"), pkg_ver));
 
     // 2. If veloxdesk binary is compiled in the same target profile dir, verify `--version` output live.
+    //    Stop before `workspace_root()` so a stale pre-built release binary at repo root is never picked up.
     if let Ok(exe) = std::env::current_exe() {
+        let root = workspace_root();
         let bin_name = if cfg!(windows) { "veloxdesk.exe" } else { "veloxdesk" };
         let client_bin = exe
             .ancestors()
             .skip(1)
+            .take_while(|dir| *dir != root)
             .map(|dir| dir.join(bin_name))
             .find(|cand| cand.is_file());
         if let Some(client_bin) = client_bin {

@@ -21,9 +21,9 @@ use veloxdesk_core_traits::{CoreError, Timestamp, TransportChannel};
 use veloxdesk_crypto::DeviceIdentity;
 use veloxdesk_crypto::auth::{Argon2Params, derive_password_key, password_proof, sign_pubkey_challenge};
 use veloxdesk_protocol::control::{
-    AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, Close, DisplayInfo, Envelope,
-    GamepadState, Hello, InputEvent, KeyEvent, MouseButtonEvent, MouseMove, MouseRelative, MouseWheel, Ping,
-    SessionConfig, SwitchDisplay, TextInput, VideoCodecCap, envelope::Msg, input_event,
+    AudioCodec, AudioConfig, AuthChallenge, AuthMethod, AuthResponse, BitrateUpdate, ChatAck, ChatMessage, Close,
+    DisplayInfo, Envelope, GamepadState, Hello, InputEvent, KeyEvent, MouseButtonEvent, MouseMove, MouseRelative,
+    MouseWheel, Ping, SessionConfig, SwitchDisplay, TextInput, VideoCodecCap, envelope::Msg, input_event,
 };
 use veloxdesk_protocol::media::MediaKind;
 use veloxdesk_protocol::{PROTOCOL_VERSION, StreamKind};
@@ -36,7 +36,7 @@ use crate::clipboard::run_android_clipboard_stream;
 use crate::constants;
 use crate::stats::{HudAggregator, HudMetrics};
 use crate::target::{ConnectTarget, format_device_id, parse_rendezvous_addr, parse_target};
-use crate::{SecretString, decode_codec_caps_mask, f32_to_pcm16, zeroize_bytes};
+use crate::{SecretString, decode_codec_caps_mask, f32_to_pcm16, unix_now_ms, zeroize_bytes};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,6 +84,8 @@ pub trait SessionCallbacks: Send + Sync + 'static {
     fn on_rumble(&self, pad_id: i32, low_freq: i32, high_freq: i32);
     fn on_cursor_shape(&self, _shape_id: u64, _width: u32, _height: u32, _hotspot_x: u32, _hotspot_y: u32, _rgba: &[u8]) {}
     fn on_cursor_position(&self, _x: i32, _y: i32, _visible: bool, _shape_id: u64) {}
+    fn on_chat_message(&self, _id: u64, _sender_name: &str, _text: &str, _ts_ms: u64) {}
+    fn on_chat_ack(&self, _id: u64) {}
     fn on_closed(&self, reason: &str, is_error: bool);
 }
 
@@ -214,6 +216,7 @@ enum SessionCommand {
     Input(InputEvent),
     Gamepad(GamepadState),
     SendClipboardText(String),
+    SendChat(ChatMessage),
 }
 
 struct SessionShared {
@@ -222,6 +225,7 @@ struct SessionShared {
     decode_us: AtomicU32,
     render_us: AtomicU32,
     gamepads: Mutex<GamepadTracker>,
+    next_chat_id: AtomicU64,
 }
 
 impl Default for SessionShared {
@@ -232,6 +236,7 @@ impl Default for SessionShared {
             decode_us: AtomicU32::new(0),
             render_us: AtomicU32::new(0),
             gamepads: Mutex::new(GamepadTracker::new()),
+            next_chat_id: AtomicU64::new(1),
         }
     }
 }
@@ -363,6 +368,17 @@ impl AndroidSessionHandle {
 
     pub fn send_clipboard_text(&self, text: String) {
         let _ = self.cmd_tx.send(SessionCommand::SendClipboardText(text));
+    }
+
+    /// Assign a monotonic message ID + UNIX `ts_ms` and queue a `ChatMessage` on the control stream.
+    /// Returns the assigned non-zero ID, or `0` if `text` is empty or the session is closed.
+    pub fn send_chat(&self, sender_name: String, text: String) -> u64 {
+        if text.is_empty() || self.disconnected.load(Ordering::Acquire) {
+            return 0;
+        }
+        let id = self.shared.next_chat_id.fetch_add(1, Ordering::Relaxed);
+        let msg = ChatMessage { id, sender_name, text, ts_ms: unix_now_ms() };
+        if self.cmd_tx.send(SessionCommand::SendChat(msg)).is_ok() { id } else { 0 }
     }
 }
 
@@ -940,6 +956,19 @@ fn emit_video_frame(
     );
 }
 
+fn handle_viewer_chat_message(
+    chat: &ChatMessage,
+    ctrl_out_tx: &mpsc::UnboundedSender<Envelope>,
+    callbacks: &Arc<dyn SessionCallbacks>,
+) {
+    let _ = ctrl_out_tx.send(Msg::ChatAck(ChatAck { id: chat.id }).into());
+    callbacks.on_chat_message(chat.id, &chat.sender_name, &chat.text, chat.ts_ms);
+}
+
+fn handle_viewer_chat_ack(ack: &ChatAck, callbacks: &Arc<dyn SessionCallbacks>) {
+    callbacks.on_chat_ack(ack.id);
+}
+
 // ───────────────────────── Main async session loop ─────────────────────────
 
 async fn run_session_async(
@@ -1223,6 +1252,12 @@ async fn run_session_async(
                         Some(Msg::CursorPosition(cp)) => {
                             callbacks.on_cursor_position(cp.x, cp.y, cp.visible, cp.shape_id);
                         }
+                        Some(Msg::ChatMessage(chat)) => {
+                            handle_viewer_chat_message(&chat, &ctrl_out_tx, &callbacks);
+                        }
+                        Some(Msg::ChatAck(ack)) => {
+                            handle_viewer_chat_ack(&ack, &callbacks);
+                        }
                         Some(Msg::Close(c)) => {
                             let reason = if c.reason.is_empty() {
                                 format!("Host closed session (code {})", c.code)
@@ -1289,6 +1324,9 @@ async fn run_session_async(
                         if let Some(clip) = &clipboard {
                             clip.send_text(text);
                         }
+                    }
+                    Some(SessionCommand::SendChat(chat)) => {
+                        let _ = ctrl_out_tx.send(Msg::ChatMessage(chat).into());
                     }
                     Some(SessionCommand::SubmitPassword(_pw)) => {
                         // Dropped immediately; SecretString::drop zeroizes the backing buffer.
@@ -1488,5 +1526,88 @@ mod tests {
         assert!(!is_valid_cursor_shape(16, 257, 16 * 257 * 4));
         assert!(!is_valid_cursor_shape(16, 16, 16 * 16 * 4 - 1));
         assert!(!is_valid_cursor_shape(16, 16, 16 * 16 * 4 + 4));
+    }
+
+    #[test]
+    fn send_chat_assigns_monotonic_ids_and_rejects_empty_or_disconnected() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = AndroidSessionHandle {
+            cmd_tx: tx,
+            shared: Arc::new(SessionShared::default()),
+            disconnected: AtomicBool::new(false),
+        };
+
+        assert_eq!(handle.send_chat("Phone".into(), String::new()), 0);
+        assert!(rx.try_recv().is_err());
+
+        let id1 = handle.send_chat("Phone".into(), "Hello PC".into());
+        let id2 = handle.send_chat("Phone".into(), "Привет".into());
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        match rx.try_recv().unwrap() {
+            SessionCommand::SendChat(m) => {
+                assert_eq!(m.id, 1);
+                assert_eq!(m.sender_name, "Phone");
+                assert_eq!(m.text, "Hello PC");
+                assert!(m.ts_ms > 0);
+            }
+            _ => panic!("expected SendChat"),
+        }
+        match rx.try_recv().unwrap() {
+            SessionCommand::SendChat(m) => {
+                assert_eq!(m.id, 2);
+                assert_eq!(m.text, "Привет");
+            }
+            _ => panic!("expected SendChat"),
+        }
+
+        handle.disconnect();
+        assert_eq!(handle.send_chat("Phone".into(), "After disconnect".into()), 0);
+    }
+
+    #[test]
+    fn viewer_incoming_chat_sends_ack_and_invokes_callbacks() {
+        #[derive(Default)]
+        struct ChatCb {
+            msgs: Mutex<Vec<(u64, String, String, u64)>>,
+            acks: Mutex<Vec<u64>>,
+        }
+        impl SessionCallbacks for ChatCb {
+            fn on_status(&self, _: i32, _: &str) {}
+            fn on_auth_required(&self, _: &str, _: &str, _: bool, _: bool) {}
+            fn on_session_config(&self, _: &SessionConfig, _: &str) {}
+            fn on_display_list(&self, _: &str) {}
+            fn on_video_frame(&self, _: i32, _: u32, _: u32, _: u32, _: i64, _: bool, _: bool, _: &[u8]) {}
+            fn on_audio_pcm(&self, _: i32, _: i32, _: &[i16]) {}
+            fn on_stats(&self, _: &HudMetrics) {}
+            fn on_clipboard_text(&self, _: &str) {}
+            fn on_rumble(&self, _: i32, _: i32, _: i32) {}
+            fn on_chat_message(&self, id: u64, sender_name: &str, text: &str, ts_ms: u64) {
+                self.msgs.lock().push((id, sender_name.to_string(), text.to_string(), ts_ms));
+            }
+            fn on_chat_ack(&self, id: u64) {
+                self.acks.lock().push(id);
+            }
+            fn on_closed(&self, _: &str, _: bool) {}
+        }
+
+        let rec = Arc::new(ChatCb::default());
+        let cb: Arc<dyn SessionCallbacks> = rec.clone();
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+
+        let incoming = ChatMessage {
+            id: 99,
+            sender_name: "DesktopHost".into(),
+            text: "Hello from PC!".into(),
+            ts_ms: 1_700_000_000_000,
+        };
+        handle_viewer_chat_message(&incoming, &ctrl_tx, &cb);
+        handle_viewer_chat_ack(&ChatAck { id: 1 }, &cb);
+
+        let ack_env = ctrl_rx.try_recv().expect("viewer must send ChatAck");
+        assert_eq!(ack_env.msg, Some(Msg::ChatAck(ChatAck { id: 99 })));
+        assert_eq!(rec.msgs.lock().as_slice(), &[(99, "DesktopHost".into(), "Hello from PC!".into(), 1_700_000_000_000)]);
+        assert_eq!(rec.acks.lock().as_slice(), &[1]);
     }
 }

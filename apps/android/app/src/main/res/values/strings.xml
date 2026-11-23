@@ -188,9 +188,22 @@
     <string name="toolbar_audio">Audio</string>
     <string name="toolbar_clipboard">Clipboard</string>
     <string name="toolbar_hud">HUD</string>
+    <string name="toolbar_chat">Chat</string>
     <string name="toolbar_bitrate">Bitrate</string>
     <string name="special_key_cad">Ctrl+Alt+Del</string>
     <string name="special_keys_fn_toggle">F1–F12</string>
+
+    <!-- In-Session Chat -->
+    <string name="chat_title">Session Chat</string>
+    <string name="chat_host_title">Chat with %1$s</string>
+    <string name="chat_open_button">Open Chat</string>
+    <string name="chat_empty">No messages yet. Say hello!</string>
+    <string name="chat_input_placeholder">Type a message…</string>
+    <string name="chat_send">Send</string>
+    <string name="chat_delivered">Delivered</string>
+    <string name="chat_sending">Sending…</string>
+    <string name="chat_you">You</string>
+    <string name="chat_unread_desc">%1$d unread messages</string>
 
     <!-- HUD -->
     <string name="hud_path_direct">Direct</string>

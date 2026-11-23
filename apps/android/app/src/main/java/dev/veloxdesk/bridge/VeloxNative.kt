@@ -118,6 +118,9 @@ object VeloxNative {
     @JvmStatic
     external fun nativeSendClipboardText(handle: Long, text: String)
 
+    @JvmStatic
+    external fun nativeSendChat(handle: Long, senderName: String, text: String): Long
+
     // ───────────────────────────── Host / Password Hashing (v0.4.0) ─────────────────────────────
 
     @JvmStatic
@@ -192,4 +195,7 @@ object VeloxNative {
 
     @JvmStatic
     external fun nativeHostSendClipboardText(handle: Long, text: String)
+
+    @JvmStatic
+    external fun nativeHostSendChat(handle: Long, senderName: String, text: String): Long
 }

@@ -16,6 +16,8 @@
     public void onRumble(int, int, int);
     public void onCursorShape(long, int, int, int, int, byte[]);
     public void onCursorPosition(int, int, boolean, long);
+    public void onChatMessage(long, java.lang.String, java.lang.String, long);
+    public void onChatAck(long);
     public void onClosed(java.lang.String, boolean);
 }
 -keep class * implements dev.veloxdesk.bridge.VeloxHostCallback {
@@ -29,6 +31,8 @@
     public void onHostKeyframeRequested();
     public void onHostInputEvent(int, int, int, int, boolean, int, int, int, java.lang.String);
     public void onHostClipboardText(java.lang.String);
+    public void onHostChatMessage(java.lang.String, long, java.lang.String, java.lang.String, long);
+    public void onHostChatAck(java.lang.String, long);
     public void onHostError(java.lang.String);
     public void onHostStopped();
 }

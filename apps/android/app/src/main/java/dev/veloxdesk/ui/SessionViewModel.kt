@@ -14,6 +14,7 @@ import androidx.lifecycle.viewModelScope
 import dev.veloxdesk.BuildConfig
 import dev.veloxdesk.bridge.AuthPromptData
 import dev.veloxdesk.bridge.BridgeConstants
+import dev.veloxdesk.bridge.ChatState
 import dev.veloxdesk.bridge.DisplayDescriptor
 import dev.veloxdesk.bridge.HudStats
 import dev.veloxdesk.bridge.ScaleMode
@@ -76,6 +77,7 @@ data class SessionUiState(
     val bitrateKbps: Int = BitratePreset.BALANCED.kbps,
     val stickyModifiers: Int = 0,
     val cursor: CursorOverlayState = CursorOverlayState(),
+    val chat: ChatState = ChatState(),
     val lastEndedReason: String? = null,
     val lastEndedWasError: Boolean = false,
 )
@@ -215,6 +217,16 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
     private var onSessionConnectedRecord: ((target: String, hostName: String, mode: Int) -> Unit)? = null
 
+    private val localDeviceName: String = buildString {
+        val manu = Build.MANUFACTURER.orEmpty().trim()
+        val model = Build.MODEL.orEmpty().trim()
+        if (model.startsWith(manu, ignoreCase = true)) {
+            append(model)
+        } else {
+            append(manu).append(' ').append(model)
+        }
+    }.trim().ifEmpty { "Android" }
+
     init {
         if (VeloxNative.isLoaded) {
             viewModelScope.launch(Dispatchers.IO) {
@@ -289,15 +301,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         val metrics = appContext.resources.displayMetrics
         val viewerWidth = maxOf(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(1280)
         val viewerHeight = minOf(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(720)
-        val deviceName = buildString {
-            val manu = Build.MANUFACTURER.orEmpty().trim()
-            val model = Build.MODEL.orEmpty().trim()
-            if (model.startsWith(manu, ignoreCase = true)) {
-                append(model)
-            } else {
-                append(manu).append(' ').append(model)
-            }
-        }.trim().ifEmpty { "Android" }
+        val deviceName = localDeviceName
 
         val codecCaps = CodecCapsProber.probeCodecCapsMask()
         val callback = createSessionCallback(gen, normalizedTarget, mode)
@@ -620,6 +624,23 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             }
         }
 
+        override fun onChatMessage(id: Long, senderName: String, text: String, tsMs: Long) {
+            if (sessionGen.get() != gen) return
+            val resolvedSender = senderName.trim().ifEmpty {
+                _uiState.value.sessionInfo?.hostName?.ifBlank { null } ?: "Host"
+            }
+            _uiState.update { state ->
+                state.copy(chat = state.chat.onIncomingReceived(id, resolvedSender, text, tsMs))
+            }
+        }
+
+        override fun onChatAck(id: Long) {
+            if (sessionGen.get() != gen) return
+            _uiState.update { state ->
+                state.copy(chat = state.chat.onAckReceived(id))
+            }
+        }
+
         override fun onClosed(reason: String, isError: Boolean) {
             if (sessionGen.get() != gen) return
             activeHandle.set(0L)
@@ -818,6 +839,29 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(showHud = !it.showHud) }
     }
 
+    fun setChatOpen(open: Boolean) {
+        _uiState.update { it.copy(chat = it.chat.setOpen(open)) }
+    }
+
+    fun toggleChat() {
+        _uiState.update { it.copy(chat = it.chat.setOpen(!it.chat.isOpen)) }
+    }
+
+    fun sendChatMessage(rawText: String) {
+        val text = rawText.trim()
+        if (text.isEmpty()) return
+        val h = activeHandle.get()
+        if (h == 0L || !VeloxNative.isLoaded) return
+        val sender = localDeviceName
+        val id = runCatching { VeloxNative.nativeSendChat(h, sender, text) }.getOrDefault(0L)
+        if (id > 0L) {
+            val nowMs = System.currentTimeMillis()
+            _uiState.update { state ->
+                state.copy(chat = state.chat.onOutgoingSent(id, sender, text, nowMs))
+            }
+        }
+    }
+
     fun setMaxBitrate(bitrateKbps: Int) {
         val h = activeHandle.get()
         if (h != 0L && VeloxNative.isLoaded) {
@@ -913,6 +957,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     fun dispatchHardwareKeyEvent(event: KeyEvent): Boolean {
         if (!_uiState.value.isActive) return false
         if (_uiState.value.authPrompt != null) return false
+        if (_uiState.value.chat.isOpen) return false
 
         if (gamepadController.isGamepadDevice(event.device)) {
             if (gamepadController.onKeyEvent(event)) return true

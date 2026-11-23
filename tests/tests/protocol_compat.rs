@@ -3,10 +3,15 @@
 //! "Old" and "future" peers are modelled with locally defined prost structs that share
 //! tags with the frozen v1 messages in `veloxdesk_protocol::control`.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use prost::Message;
 use veloxdesk_protocol::control::{
-    envelope::Msg, Envelope, Hello, KeyframeRequest, Nack, Ping, ReceiverReport, VideoCodecCap,
+    envelope::Msg, AudioConfig, AuthChallenge, AuthResponse, AuthResult, BitrateUpdate, ChatAck, ChatMessage,
+    ClipboardData, Close, CursorPosition, CursorShape, DisplayList, Envelope, FileAck, FileChunk, FileListing,
+    FileRequest, FrameTimingReport, Hello, InputEvent, KeyframeRequest, Nack, Permissions, Ping, Pong, PrivacyMode,
+    PrivacyModeResult, ReceiverReport, Rumble, SessionConfig, SwitchDisplay, SystemPowerAction, SystemPowerRequest,
+    SystemPowerResult, TerminalData, TerminalExit, TerminalOpen, TerminalResize, TunnelOpen, TunnelResult,
+    VideoCodecCap, VideoConfig,
 };
 use veloxdesk_protocol::framing::{decode_frame, encode_frame, frame_to_bytes, stream_preamble, MAX_FRAME_LEN};
 use veloxdesk_protocol::media::{flags, MediaHeader, MediaKind, WireCodec, MEDIA_HEADER_LEN};
@@ -265,5 +270,311 @@ fn media_header_rejects_future_version_and_garbage() {
         if let Ok((h, _)) = MediaHeader::parse(&d) {
             let _ = h.validate();
         }
+    }
+}
+
+// ───────────────────── v0.4.0 / v0.5.0 compatibility ─────────────────────
+
+/// Decode the leading protobuf field tag and wire type from an encoded message.
+fn decode_first_field_key(bytes: &[u8]) -> (u32, u8) {
+    assert!(!bytes.is_empty(), "encoded protobuf message must not be empty");
+    let mut key: u64 = 0;
+    let mut shift = 0u32;
+    for &b in bytes {
+        key |= u64::from(b & 0x7F) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        assert!(shift < 64, "malformed varint key");
+    }
+    ((key >> 3) as u32, (key & 0x07) as u8)
+}
+
+/// Model of a v0.4.0 `Permissions` struct (only tags 1..=9 existed).
+#[derive(Clone, PartialEq, Message)]
+struct PermissionsV040 {
+    #[prost(bool, tag = "1")]
+    view: bool,
+    #[prost(bool, tag = "2")]
+    input: bool,
+    #[prost(bool, tag = "3")]
+    clipboard: bool,
+    #[prost(bool, tag = "4")]
+    file_transfer: bool,
+    #[prost(bool, tag = "5")]
+    audio: bool,
+    #[prost(bool, tag = "6")]
+    tunnel: bool,
+    #[prost(bool, tag = "7")]
+    terminal: bool,
+    #[prost(bool, tag = "8")]
+    restart: bool,
+    #[prost(bool, tag = "9")]
+    privacy_mode: bool,
+}
+
+/// Model of a v0.4.0 `Envelope` decoder that knows tags 1..=45, NOT v0.5.0 tags 46..=49.
+#[derive(Clone, PartialEq, Message)]
+struct EnvelopeV040 {
+    #[prost(oneof = "env_v040::Msg", tags = "1, 6, 43, 45")]
+    msg: Option<env_v040::Msg>,
+}
+mod env_v040 {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Msg {
+        #[prost(message, tag = "1")]
+        Hello(veloxdesk_protocol::control::Hello),
+        #[prost(message, tag = "6")]
+        Ping(veloxdesk_protocol::control::Ping),
+        #[prost(message, tag = "43")]
+        Permissions(super::PermissionsV040),
+        #[prost(message, tag = "45")]
+        DisplayList(veloxdesk_protocol::control::DisplayList),
+    }
+}
+
+/// Verify exact wire tag preservation for EVERY v0.4.0 Envelope variant (tags 1..=45).
+/// If any tag is accidentally renumbered or shifted, this test fails immediately.
+#[test]
+fn v040_envelope_wire_tags_1_through_45_preserved() {
+    let cases: Vec<(u32, Msg)> = vec![
+        // session 1..=8
+        (1, Msg::Hello(Hello { protocol_version: 1, ..Default::default() })),
+        (2, Msg::AuthChallenge(AuthChallenge { nonce: vec![1, 2], ..Default::default() })),
+        (3, Msg::AuthResponse(AuthResponse { method: 1, proof: vec![3] })),
+        (4, Msg::AuthResult(AuthResult { ok: true, session_id: 1, ..Default::default() })),
+        (5, Msg::SessionConfig(SessionConfig { active_display: 0, host_name: "h".into(), ..Default::default() })),
+        (6, Msg::Ping(Ping { seq: 1, sent_us: 2 })),
+        (7, Msg::Pong(Pong { seq: 1, ping_sent_us: 2, peer_recv_us: 3, peer_send_us: 4 })),
+        (8, Msg::Close(Close { code: 0, reason: "bye".into() })),
+        // video / ABR 10..=16
+        (10, Msg::KeyframeRequest(KeyframeRequest { stream_id: 0, last_good_frame_id: 9 })),
+        (11, Msg::Nack(Nack { stream_id: 0, frame_id: 1, block_index: 0, shard_indices: vec![0] })),
+        (12, Msg::ReceiverReport(ReceiverReport { packets_received: 10, ..Default::default() })),
+        (13, Msg::BitrateUpdate(BitrateUpdate { stream_id: 0, bitrate_kbps: 4000, fps: 60, fec_parity_percent: 10 })),
+        (14, Msg::FrameTiming(FrameTimingReport { frame_id: 1, encode_us: 500, ..Default::default() })),
+        (15, Msg::SwitchDisplay(SwitchDisplay { index: 1 })),
+        (16, Msg::VideoConfig(VideoConfig { codec: 1, width: 1920, height: 1080, fps: 60, ..Default::default() })),
+        // input 20..=23
+        (20, Msg::Input(InputEvent { ts_us: 42, event: None })),
+        (21, Msg::Rumble(Rumble { pad_id: 0, low_freq: 1000, high_freq: 2000 })),
+        (22, Msg::CursorShape(CursorShape { id: 1, width: 1, height: 1, hotspot_x: 0, hotspot_y: 0, rgba: Bytes::from_static(&[0, 0, 0, 255]) })),
+        (23, Msg::CursorPosition(CursorPosition { x: 10, y: 20, visible: true, shape_id: 1 })),
+        // features 30..=45
+        (30, Msg::Clipboard(ClipboardData { format: 0, data: Bytes::from_static(b"hi"), compressed: false })),
+        (31, Msg::FileRequest(FileRequest { id: 1, op: 0, path: "/".into(), ..Default::default() })),
+        (32, Msg::FileListing(FileListing { id: 1, path: "/".into(), entries: vec![] })),
+        (33, Msg::FileChunk(FileChunk { id: 1, offset: 0, data: Bytes::from_static(b"abc"), compressed: false, last: true })),
+        (34, Msg::FileAck(FileAck { id: 1, offset: 3, error: String::new(), digest: vec![] })),
+        (35, Msg::TunnelOpen(TunnelOpen { tunnel_id: 1, remote_host: "127.0.0.1".into(), remote_port: 8080 })),
+        (36, Msg::TunnelResult(TunnelResult { tunnel_id: 1, ok: true, error: String::new() })),
+        (37, Msg::TerminalOpen(TerminalOpen { term_id: 1, cols: 80, rows: 24, shell: String::new() })),
+        (38, Msg::TerminalData(TerminalData { term_id: 1, data: Bytes::from_static(b"ls\n") })),
+        (39, Msg::TerminalResize(TerminalResize { term_id: 1, cols: 120, rows: 40 })),
+        (40, Msg::TerminalExit(TerminalExit { term_id: 1, code: 0 })),
+        (41, Msg::PrivacyMode(PrivacyMode { enable: true })),
+        (42, Msg::PrivacyModeResult(PrivacyModeResult { enabled: true, error: String::new() })),
+        (43, Msg::Permissions(Permissions::interactive_default())),
+        (44, Msg::AudioConfig(AudioConfig { codec: 16, sample_rate: 48_000, channels: 2, frame_duration_us: 5_000, bitrate_kbps: 64 })),
+        (45, Msg::DisplayList(DisplayList { displays: vec![] })),
+    ];
+
+    assert_eq!(cases.len(), 35, "expected all 35 v0.4.0 Envelope variants");
+    for (expected_tag, msg) in cases {
+        let env: Envelope = msg.into();
+        let bytes = env.encode_to_vec();
+        let (wire_tag, wire_type) = decode_first_field_key(&bytes);
+        assert_eq!(wire_type, 2, "Envelope oneof field {expected_tag} must be length-delimited (wire type 2)");
+        assert_eq!(wire_tag, expected_tag, "v0.4.0 Envelope tag {expected_tag} shifted to {wire_tag}");
+        assert_eq!(
+            Envelope::decode(bytes.as_slice()).expect("v0.4.0 message must decode cleanly"),
+            env,
+            "v0.4.0 Envelope tag {expected_tag} roundtrip mismatch"
+        );
+    }
+}
+
+/// Verify v0.5.0 tags 46..=49 exact wire tags, golden key prefixes, framing roundtrip,
+/// and clean forward-compatibility (`msg: None`) on older v0.4.0 and v0 decoders.
+#[test]
+fn v050_envelope_tags_46_through_49_roundtrip_and_older_decoder_compat() {
+    let cases: Vec<(u32, [u8; 2], Msg)> = vec![
+        (
+            46,
+            [0xF2, 0x02], // (46 << 3) | 2 = 370
+            Msg::ChatMessage(ChatMessage {
+                id: 42,
+                sender_name: "Alice".into(),
+                text: "Hello from v0.5.0 / Привет!".into(),
+                ts_ms: 1_735_689_600_123,
+            }),
+        ),
+        (
+            47,
+            [0xFA, 0x02], // (47 << 3) | 2 = 378
+            Msg::ChatAck(ChatAck { id: 42 }),
+        ),
+        (
+            48,
+            [0x82, 0x03], // (48 << 3) | 2 = 386
+            Msg::SystemPowerRequest(SystemPowerRequest {
+                action: SystemPowerAction::RebootSafeMode as i32,
+                reason: "Maintenance reboot".into(),
+                delay_secs: 5,
+            }),
+        ),
+        (
+            49,
+            [0x8A, 0x03], // (49 << 3) | 2 = 394
+            Msg::SystemPowerResult(SystemPowerResult {
+                action: SystemPowerAction::RebootSafeMode as i32,
+                ok: true,
+                error: String::new(),
+            }),
+        ),
+    ];
+
+    let mut framed_wire = BytesMut::new();
+    let mut expected_envelopes = Vec::with_capacity(cases.len());
+
+    for (expected_tag, key_prefix, msg) in cases {
+        let env: Envelope = msg.into();
+        let bytes = env.encode_to_vec();
+
+        // Exact wire tag and golden varint key prefix.
+        let (wire_tag, wire_type) = decode_first_field_key(&bytes);
+        assert_eq!(wire_type, 2, "tag {expected_tag} must use wire type 2");
+        assert_eq!(wire_tag, expected_tag, "tag mismatch for v0.5.0 message");
+        assert_eq!(&bytes[..2], &key_prefix, "golden key prefix mismatch for tag {expected_tag}");
+
+        // Current v0.5.0 decoder roundtrips identically.
+        assert_eq!(Envelope::decode(bytes.as_slice()).unwrap(), env);
+
+        // Older v0.4.0 and v0 decoders ignore unknown oneof tags cleanly (`msg: None`).
+        let old_v040 = EnvelopeV040::decode(bytes.as_slice())
+            .expect("v0.4.0 decoder must not fail on v0.5.0 Envelope tags 46..=49");
+        assert!(old_v040.msg.is_none(), "v0.4.0 decoder must decode tag {expected_tag} as msg: None");
+
+        let old_v0 = EnvelopeV0::decode(bytes.as_slice())
+            .expect("v0 decoder must not fail on v0.5.0 Envelope tags 46..=49");
+        assert!(old_v0.msg.is_none(), "v0 decoder must decode tag {expected_tag} as msg: None");
+
+        encode_frame(&env, &mut framed_wire).unwrap();
+        expected_envelopes.push(env);
+    }
+
+    // All 4 v0.5.0 messages also roundtrip cleanly through length-prefixed stream framing.
+    let mut decoded = Vec::new();
+    while let Some(env) = decode_frame::<Envelope>(&mut framed_wire).unwrap() {
+        decoded.push(env);
+    }
+    assert_eq!(decoded, expected_envelopes);
+    assert!(framed_wire.is_empty());
+
+    // All SystemPowerAction enum wire values are stable.
+    assert_eq!(SystemPowerAction::Reboot as i32, 0);
+    assert_eq!(SystemPowerAction::RebootSafeMode as i32, 1);
+    assert_eq!(SystemPowerAction::LockScreen as i32, 2);
+    assert_eq!(SystemPowerAction::Sleep as i32, 3);
+    for action in [
+        SystemPowerAction::Reboot,
+        SystemPowerAction::RebootSafeMode,
+        SystemPowerAction::LockScreen,
+        SystemPowerAction::Sleep,
+    ] {
+        let req: Envelope = Msg::SystemPowerRequest(SystemPowerRequest {
+            action: action as i32,
+            reason: "test".into(),
+            delay_secs: 3,
+        })
+        .into();
+        assert_eq!(Envelope::decode(req.encode_to_vec().as_slice()).unwrap(), req);
+
+        let res: Envelope = Msg::SystemPowerResult(SystemPowerResult {
+            action: action as i32,
+            ok: false,
+            error: "denied".into(),
+        })
+        .into();
+        assert_eq!(Envelope::decode(res.encode_to_vec().as_slice()).unwrap(), res);
+    }
+}
+
+/// Verify `Permissions` backward compatibility (v0.4.0 tags 1..=9 -> v0.5.0)
+/// and forward compatibility (v0.5.0 tags 1..=11 -> v0.4.0), plus exact tag numbers 10 & 11.
+#[test]
+fn permissions_v040_and_v050_backward_and_forward_compat() {
+    // 1. v0.4.0 bytes (tags 1..=9 only) decode cleanly in v0.5.0 with allow_chat/allow_power = false.
+    let old_perms = PermissionsV040 {
+        view: true,
+        input: true,
+        clipboard: true,
+        file_transfer: false,
+        audio: true,
+        tunnel: false,
+        terminal: true,
+        restart: false,
+        privacy_mode: true,
+    };
+    let old_bytes = old_perms.encode_to_vec();
+    let decoded_v050 = Permissions::decode(old_bytes.as_slice())
+        .expect("v0.5.0 Permissions must decode v0.4.0 bytes cleanly");
+    assert!(decoded_v050.view);
+    assert!(decoded_v050.input);
+    assert!(decoded_v050.clipboard);
+    assert!(!decoded_v050.file_transfer);
+    assert!(decoded_v050.audio);
+    assert!(!decoded_v050.tunnel);
+    assert!(decoded_v050.terminal);
+    assert!(!decoded_v050.restart);
+    assert!(decoded_v050.privacy_mode);
+    assert!(!decoded_v050.allow_chat, "missing tag 10 in v0.4.0 bytes defaults to false");
+    assert!(!decoded_v050.allow_power, "missing tag 11 in v0.4.0 bytes defaults to false");
+
+    // 2. v0.5.0 Permissions (tags 1..=11) roundtrip cleanly and decode on a v0.4.0 peer ignoring tags 10..=11.
+    let full = Permissions::all();
+    assert!(full.allow_chat && full.allow_power);
+    let full_bytes = full.encode_to_vec();
+    assert_eq!(Permissions::decode(full_bytes.as_slice()).unwrap(), full);
+
+    let decoded_on_v040 = PermissionsV040::decode(full_bytes.as_slice())
+        .expect("v0.4.0 peer must ignore unknown Permissions tags 10..=11");
+    assert!(
+        decoded_on_v040.view
+            && decoded_on_v040.input
+            && decoded_on_v040.clipboard
+            && decoded_on_v040.file_transfer
+            && decoded_on_v040.audio
+            && decoded_on_v040.tunnel
+            && decoded_on_v040.terminal
+            && decoded_on_v040.restart
+            && decoded_on_v040.privacy_mode
+    );
+
+    // 3. Interactive default has chat enabled and power disabled.
+    let inter = Permissions::interactive_default();
+    assert!(inter.allow_chat);
+    assert!(!inter.allow_power);
+    assert_eq!(Permissions::decode(inter.encode_to_vec().as_slice()).unwrap(), inter);
+
+    // 4. Freeze exact wire tags 10 (`allow_chat`) and 11 (`allow_power`).
+    let only_chat = Permissions { allow_chat: true, ..Default::default() }.encode_to_vec();
+    assert_eq!(only_chat, vec![10 << 3, 0x01], "allow_chat must be protobuf tag 10");
+
+    let only_power = Permissions { allow_power: true, ..Default::default() }.encode_to_vec();
+    assert_eq!(only_power, vec![11 << 3, 0x01], "allow_power must be protobuf tag 11");
+
+    // 5. Envelope(Permissions) encoded by v0.5.0 also decodes on EnvelopeV040.
+    let env_v050: Envelope = Msg::Permissions(inter.clone()).into();
+    let env_v040 = EnvelopeV040::decode(env_v050.encode_to_vec().as_slice()).unwrap();
+    match env_v040.msg {
+        Some(env_v040::Msg::Permissions(p)) => {
+            assert_eq!(p.view, inter.view);
+            assert_eq!(p.input, inter.input);
+            assert_eq!(p.privacy_mode, inter.privacy_mode);
+            assert_eq!(p.restart, inter.restart);
+        }
+        other => panic!("expected v0.4.0 Permissions inside Envelope, got {other:?}"),
     }
 }

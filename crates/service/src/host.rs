@@ -5,10 +5,10 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use veloxdesk_core_traits::video::EncodedPacket;
 use veloxdesk_core_traits::{CoreError, Result, Timestamp, TransportChannel};
@@ -17,7 +17,7 @@ use veloxdesk_protocol::control::{ChatMessage, Nack, ReceiverReport};
 use veloxdesk_transport::{AbrController, Listener, P2pListener, QuicChannel, VideoSender};
 
 use crate::auth::{HostAuthState, TrustedPeer};
-use crate::backends::{EncoderFactory, HostBackends, RateController, RateDecision, VideoSink};
+use crate::backends::{AudioCaptureFactory, EncoderFactory, HostBackends, RateController, RateDecision, VideoSink};
 use crate::config::HostConfig;
 use crate::daemon::detect_desktop;
 use crate::ipc::{IpcRequest, IpcResponse, IpcServer};
@@ -87,6 +87,11 @@ impl RateController for TransportAbr {
     }
 }
 
+pub(crate) fn system_audio_capture_factory() -> Arc<AudioCaptureFactory> {
+    static FACTORY: OnceLock<Arc<AudioCaptureFactory>> = OnceLock::new();
+    FACTORY.get_or_init(|| Arc::new(veloxdesk_audio::create_loopback_capture)).clone()
+}
+
 impl HostBackends {
     /// Production capture, input, audio, QUIC FEC sender and ABR, with a caller-provided encoder
     /// factory (useful for tests or custom encoders).
@@ -97,7 +102,7 @@ impl HostBackends {
             injector: Arc::new(veloxdesk_input::create_injector),
             video_sink: Arc::new(|ch, stream_id| Box::new(TransportVideoSink(VideoSender::new(ch, stream_id)))),
             rate: Arc::new(|start, min, max| Box::new(TransportAbr(AbrController::new(start, min, max)))),
-            audio_capture: Some(Arc::new(veloxdesk_audio::create_loopback_capture)),
+            audio_capture: Some(system_audio_capture_factory()),
             audio_encoder: Some(Arc::new(|cfg| Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?)))),
             audio_playback: Some(Arc::new(veloxdesk_audio::create_playback)),
             clipboard: Some(Arc::new(veloxdesk_clipboard::create_system_clipboard)),
@@ -150,6 +155,8 @@ pub struct RunningHost {
     device_id: String,
     auth_state: Arc<HostAuthState>,
     active_sessions: Arc<AtomicUsize>,
+    chat_tx: broadcast::Sender<ChatMessage>,
+    next_chat_id: AtomicU64,
     stop_tx: watch::Sender<bool>,
     task: Option<JoinHandle<Result<()>>>,
 }
@@ -280,9 +287,12 @@ impl RunningHost {
             });
         }
 
+        let (chat_tx, _) = broadcast::channel::<ChatMessage>(64);
         let hooks = SessionHooks {
             active_sessions: Some(active_sessions.clone()),
             on_event: on_event.clone(),
+            chat_tx: Some(chat_tx.clone()),
+            power_executor: None,
         };
         let stop_tx_done = stop_tx.clone();
         let mut accept_stop = stop_rx;
@@ -314,6 +324,8 @@ impl RunningHost {
             device_id,
             auth_state,
             active_sessions,
+            chat_tx,
+            next_chat_id: AtomicU64::new(1),
             stop_tx,
             task: Some(task),
         })
@@ -346,9 +358,17 @@ impl RunningHost {
     }
 
     /// Broadcast a chat message from the local host user to all active viewer sessions (v0.5.0).
-    /// Returns the assigned monotonic message ID.
-    pub fn send_chat(&self, _text: String, _sender_name: String) -> Result<u64> {
-        Ok(0)
+    /// Returns the assigned monotonic message ID (starting at 1).
+    pub fn send_chat(&self, text: String, sender_name: String) -> Result<u64> {
+        let id = self.next_chat_id.fetch_add(1, Ordering::Relaxed);
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let msg = ChatMessage { id, sender_name, text, ts_ms };
+        // Ignore SendError when no viewer session is currently subscribed.
+        let _ = self.chat_tx.send(msg);
+        Ok(id)
     }
 
     /// Signal the host listener, active sessions, and local IPC server to shut down gracefully.
@@ -1057,6 +1077,131 @@ mod tests {
                     if peer.public_key == expected_viewer_pk && peer.name == "trusted-laptop"
             )),
             "expected TrustedPeerAdded event, got {recorded:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_host_bidirectional_chat_and_ack() {
+        use veloxdesk_protocol::control::ChatAck;
+
+        let host_id = DeviceIdentity::generate();
+        let expected_host_pk = host_id.public_key();
+        let viewer_id = DeviceIdentity::generate();
+
+        let events: Arc<Mutex<Vec<HostStatusEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_c = events.clone();
+
+        let cfg = HostConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ipc_port: None,
+            audio_enabled: false,
+            ..Default::default()
+        };
+
+        let host = RunningHost::start(
+            cfg,
+            host_id,
+            synthetic_backends(),
+            Some(Arc::new(move |ev| events_c.lock().unwrap().push(ev))),
+        )
+        .await
+        .expect("RunningHost::start");
+
+        let ch = connect(host.local_addr(), &viewer_id, Some(expected_host_pk)).await.expect("connect");
+        let (send, recv) = ch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut writer, mut reader) = framed(send, recv);
+        writer
+            .send(
+                &Msg::Hello(Hello {
+                    protocol_version: veloxdesk_protocol::PROTOCOL_VERSION,
+                    device_id: viewer_id.device_id(),
+                    device_name: "chat-viewer".into(),
+                    os: "windows".into(),
+                    public_key: viewer_id.public_key().to_vec(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        // Drain AuthResult + SessionConfig.
+        let mut saw_cfg = false;
+        for _ in 0..8 {
+            let env = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+            if matches!(env.msg, Some(Msg::SessionConfig(_))) {
+                saw_cfg = true;
+                break;
+            }
+        }
+        assert!(saw_cfg, "expected SessionConfig");
+
+        // 1. Viewer -> Host chat: host emits ChatReceived and replies ChatAck.
+        writer
+            .send(
+                &Msg::ChatMessage(ChatMessage {
+                    id: 77,
+                    sender_name: "Viewer".into(),
+                    text: "Hello host!".into(),
+                    ts_ms: 1_700_000_000_000,
+                })
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let ack = loop {
+            let env = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+            if let Some(Msg::ChatAck(a)) = env.msg {
+                break a;
+            }
+        };
+        assert_eq!(ack.id, 77);
+
+        // 2. Host -> Viewer chat via RunningHost::send_chat assigns monotonic IDs starting at 1.
+        let id1 = host.send_chat("Reply from host".into(), "HostAdmin".into()).unwrap();
+        let id2 = host.send_chat("Second line".into(), "HostAdmin".into()).unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        let mut received_from_host = Vec::new();
+        while received_from_host.len() < 2 {
+            let env = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+            if let Some(Msg::ChatMessage(m)) = env.msg {
+                received_from_host.push(m);
+            }
+        }
+        assert_eq!(received_from_host[0].id, 1);
+        assert_eq!(received_from_host[0].sender_name, "HostAdmin");
+        assert_eq!(received_from_host[0].text, "Reply from host");
+        assert!(received_from_host[0].ts_ms > 0);
+        assert_eq!(received_from_host[1].id, 2);
+
+        // Viewer acknowledges host message -> host emits ChatAcked.
+        writer.send(&Msg::ChatAck(ChatAck { id: id1 }).into()).await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if events.lock().unwrap().iter().any(|e| matches!(e, HostStatusEvent::ChatAcked { id: 1, .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        host.stop();
+        tokio::time::timeout(Duration::from_secs(5), host.join()).await.unwrap().unwrap();
+
+        let recorded = events.lock().unwrap();
+        assert!(
+            recorded.iter().any(|e| matches!(
+                e,
+                HostStatusEvent::ChatReceived { msg, .. } if msg.id == 77 && msg.text == "Hello host!"
+            )),
+            "expected ChatReceived event, got {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|e| matches!(e, HostStatusEvent::ChatAcked { id: 1, .. })),
+            "expected ChatAcked event, got {recorded:?}"
         );
     }
 }

@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 
-use veloxdesk_protocol::control::Permissions;
+use veloxdesk_protocol::control::{ChatMessage, Permissions};
 use veloxdesk_ui::{AcceptDecision, IncomingSessionInfo, PasswordMode, SavedTrustedPeer};
 
 /// Initial host authentication settings supplied when starting the embedded host.
@@ -17,6 +17,7 @@ pub struct EmbeddedHostAuthOpts {
     pub permanent_password_hash: Option<String>,
     pub trusted_peers: Vec<SavedTrustedPeer>,
     pub require_accept: bool,
+    pub echo_cancellation: bool,
 }
 
 /// Events posted from the embedded background host thread to the winit event loop.
@@ -41,6 +42,20 @@ pub enum EmbeddedHostEvent {
     },
     OtpCleared,
     TrustedPeerAdded(SavedTrustedPeer),
+    ChatReceived {
+        peer_device_id: String,
+        msg: ChatMessage,
+    },
+    ChatAcked {
+        peer_device_id: String,
+        id: u64,
+    },
+    ChatSent {
+        id: u64,
+        sender_name: String,
+        text: String,
+        ts_ms: u64,
+    },
     ApprovalRequested {
         info: IncomingSessionInfo,
         default_permissions: Permissions,
@@ -127,6 +142,8 @@ impl EmbeddedHostHandle {
 
     pub fn remove_trusted_peer(&self, _public_key_hex: String) {}
 
+    pub fn send_chat(&self, _text: String, _sender_name: String) {}
+
     pub fn stop(&self) {}
 }
 
@@ -166,8 +183,8 @@ mod net {
             tunnel: saved.allow_tunnel,
             privacy_mode: saved.allow_privacy_mode,
             restart: false,
-            allow_chat: true,
-            allow_power: false,
+            allow_chat: saved.allow_chat,
+            allow_power: saved.allow_power,
         };
         Some(TrustedPeer::new(pk, saved.name.clone()).with_permissions(perms))
     }
@@ -185,6 +202,8 @@ mod net {
             allow_terminal: peer.permissions.terminal,
             allow_tunnel: peer.permissions.tunnel,
             allow_privacy_mode: peer.permissions.privacy_mode,
+            allow_chat: peer.permissions.allow_chat,
+            allow_power: peer.permissions.allow_power,
         }
     }
 
@@ -194,6 +213,7 @@ mod net {
         SetPermanentPasswordHash(Option<PasswordHash>),
         SetOtpEnabled(bool),
         RemoveTrustedPeer([u8; 32]),
+        SendChat { text: String, sender_name: String },
         Stop,
     }
 
@@ -290,6 +310,7 @@ mod net {
 
             let cfg = HostConfig {
                 rendezvous,
+                echo_cancellation: auth.echo_cancellation,
                 auth: HostAuthConfig {
                     auto_otp,
                     permanent_password_hash: effective_perm_hash,
@@ -345,6 +366,10 @@ mod net {
             }
         }
 
+        pub fn send_chat(&self, text: String, sender_name: String) {
+            let _ = self.cmd_tx.send(HostCmd::SendChat { text, sender_name });
+        }
+
         pub fn stop(&self) {
             let _ = self.cmd_tx.send(HostCmd::Stop);
         }
@@ -398,7 +423,12 @@ mod net {
                     HostStatusEvent::TrustedPeerAdded { peer } => {
                         EmbeddedHostEvent::TrustedPeerAdded(trusted_peer_to_saved(&peer))
                     }
-                    HostStatusEvent::ChatReceived { .. } | HostStatusEvent::ChatAcked { .. } => return,
+                    HostStatusEvent::ChatReceived { peer_device_id, msg } => {
+                        EmbeddedHostEvent::ChatReceived { peer_device_id, msg }
+                    }
+                    HostStatusEvent::ChatAcked { peer_device_id, id } => {
+                        EmbeddedHostEvent::ChatAcked { peer_device_id, id }
+                    }
                     HostStatusEvent::Error(e) => EmbeddedHostEvent::Error(e),
                 };
                 let _ = ev_proxy.send_event(UserEvent::Host(mapped));
@@ -453,6 +483,25 @@ mod net {
                     }
                     HostCmd::RemoveTrustedPeer(pk) => {
                         let _ = running.auth_state().remove_trusted_peer(&pk);
+                    }
+                    HostCmd::SendChat { text, sender_name } => {
+                        match running.send_chat(text.clone(), sender_name.clone()) {
+                            Ok(id) => {
+                                let ts_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64;
+                                let _ = proxy.send_event(UserEvent::Host(EmbeddedHostEvent::ChatSent {
+                                    id,
+                                    sender_name,
+                                    text,
+                                    ts_ms,
+                                }));
+                            }
+                            Err(e) => {
+                                tracing::warn!("embedded host send_chat failed: {e}");
+                            }
+                        }
                     }
                     HostCmd::Stop => {
                         running.stop();

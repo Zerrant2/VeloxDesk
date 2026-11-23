@@ -9,7 +9,9 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -24,9 +26,11 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.requiredHeight
@@ -41,6 +45,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.Chat
 import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.AspectRatio
@@ -92,6 +97,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -159,6 +165,9 @@ fun SessionScreen(
     onToggleAudio: () -> Unit,
     onToggleClipboard: () -> Unit,
     onToggleHud: () -> Unit,
+    onToggleChat: () -> Unit,
+    onCloseChat: () -> Unit,
+    onSendChatMessage: (String) -> Unit,
     onSelectBitrate: (Int) -> Unit,
     onSwitchDisplay: (Int) -> Unit,
     onSpecialKeyPressed: (SpecialKeyDef) -> Unit,
@@ -204,6 +213,7 @@ fun SessionScreen(
     BackHandler(enabled = true) {
         when {
             state.authPrompt != null -> onCancelAuth()
+            state.chat.isOpen -> onCloseChat()
             toolbarExpanded -> toolbarExpanded = false
             specialKeysVisible -> specialKeysVisible = false
             else -> showDisconnectConfirm = true
@@ -339,13 +349,30 @@ fun SessionScreen(
                 .align(Alignment.TopCenter)
                 .padding(top = 8.dp, start = 12.dp, end = 12.dp),
         ) {
-            ToolbarPillHandle(
-                hostLabel = state.sessionInfo?.hostName?.ifBlank { null }
-                    ?: AppPreferences.formatDisplayTarget(state.target),
-                connected = state.statusCode == BridgeConstants.STATUS_CONNECTED,
-                expanded = toolbarExpanded,
-                onClick = { toolbarExpanded = !toolbarExpanded },
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ToolbarPillHandle(
+                    hostLabel = state.sessionInfo?.hostName?.ifBlank { null }
+                        ?: AppPreferences.formatDisplayTarget(state.target),
+                    connected = state.statusCode == BridgeConstants.STATUS_CONNECTED,
+                    expanded = toolbarExpanded,
+                    onClick = { toolbarExpanded = !toolbarExpanded },
+                )
+                ToolbarChatButton(
+                    unreadCount = state.chat.unreadCount,
+                    isOpen = state.chat.isOpen,
+                    onClick = {
+                        if (!state.chat.isOpen) {
+                            toolbarExpanded = false
+                            specialKeysVisible = false
+                            softKeyboardActive = false
+                        }
+                        onToggleChat()
+                    },
+                )
+            }
 
             AnimatedVisibility(
                 visible = toolbarExpanded,
@@ -370,6 +397,12 @@ fun SessionScreen(
                     onToggleAudio = onToggleAudio,
                     onToggleClipboard = onToggleClipboard,
                     onToggleHud = onToggleHud,
+                    onToggleChat = {
+                        toolbarExpanded = false
+                        specialKeysVisible = false
+                        softKeyboardActive = false
+                        onToggleChat()
+                    },
                     onSelectBitrate = onSelectBitrate,
                     onSwitchDisplay = onSwitchDisplay,
                     onDisconnect = {
@@ -378,6 +411,42 @@ fun SessionScreen(
                     },
                 )
             }
+        }
+
+        // Responsive In-Session Chat drawer (landscape/wide) or bottom sheet (portrait)
+        val isWideScreen = LocalConfiguration.current.screenWidthDp >= 600
+        val chatPeerLabel = state.sessionInfo?.hostName?.ifBlank { null }
+            ?: AppPreferences.formatDisplayTarget(state.target)
+        AnimatedVisibility(
+            visible = state.chat.isOpen,
+            enter = if (isWideScreen) slideInHorizontally { it } + fadeIn() else slideInVertically { it } + fadeIn(),
+            exit = if (isWideScreen) slideOutHorizontally { it } + fadeOut() else slideOutVertically { it } + fadeOut(),
+            modifier = if (isWideScreen) {
+                Modifier
+                    .align(Alignment.CenterEnd)
+                    .imePadding()
+                    .padding(10.dp)
+                    .fillMaxHeight(0.88f)
+                    .widthIn(min = 280.dp, max = 360.dp)
+            } else {
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .imePadding()
+                    .padding(horizontal = 8.dp, vertical = 8.dp)
+                    .fillMaxWidth()
+                    .heightIn(min = 280.dp, max = 420.dp)
+                    .height(360.dp)
+            },
+        ) {
+            ChatPanelContent(
+                title = str(R.string.chat_title),
+                subtitle = chatPeerLabel,
+                messages = state.chat.messages,
+                onSendMessage = onSendChatMessage,
+                onClose = onCloseChat,
+                useDarkOverlayPalette = true,
+                modifier = Modifier.fillMaxSize(),
+            )
         }
 
         // Slide-up Special Keys Bar at bottom edge
@@ -684,6 +753,43 @@ private fun ToolbarPillHandle(
     }
 }
 
+@Composable
+private fun ToolbarChatButton(
+    unreadCount: Int,
+    isOpen: Boolean,
+    onClick: () -> Unit,
+) {
+    Surface(
+        color = if (isOpen) VeloxColors.Primary.copy(alpha = 0.25f) else VeloxColors.SurfaceOverlay,
+        shape = RoundedCornerShape(999.dp),
+        border = BorderStroke(
+            1.dp,
+            if (isOpen) VeloxColors.Primary else VeloxColors.Border.copy(alpha = 0.7f),
+        ),
+        modifier = Modifier.clickable(onClick = onClick),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Rounded.Chat,
+                contentDescription = if (unreadCount > 0) {
+                    str(R.string.chat_unread_desc, unreadCount)
+                } else {
+                    str(R.string.toolbar_chat)
+                },
+                tint = if (isOpen || unreadCount > 0) VeloxColors.Primary else VeloxColors.TextPrimary,
+                modifier = Modifier.size(16.dp),
+            )
+            if (unreadCount > 0) {
+                UnreadCountBadge(count = unreadCount)
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SessionControlPanel(
@@ -698,6 +804,7 @@ private fun SessionControlPanel(
     onToggleAudio: () -> Unit,
     onToggleClipboard: () -> Unit,
     onToggleHud: () -> Unit,
+    onToggleChat: () -> Unit,
     onSelectBitrate: (Int) -> Unit,
     onSwitchDisplay: (Int) -> Unit,
     onDisconnect: () -> Unit,
@@ -781,6 +888,13 @@ private fun SessionControlPanel(
                     onClick = onToggleHud,
                 )
                 ControlPillButton(
+                    icon = Icons.AutoMirrored.Rounded.Chat,
+                    label = str(R.string.toolbar_chat),
+                    active = state.chat.isOpen,
+                    badgeCount = state.chat.unreadCount,
+                    onClick = onToggleChat,
+                )
+                ControlPillButton(
                     icon = Icons.Rounded.CallEnd,
                     label = str(R.string.btn_disconnect),
                     active = false,
@@ -850,6 +964,7 @@ private fun ControlPillButton(
     label: String,
     active: Boolean,
     danger: Boolean = false,
+    badgeCount: Int = 0,
     onClick: () -> Unit,
 ) {
     val bg = when {
@@ -890,6 +1005,10 @@ private fun ControlPillButton(
                 style = MaterialTheme.typography.labelMedium,
                 color = content,
             )
+            if (badgeCount > 0) {
+                Spacer(modifier = Modifier.width(6.dp))
+                UnreadCountBadge(count = badgeCount)
+            }
         }
     }
 }

@@ -39,17 +39,22 @@ pub fn create_loopback_capture() -> Result<Box<dyn AudioCapture>> {
 /// current process tree (Parsec-class Windows 10 2004+ / 11 Process Loopback
 /// Exclusion, with transparent fallback to standard loopback on older OSes).
 pub fn create_loopback_capture_with_options(exclude_self_process: bool) -> Result<Box<dyn AudioCapture>> {
-    let _ = exclude_self_process;
     #[cfg(windows)]
     {
-        Ok(Box::new(wasapi::WasapiCapture::loopback()))
+        if exclude_self_process {
+            Ok(Box::new(wasapi::WasapiCapture::loopback_excluding_self()))
+        } else {
+            Ok(Box::new(wasapi::WasapiCapture::loopback()))
+        }
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = exclude_self_process;
         Ok(Box::new(linux::LinuxAudioCapture::loopback()))
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
+        let _ = exclude_self_process;
         Err(CoreError::unsupported("audio loopback capture is not implemented on this OS"))
     }
 }
@@ -244,6 +249,37 @@ mod tests {
             }
             Err(e) => {
                 eprintln!("skipping live playback smoke (no audio endpoint in env): {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn wasapi_process_loopback_exclusion_smoke_and_fallback() {
+        let mut cap = create_loopback_capture_with_options(true).expect("create_loopback_capture_with_options(true)");
+        let cfg = AudioCaptureConfig {
+            format: AudioFormat::STEREO_48K,
+            chunk: Duration::from_millis(10),
+            device: None,
+            microphone: false,
+        };
+        match cap.start(&cfg) {
+            Ok(fmt) => {
+                let backend = cap.backend();
+                eprintln!("process-excluding loopback started ({backend}): {fmt:?}");
+                assert_eq!(fmt, AudioFormat::STEREO_48K);
+                assert!(
+                    backend == "wasapi-process-loopback" || backend == "wasapi-loopback",
+                    "unexpected backend: {backend}"
+                );
+                let res = cap.read(Duration::from_millis(30)).expect("process loopback read");
+                eprintln!(
+                    "process-excluding loopback read got {} samples",
+                    res.as_ref().map(|f| f.samples.len()).unwrap_or(0)
+                );
+                cap.stop();
+            }
+            Err(e) => {
+                eprintln!("skipping live process-loopback smoke (no audio endpoint in env): {e}");
             }
         }
     }

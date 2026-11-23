@@ -188,9 +188,22 @@
     <string name="toolbar_audio">Звук</string>
     <string name="toolbar_clipboard">Буфер</string>
     <string name="toolbar_hud">HUD</string>
+    <string name="toolbar_chat">Чат</string>
     <string name="toolbar_bitrate">Битрейт</string>
     <string name="special_key_cad">Ctrl+Alt+Del</string>
     <string name="special_keys_fn_toggle">F1–F12</string>
+
+    <!-- In-Session Chat -->
+    <string name="chat_title">Чат сессии</string>
+    <string name="chat_host_title">Чат с %1$s</string>
+    <string name="chat_open_button">Открыть чат</string>
+    <string name="chat_empty">Сообщений пока нет. Напишите первым!</string>
+    <string name="chat_input_placeholder">Введите сообщение…</string>
+    <string name="chat_send">Отправить</string>
+    <string name="chat_delivered">Доставлено</string>
+    <string name="chat_sending">Отправка…</string>
+    <string name="chat_you">Вы</string>
+    <string name="chat_unread_desc">Непрочитанных сообщений: %1$d</string>
 
     <!-- HUD -->
     <string name="hud_path_direct">Прямое</string>

@@ -24,23 +24,28 @@ RustDesk-class desktop administration + Parsec-class low-latency gaming mode —
 - **Built-in Auto-Updater**: Checks [GitHub Releases](https://github.com/Zerrant2/VeloxDesk/releases) over HTTPS (`rustls`), verifies PE headers & GitHub SHA-256 digests, atomically replaces the running executable with rollback on failure, and relaunches cleanly.
 
 ### Parsec-Class Gaming Mode
-- **Independent Profiles**: Separate persisted streaming settings for **Desktop** and **Gaming** modes (quality/bitrate, FPS cap up to 240 FPS, Mailbox/Immediate/FIFO presentation, scaling, HUD, HW decode, audio, mic, clipboard, HDR, YUV 4:4:4, relative mouse).
+- **Independent Profiles**: Separate persisted streaming settings for **Desktop** and **Gaming** modes (quality/bitrate, FPS cap up to 240 FPS, Mailbox/Immediate/FIFO presentation, scaling, HUD, HW decode, audio, mic, echo cancellation, clipboard, HDR, YUV 4:4:4, relative mouse).
 - **GPU Zero-Copy Pipeline**: Windows DXGI Desktop Duplication + DX12 GPU Zero-Copy (`~3.03 ms` p50 @ 1080p120; `~3.23 ms` p50 @ 1080p240 in local pipeline benchmarks).
 - **Hardware Video & High Fidelity**: NVENC / D3D11VA / Media Foundation hardware encode & decode (with `openh264` software fallback), **10-bit HDR** (`P010` / HEVC Main10 / AV1 10-bit), and **YUV 4:4:4** full chroma.
-- **Low-Latency Audio & Gamepads**: Pure-Rust Opus (`rusty-opus`) + WASAPI loopback, microphone passthrough, and up to **4 gamepads** (XInput → ViGEmBus / uinput) with rumble feedback.
+- **Low-Latency Audio, Echo Cancellation & Gamepads**: Pure-Rust Opus (`rusty-opus`), Windows 10 2004+/11 **Process Loopback Exclusion** (`AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS`) + pure-Rust **NLMS Acoustic Echo Canceller (AEC)** (enabled by default in Gaming mode), microphone passthrough, and up to **4 gamepads** (XInput → ViGEmBus / uinput) with rumble feedback.
+- **Zero Re-Encode Session Recording**: Client-side pure-Rust Matroska (`.mkv`) muxer on a dedicated IO thread (H.264/HEVC/AV1 + Opus) that starts cleanly on an IDR keyframe without adding render latency, complete with a live `REC` toolbar indicator, timer, and file size readout (default `Videos\VeloxDesk`).
 
-### RustDesk-Class Remote Admin & Networking
+### RustDesk-Class Remote Admin, Android & Networking
 - **Flexible Connectivity**:
   - Direct **LAN / IP** connections (`UDP 21118`).
   - **Native Tailscale Integration**: Auto-detects installed `tailscale` CLI, copies your Tailscale IP in one click, and lists online Tailscale peers for 1-click connect.
   - **Connect by 9-Digit Device ID**: Self-hosted `veloxdesk-server` with UDP NAT hole punching (`UDP 21116`) and zero-knowledge UDP relay fallback (`UDP 21117`).
+- **Android Companion (Viewer & Host)**: Native Jetpack Compose Android app (`apps/android`, v0.5.0) backed by the Rust JNI bridge (`crates/android-bridge`) with bidirectional PC ↔ Android session chat, remote control, and screen streaming.
 - **Resilient Media Transport**: QUIC (`quinn`) with unreliable media datagrams + Reed-Solomon FEC + adaptive bitrate (ABR), plus reliable streams for control, input, files, tunnels, and terminal.
 - **Admin Tools**:
+  - **Bidirectional Session Chat**: Built-in chat panel on Desktop (both Viewer and embedded Host GUI) and Android with unread badges and delivery acknowledgements (`allow_chat` permission).
+  - **Remote Power & Auto-Reconnect**: Confirmation-gated `Reboot`, `Reboot (Safe Mode)`, `Lock Screen`, and `Sleep` (`allow_power` permission, off by default for interactive sessions) with automatic exponential-backoff reconnect for up to 5 minutes after host reboot.
+  - **Reliable Windows Privacy Mode**: Two-tier `WindowsPrivacyController` using a black fullscreen topmost curtain overlay per physical monitor with `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` (works without VDD or admin privileges while DXGI/WGC captures cleanly underneath), optional `BlockInput` / VDD `SC_MONITORPOWER`, and strict RAII `PrivacyGuard` cleanup.
   - Bidirectional clipboard sync (text, HTML, PNG, file lists with `zstd` compression & echo suppression).
   - Resumable file manager with `zstd` compression and SHA-256 verification.
   - Built-in remote terminal (**ConPTY** on Windows / PTY on Unix).
   - TCP port-forwarding tunnels (`--tunnel local:host:remote`).
-  - Multi-monitor switching, virtual display support, and host privacy curtain (`PrivacyGuard`).
+  - Multi-monitor switching and virtual display support.
 
 ### End-to-End Security & Flexible Access Control
 - **E2EE by Default**: QUIC + TLS 1.3 pinned directly to persistent Ed25519 device identities (`identity.key`). Neither the rendezvous nor the relay server can decrypt traffic.
@@ -110,10 +115,11 @@ veloxdesk --service-uninstall
 
 ## Architecture
 
-VeloxDesk is organized as a modular 22-crate Cargo workspace:
+VeloxDesk is organized as a modular 24-crate Cargo workspace (+ Android Jetpack Compose app):
 
 ```text
 apps/
+  android/             # Android Viewer + Host Jetpack Compose app (Kotlin + JNI)
   client/              # Unified GUI (Host + Viewer + Win32 tray + Tailscale + Auto-updater)
   server/              # Self-hosted rendezvous + zero-knowledge relay binary
 crates/
@@ -125,17 +131,19 @@ crates/
   server-relay/        # Zero-knowledge UDP relay (UDP 21117)
   capture/             # DXGI Desktop Duplication & DX12 GPU Zero-Copy capture
   codec/               # Hardware NVENC/MF/D3D11VA + openh264 software codecs
-  audio/               # Pure-Rust Opus + WASAPI loopback/mic/playback + jitter buffer
+  audio/               # Pure-Rust Opus, WASAPI process-exclusion loopback, NLMS AEC, jitter buffer
+  recorder/            # Zero re-encode pure-Rust Matroska (.mkv) muxer (H.264/HEVC/AV1 + Opus)
   render/              # Single-pass wgpu + egui video renderer & performance HUD
-  ui/                  # Connect screen, Settings, vector icons, EN/RU i18n, tools UI
+  ui/                  # Connect screen, Settings, chat, power modal, EN/RU i18n, tools UI
   input/               # Keyboard/mouse injection & XInput/ViGEmBus/uinput gamepads
   clipboard/           # Cross-platform clipboard sync (text/HTML/PNG/files + zstd)
   file-transfer/       # Resumable zstd file transfer with SHA-256 verification
   tunnel/              # Multiplexed TCP port forwarding over QUIC
   terminal/            # Native Windows ConPTY & Unix PTY remote shell
-  virtual-display/     # Virtual display management & RAII privacy curtain
-  service/             # Host session manager, auth state, local IPC, Windows SCM / systemd
-tests/                 # End-to-end integration & headless UI glyph tests
+  virtual-display/     # Virtual display management & WDA_EXCLUDEFROMCAPTURE privacy curtain
+  service/             # Host session manager, chat/power dispatch, auth state, IPC, SCM / systemd
+  android-bridge/      # Rust JNI bridge powering the Android Viewer & Host app
+tests/                 # End-to-end integration, protocol compat & headless UI glyph tests
 benches/               # Pipeline latency & network impairment simulator benchmarks
 ```
 

@@ -277,6 +277,10 @@ impl PasswordMode {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Persisted trusted viewer identity remembered from an interactive Accept dialog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -292,6 +296,10 @@ pub struct SavedTrustedPeer {
     pub allow_terminal: bool,
     pub allow_tunnel: bool,
     pub allow_privacy_mode: bool,
+    #[serde(default = "default_true")]
+    pub allow_chat: bool,
+    #[serde(default)]
+    pub allow_power: bool,
 }
 
 impl Default for SavedTrustedPeer {
@@ -308,6 +316,8 @@ impl Default for SavedTrustedPeer {
             allow_terminal: true,
             allow_tunnel: true,
             allow_privacy_mode: false,
+            allow_chat: true,
+            allow_power: false,
         }
     }
 }
@@ -382,6 +392,12 @@ pub struct Settings {
     pub permanent_password_hash: Option<String>,
     /// Persisted trusted viewer devices allowed passwordless Ed25519 reconnect.
     pub trusted_peers: Vec<SavedTrustedPeer>,
+    /// Enable echo cancellation (Windows process loopback exclusion + NLMS AEC; forced on in Gaming mode).
+    #[serde(default = "default_true")]
+    pub echo_cancellation: bool,
+    /// Custom folder for saved `.mkv` session recordings (empty = default `Videos\VeloxDesk`).
+    #[serde(default)]
+    pub recordings_dir: String,
 }
 
 impl Default for Settings {
@@ -398,6 +414,8 @@ impl Default for Settings {
             password_mode: PasswordMode::default(),
             permanent_password_hash: None,
             trusted_peers: Vec::new(),
+            echo_cancellation: true,
+            recordings_dir: String::new(),
         }
     }
 }
@@ -474,6 +492,8 @@ struct RawSettings {
     password_mode: Option<PasswordMode>,
     permanent_password_hash: Option<String>,
     trusted_peers: Option<Vec<SavedTrustedPeer>>,
+    echo_cancellation: Option<bool>,
+    recordings_dir: Option<String>,
     #[serde(flatten)]
     legacy: RawStreamSettings,
 }
@@ -504,6 +524,12 @@ impl<'de> Deserialize<'de> for Settings {
             gaming.relative_mouse_in_gaming = rel;
         }
 
+        let echo_cancellation = if mode == Mode::Gaming {
+            true
+        } else {
+            raw.echo_cancellation.unwrap_or(true)
+        };
+
         Ok(Self {
             language: raw.language.unwrap_or_default(),
             theme: raw.theme.unwrap_or_default(),
@@ -516,11 +542,25 @@ impl<'de> Deserialize<'de> for Settings {
             password_mode: raw.password_mode.unwrap_or_default(),
             permanent_password_hash: raw.permanent_password_hash.filter(|s| !s.trim().is_empty()),
             trusted_peers: raw.trusted_peers.unwrap_or_default(),
+            echo_cancellation,
+            recordings_dir: raw.recordings_dir.unwrap_or_default(),
         })
     }
 }
 
 impl Settings {
+    /// Whether echo cancellation is effectively active (always `true` in Gaming mode).
+    pub fn effective_echo_cancellation(&self) -> bool {
+        self.echo_cancellation || self.mode == Mode::Gaming
+    }
+
+    /// Switch the active session mode, forcing `echo_cancellation = true` when selecting Gaming.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        if mode == Mode::Gaming {
+            self.echo_cancellation = true;
+        }
+    }
     /// Whether a permanent host password hash is currently configured.
     pub fn has_permanent_password(&self) -> bool {
         self.permanent_password_hash.as_deref().is_some_and(|s| !s.trim().is_empty())
@@ -820,6 +860,8 @@ mod tests {
             allow_terminal: false,
             allow_tunnel: false,
             allow_privacy_mode: true,
+            allow_chat: true,
+            allow_power: true,
         };
         s.upsert_trusted_peer(peer.clone());
         assert_eq!(s.trusted_peers.len(), 1);
@@ -872,5 +914,37 @@ mod tests {
             assert_eq!(reloaded.theme, th);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn v050_echo_cancellation_recordings_dir_and_trusted_peer_compat() {
+        let def = Settings::default();
+        assert!(def.echo_cancellation);
+        assert!(def.effective_echo_cancellation());
+        assert!(def.recordings_dir.is_empty());
+
+        // Legacy v0.4.0 JSON without echo_cancellation / recordings_dir / allow_chat / allow_power.
+        let legacy: Settings = serde_json::from_str(
+            r#"{"mode":"Desktop","trusted_peers":[{"public_key_hex":"aa","device_id":"123456789","name":"Peer","fingerprint":"fp"}]}"#,
+        )
+        .unwrap();
+        assert!(legacy.echo_cancellation);
+        assert!(legacy.recordings_dir.is_empty());
+        assert_eq!(legacy.trusted_peers.len(), 1);
+        assert!(legacy.trusted_peers[0].allow_chat);
+        assert!(!legacy.trusted_peers[0].allow_power);
+
+        // Gaming mode forces echo_cancellation = true.
+        let mut s = Settings { echo_cancellation: false, recordings_dir: "D:\\Captures".into(), ..Default::default() };
+        assert!(!s.effective_echo_cancellation());
+        s.set_mode(Mode::Gaming);
+        assert!(s.echo_cancellation);
+        assert!(s.effective_echo_cancellation());
+
+        // JSON with Gaming mode and echo_cancellation=false still forces true on deserialize.
+        let gaming_json: Settings =
+            serde_json::from_str(r#"{"mode":"Gaming","echo_cancellation":false,"recordings_dir":"C:\\Rec"}"#).unwrap();
+        assert!(gaming_json.echo_cancellation);
+        assert_eq!(gaming_json.recordings_dir, "C:\\Rec");
     }
 }

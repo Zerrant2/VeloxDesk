@@ -100,6 +100,13 @@ pub fn decode_codec_caps_mask(
     caps
 }
 
+/// Current wall-clock time in milliseconds since UNIX epoch.
+pub(crate) fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Convert interleaved `f32` audio samples (`-1.0..=1.0`, clamped & NaN-safe) into `i16` PCM.
 pub fn f32_to_pcm16(src: &[f32], dst: &mut Vec<i16>) {
     dst.clear();

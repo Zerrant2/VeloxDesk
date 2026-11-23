@@ -130,4 +130,88 @@ mod tests {
         let privacy = create_privacy_controller();
         assert!(!privacy.is_enabled());
     }
+
+    #[test]
+    fn privacy_controller_idempotent_enable_and_disable() {
+        let ctrl = SimulatedPrivacyController::new();
+        assert!(!ctrl.is_enabled());
+
+        ctrl.disable().expect("idempotent disable when already off");
+        assert!(!ctrl.is_enabled());
+
+        ctrl.enable().expect("enable 1");
+        assert!(ctrl.is_enabled());
+        ctrl.enable().expect("enable 2");
+        assert!(ctrl.is_enabled());
+
+        ctrl.disable().expect("disable 1");
+        assert!(!ctrl.is_enabled());
+        ctrl.disable().expect("disable 2");
+        assert!(!ctrl.is_enabled());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_privacy_controller_curtain_lifecycle_and_raii() {
+        let ctrl = Arc::new(privacy::win::WindowsPrivacyController::new());
+        assert!(!ctrl.is_enabled());
+        assert!(!ctrl.is_vdd_active(), "VDD SC_MONITORPOWER must default to false");
+        assert_eq!(ctrl.active_window_count(), 0);
+
+        ctrl.set_vdd_active(true);
+        assert!(ctrl.is_vdd_active());
+        ctrl.set_vdd_active(false);
+        assert!(!ctrl.is_vdd_active());
+
+        // Idempotent disable when never enabled.
+        ctrl.disable().expect("disable when off");
+        assert!(!ctrl.is_enabled());
+
+        // Real curtain overlay lifecycle (no VDD => no SC_MONITORPOWER; WDA_EXCLUDEFROMCAPTURE).
+        match ctrl.enable() {
+            Ok(()) => {
+                assert!(ctrl.is_enabled());
+                assert!(ctrl.active_window_count() >= 1, "expected >=1 curtain overlay window");
+
+                // Idempotent second enable must succeed without spawning extra curtains.
+                let count = ctrl.active_window_count();
+                ctrl.enable().expect("idempotent second enable");
+                assert_eq!(ctrl.active_window_count(), count);
+
+                ctrl.disable().expect("disable curtain");
+                assert!(!ctrl.is_enabled());
+                assert_eq!(ctrl.active_window_count(), 0);
+
+                // Idempotent second disable.
+                ctrl.disable().expect("idempotent second disable");
+
+                // RAII PrivacyGuard drop & panic unwind cleanup.
+                let ctrl_drop = Arc::new(privacy::win::WindowsPrivacyController::new());
+                {
+                    let guard = PrivacyGuard::activate(ctrl_drop.clone()).expect("activate guard");
+                    assert!(guard.is_active());
+                    assert!(ctrl_drop.active_window_count() >= 1);
+                }
+                assert!(!ctrl_drop.is_enabled());
+                assert_eq!(ctrl_drop.active_window_count(), 0);
+
+                let ctrl_panic = Arc::new(privacy::win::WindowsPrivacyController::new());
+                let ctrl_panic_inner = ctrl_panic.clone();
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let _guard = PrivacyGuard::activate(ctrl_panic_inner).expect("activate guard panic");
+                    panic!("simulated unwind with active curtain");
+                }));
+                assert!(res.is_err());
+                assert!(!ctrl_panic.is_enabled());
+                assert_eq!(ctrl_panic.active_window_count(), 0);
+            }
+            Err(e) => {
+                // In non-interactive/Session-0 environments without desktop window station,
+                // enable() must fail cleanly leaving no partial state.
+                eprintln!("curtain overlay unavailable in this desktop session (clean failure): {e}");
+                assert!(!ctrl.is_enabled());
+                assert_eq!(ctrl.active_window_count(), 0);
+            }
+        }
+    }
 }

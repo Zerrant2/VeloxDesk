@@ -88,6 +88,12 @@ interface VeloxSessionCallback {
     // JNI: (IIZJ)V
     fun onCursorPosition(x: Int, y: Int, visible: Boolean, shapeId: Long)
 
+    // JNI: (JLjava/lang/String;Ljava/lang/String;J)V
+    fun onChatMessage(id: Long, senderName: String, text: String, tsMs: Long)
+
+    // JNI: (J)V
+    fun onChatAck(id: Long)
+
     // JNI: (Ljava/lang/String;Z)V
     fun onClosed(reason: String, isError: Boolean)
 }
