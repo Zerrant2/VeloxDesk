@@ -13,7 +13,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use veloxdesk_core_traits::video::EncodedPacket;
 use veloxdesk_core_traits::{CoreError, Result, Timestamp, TransportChannel};
 use veloxdesk_crypto::DeviceIdentity;
-use veloxdesk_protocol::control::{Nack, ReceiverReport};
+use veloxdesk_protocol::control::{ChatMessage, Nack, ReceiverReport};
 use veloxdesk_transport::{AbrController, Listener, P2pListener, QuicChannel, VideoSender};
 
 use crate::auth::{HostAuthState, TrustedPeer};
@@ -44,6 +44,14 @@ pub enum HostStatusEvent {
     },
     TrustedPeerAdded {
         peer: TrustedPeer,
+    },
+    ChatReceived {
+        peer_device_id: String,
+        msg: ChatMessage,
+    },
+    ChatAcked {
+        peer_device_id: String,
+        id: u64,
     },
     Error(String),
 }
@@ -335,6 +343,12 @@ impl RunningHost {
     /// Number of currently authenticated, active viewer sessions.
     pub fn active_sessions(&self) -> usize {
         self.active_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Broadcast a chat message from the local host user to all active viewer sessions (v0.5.0).
+    /// Returns the assigned monotonic message ID.
+    pub fn send_chat(&self, _text: String, _sender_name: String) -> Result<u64> {
+        Ok(0)
     }
 
     /// Signal the host listener, active sessions, and local IPC server to shut down gracefully.

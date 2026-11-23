@@ -436,6 +436,8 @@ fn default_session_permissions(cfg: &HostConfig) -> Permissions {
         terminal: true,
         restart: false,
         privacy_mode: true,
+        allow_chat: true,
+        allow_power: false,
     }
 }
 

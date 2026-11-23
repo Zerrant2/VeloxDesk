@@ -10,6 +10,7 @@ members = [
     "crates/capture",
     "crates/codec",
     "crates/audio",
+    "crates/recorder",
     "crates/render",
     "crates/ui",
     "crates/input",
@@ -27,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -46,6 +47,7 @@ veloxdesk-server-relay = { path = "crates/server-relay" }
 veloxdesk-capture = { path = "crates/capture" }
 veloxdesk-codec = { path = "crates/codec" }
 veloxdesk-audio = { path = "crates/audio" }
+veloxdesk-recorder = { path = "crates/recorder" }
 veloxdesk-render = { path = "crates/render" }
 veloxdesk-ui = { path = "crates/ui" }
 veloxdesk-input = { path = "crates/input" }

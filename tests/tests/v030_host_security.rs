@@ -393,6 +393,8 @@ async fn v030_live_trusted_peer_added_persist_reconnect_and_revoke() {
         terminal: false,
         privacy_mode: true,
         restart: false,
+        allow_chat: true,
+        allow_power: false,
     };
 
     let approval_calls = Arc::new(AtomicUsize::new(0));

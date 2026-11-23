@@ -4261,7 +4261,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4284,6 +4284,7 @@ dependencies = [
  "veloxdesk-crypto",
  "veloxdesk-file-transfer",
  "veloxdesk-protocol",
+ "veloxdesk-recorder",
  "veloxdesk-render",
  "veloxdesk-service",
  "veloxdesk-terminal",
@@ -4297,7 +4298,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-android-bridge"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -4326,9 +4327,10 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-audio"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
+ "parking_lot",
  "rusty-opus",
  "tracing",
  "veloxdesk-core-traits",
@@ -4338,7 +4340,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-benches"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4359,7 +4361,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-capture"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ashpd",
  "bytes",
@@ -4374,7 +4376,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-clipboard"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arboard",
  "bytes",
@@ -4390,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-codec"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "openh264",
@@ -4405,7 +4407,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-core-traits"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4416,7 +4418,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-crypto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "argon2",
  "ed25519-dalek",
@@ -4435,7 +4437,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-file-transfer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "prost",
@@ -4450,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-input"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "tracing",
@@ -4461,7 +4463,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-protocol"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "prost",
@@ -4469,8 +4471,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "veloxdesk-recorder"
+version = "0.5.0"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "parking_lot",
+ "thiserror 2.0.21",
+ "tracing",
+ "veloxdesk-core-traits",
+]
+
+[[package]]
 name = "veloxdesk-render"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "egui",
@@ -4488,7 +4502,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4503,7 +4517,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-server-relay"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "socket2",
  "tokio",
@@ -4514,7 +4528,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-server-rendezvous"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "prost",
  "rand_core 0.6.4",
@@ -4528,7 +4542,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-service"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4559,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-terminal"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4574,7 +4588,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-tests"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4590,6 +4604,7 @@ dependencies = [
  "veloxdesk-crypto",
  "veloxdesk-file-transfer",
  "veloxdesk-protocol",
+ "veloxdesk-recorder",
  "veloxdesk-render",
  "veloxdesk-server-relay",
  "veloxdesk-server-rendezvous",
@@ -4604,7 +4619,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-transport"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4627,7 +4642,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-tunnel"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "prost",
@@ -4641,7 +4656,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-ui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "egui",
  "serde",
@@ -4653,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "veloxdesk-virtual-display"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "tracing",
  "veloxdesk-core-traits",

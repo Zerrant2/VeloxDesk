@@ -65,6 +65,8 @@ pub struct HostConfig {
     pub audio_frame_ms: f32,
     /// Allow viewer microphone audio playback (`stream_id = 1`) on the host.
     pub allow_mic: bool,
+    /// Enable echo cancellation (Windows process loopback exclusion + NLMS AEC) (v0.5.0).
+    pub echo_cancellation: bool,
     /// Portable mode: store config and device identity next to the executable instead of AppData.
     pub portable: bool,
     /// Local loopback TCP port for daemon/GUI IPC (`Some(DEFAULT_IPC_PORT)` by default,
@@ -119,6 +121,7 @@ impl Default for HostConfig {
             audio_bitrate_kbps: 128,
             audio_frame_ms: 5.0,
             allow_mic: false,
+            echo_cancellation: true,
             portable: false,
             ipc_port: Some(DEFAULT_IPC_PORT),
         }

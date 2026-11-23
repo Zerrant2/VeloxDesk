@@ -166,6 +166,8 @@ mod net {
             tunnel: saved.allow_tunnel,
             privacy_mode: saved.allow_privacy_mode,
             restart: false,
+            allow_chat: true,
+            allow_power: false,
         };
         Some(TrustedPeer::new(pk, saved.name.clone()).with_permissions(perms))
     }
@@ -396,6 +398,7 @@ mod net {
                     HostStatusEvent::TrustedPeerAdded { peer } => {
                         EmbeddedHostEvent::TrustedPeerAdded(trusted_peer_to_saved(&peer))
                     }
+                    HostStatusEvent::ChatReceived { .. } | HostStatusEvent::ChatAcked { .. } => return,
                     HostStatusEvent::Error(e) => EmbeddedHostEvent::Error(e),
                 };
                 let _ = ev_proxy.send_event(UserEvent::Host(mapped));

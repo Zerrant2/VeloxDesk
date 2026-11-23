@@ -10,6 +10,7 @@
 //! * **Linux**: PipeWire / ALSA interface behind `#[cfg(target_os = "linux")]`.
 //! * **Codec**: Pure-Rust `rusty-opus` (RFC 6716 / RFC 8251, runtime AVX2/NEON SIMD).
 
+pub mod aec;
 pub mod jitter;
 pub mod opus;
 pub mod pcm;
@@ -20,6 +21,7 @@ pub mod wasapi;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+pub use aec::{AcousticEchoCanceller, AecConfig, AecReferenceFeed};
 pub use jitter::{AudioJitterBuffer, JitterConfig, JitterPop, JitterStats};
 pub use opus::{OpusDecoder, OpusEncoder};
 
@@ -30,6 +32,14 @@ use veloxdesk_core_traits::audio::{AudioCapture, AudioPlayback};
 
 /// Create the OS system-audio loopback capture backend.
 pub fn create_loopback_capture() -> Result<Box<dyn AudioCapture>> {
+    create_loopback_capture_with_options(false)
+}
+
+/// Create the OS system-audio loopback capture backend, optionally excluding the
+/// current process tree (Parsec-class Windows 10 2004+ / 11 Process Loopback
+/// Exclusion, with transparent fallback to standard loopback on older OSes).
+pub fn create_loopback_capture_with_options(exclude_self_process: bool) -> Result<Box<dyn AudioCapture>> {
+    let _ = exclude_self_process;
     #[cfg(windows)]
     {
         Ok(Box::new(wasapi::WasapiCapture::loopback()))

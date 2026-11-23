@@ -11,6 +11,7 @@ publish = false
 veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
 bytes = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 rusty-opus = "1"
 

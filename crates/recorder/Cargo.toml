@@ -1,0 +1,19 @@
+[package]
+name = "veloxdesk-recorder"
+description = "Zero re-encode client-side session recorder (pure-Rust Matroska MKV muxer for H.264/HEVC/AV1 + Opus)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+veloxdesk-core-traits = { workspace = true }
+
+[lints]
+workspace = true

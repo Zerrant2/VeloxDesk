@@ -245,6 +245,8 @@ impl AndroidTrustedPeer {
             terminal: saved.allow_terminal,
             restart: false,
             privacy_mode: saved.allow_privacy_mode,
+            allow_chat: true,
+            allow_power: false,
         };
         Some(Self { public_key: pk, name: saved.name.clone(), permissions: perms })
     }
@@ -1505,6 +1507,8 @@ async fn authenticate(
             terminal: false,
             restart: false,
             privacy_mode: false,
+            allow_chat: true,
+            allow_power: false,
         };
         if decision.remember_peer
             && let Some(pk) = peer_pk
@@ -1527,6 +1531,8 @@ async fn authenticate(
             terminal: false,
             restart: false,
             privacy_mode: false,
+            allow_chat: true,
+            allow_power: false,
         }
     };
 

@@ -12,7 +12,7 @@ default = ["full"]
 # Tests needing the M1 transport (QUIC + FEC) API.
 net = ["dep:veloxdesk-transport", "dep:veloxdesk-crypto"]
 # Host↔viewer session smoke test (needs transport + service + codec).
-full = ["net", "dep:veloxdesk-service", "dep:veloxdesk-codec"]
+full = ["net", "dep:veloxdesk-codec"]
 
 [dependencies]
 anyhow.workspace = true
@@ -23,7 +23,6 @@ veloxdesk-core-traits = { workspace = true }
 veloxdesk-protocol = { workspace = true }
 veloxdesk-transport = { workspace = true, optional = true }
 veloxdesk-crypto = { workspace = true, optional = true }
-veloxdesk-service = { workspace = true, optional = true }
 veloxdesk-codec = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -33,9 +32,11 @@ veloxdesk-benches = { path = "../benches" }
 veloxdesk-audio = { workspace = true }
 veloxdesk-clipboard = { workspace = true }
 veloxdesk-file-transfer = { workspace = true }
+veloxdesk-recorder = { workspace = true }
 veloxdesk-render = { workspace = true }
 veloxdesk-server-rendezvous = { workspace = true }
 veloxdesk-server-relay = { workspace = true }
+veloxdesk-service = { workspace = true }
 veloxdesk-terminal = { workspace = true }
 veloxdesk-tunnel = { workspace = true }
 veloxdesk-ui = { workspace = true }

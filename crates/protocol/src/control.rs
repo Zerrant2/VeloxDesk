@@ -87,6 +87,16 @@ pub enum FileOp {
     Stat = 6,
 }
 
+/// Remote host power management actions (v0.5.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SystemPowerAction {
+    Reboot = 0,
+    RebootSafeMode = 1,
+    LockScreen = 2,
+    Sleep = 3,
+}
+
 // ───────────────────────────── session ─────────────────────────────
 
 /// Viewer decode capability for one codec.
@@ -195,6 +205,12 @@ pub struct Permissions {
     pub restart: bool,
     #[prost(bool, tag = "9")]
     pub privacy_mode: bool,
+    /// Bidirectional text chat in session (v0.5.0; interactive default: true).
+    #[prost(bool, tag = "10")]
+    pub allow_chat: bool,
+    /// Remote host power actions: reboot/lock/sleep (v0.5.0; interactive default: false).
+    #[prost(bool, tag = "11")]
+    pub allow_power: bool,
 }
 
 impl Permissions {
@@ -209,6 +225,25 @@ impl Permissions {
             terminal: true,
             restart: true,
             privacy_mode: true,
+            allow_chat: true,
+            allow_power: true,
+        }
+    }
+
+    /// Standard permissions for interactive sessions (chat allowed, power actions disabled by default).
+    pub fn interactive_default() -> Self {
+        Self {
+            view: true,
+            input: true,
+            clipboard: true,
+            file_transfer: true,
+            audio: true,
+            tunnel: true,
+            terminal: true,
+            restart: false,
+            privacy_mode: true,
+            allow_chat: true,
+            allow_power: false,
         }
     }
 }
@@ -765,6 +800,51 @@ pub struct PrivacyModeResult {
     pub error: String,
 }
 
+/// Bidirectional in-session chat message (v0.5.0, Envelope tag 46).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChatMessage {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(string, tag = "2")]
+    pub sender_name: String,
+    #[prost(string, tag = "3")]
+    pub text: String,
+    /// Sender wall-clock timestamp in milliseconds since UNIX epoch.
+    #[prost(uint64, tag = "4")]
+    pub ts_ms: u64,
+}
+
+/// Delivery acknowledgement for a [`ChatMessage`] (v0.5.0, Envelope tag 47).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChatAck {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+}
+
+/// Viewer → host remote power management request (v0.5.0, Envelope tag 48).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SystemPowerRequest {
+    #[prost(enumeration = "SystemPowerAction", tag = "1")]
+    pub action: i32,
+    /// Optional reason string (logged by OS shutdown/power manager).
+    #[prost(string, tag = "2")]
+    pub reason: String,
+    /// Optional grace delay in seconds before executing reboot.
+    #[prost(uint32, tag = "3")]
+    pub delay_secs: u32,
+}
+
+/// Host → viewer acknowledgement/result for [`SystemPowerRequest`] (v0.5.0, Envelope tag 49).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SystemPowerResult {
+    #[prost(enumeration = "SystemPowerAction", tag = "1")]
+    pub action: i32,
+    #[prost(bool, tag = "2")]
+    pub ok: bool,
+    #[prost(string, tag = "3")]
+    pub error: String,
+}
+
 // ───────────────────────────── envelope ─────────────────────────────
 
 /// Top-level control message. Unknown oneof tags decode as `msg: None` (ignore them).
@@ -772,7 +852,7 @@ pub struct PrivacyModeResult {
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Msg",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49"
     )]
     pub msg: Option<envelope::Msg>,
 }
@@ -854,6 +934,15 @@ pub mod envelope {
         AudioConfig(super::AudioConfig),
         #[prost(message, tag = "45")]
         DisplayList(super::DisplayList),
+        // v0.5.0 features 46..
+        #[prost(message, tag = "46")]
+        ChatMessage(super::ChatMessage),
+        #[prost(message, tag = "47")]
+        ChatAck(super::ChatAck),
+        #[prost(message, tag = "48")]
+        SystemPowerRequest(super::SystemPowerRequest),
+        #[prost(message, tag = "49")]
+        SystemPowerResult(super::SystemPowerResult),
     }
 }
 
@@ -891,5 +980,43 @@ mod tests {
         let bytes = [0x98, 0x06, 0x01];
         let env = Envelope::decode(&bytes[..]).unwrap();
         assert!(env.msg.is_none());
+    }
+
+    #[test]
+    fn v050_chat_and_power_roundtrip() {
+        let msgs: Vec<envelope::Msg> = vec![
+            envelope::Msg::ChatMessage(ChatMessage {
+                id: 42,
+                sender_name: "Alice".into(),
+                text: "Привет / Hello!".into(),
+                ts_ms: 1_700_000_000_000,
+            }),
+            envelope::Msg::ChatAck(ChatAck { id: 42 }),
+            envelope::Msg::SystemPowerRequest(SystemPowerRequest {
+                action: SystemPowerAction::Reboot as i32,
+                reason: "Windows Update".into(),
+                delay_secs: 5,
+            }),
+            envelope::Msg::SystemPowerResult(SystemPowerResult {
+                action: SystemPowerAction::Reboot as i32,
+                ok: true,
+                error: String::new(),
+            }),
+        ];
+        for msg in msgs {
+            let env: Envelope = msg.into();
+            let bytes = env.encode_to_vec();
+            assert_eq!(Envelope::decode(bytes.as_slice()).unwrap(), env);
+        }
+    }
+
+    #[test]
+    fn permissions_v040_compat_roundtrip() {
+        let full = Permissions::all();
+        assert!(full.allow_chat && full.allow_power);
+        let inter = Permissions::interactive_default();
+        assert!(inter.allow_chat && !inter.allow_power);
+        let encoded = inter.encode_to_vec();
+        assert_eq!(Permissions::decode(encoded.as_slice()).unwrap(), inter);
     }
 }
