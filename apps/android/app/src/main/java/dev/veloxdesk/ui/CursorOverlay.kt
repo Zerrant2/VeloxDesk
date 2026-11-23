@@ -35,6 +35,7 @@ data class CursorOverlayState(
     val hostX: Float = 0f,
     val hostY: Float = 0f,
     val visible: Boolean = false,
+    val hostReportedVisibility: Boolean = false,
     val hasPosition: Boolean = false,
     val shapeId: Long = 0L,
     val shape: CursorShapeBitmap? = null,
@@ -164,7 +165,11 @@ fun CursorOverlayCanvas(
     modifier: Modifier = Modifier,
 ) {
     val shouldDraw = videoWidth > 0 && videoHeight > 0 &&
-        (cursor.visible || (touchMode == TouchMode.TRACKPAD && cursor.hasPosition))
+        if (cursor.hostReportedVisibility) {
+            cursor.visible
+        } else {
+            cursor.visible || (touchMode == TouchMode.TRACKPAD && cursor.hasPosition)
+        }
     if (!shouldDraw) return
 
     val density = LocalDensity.current

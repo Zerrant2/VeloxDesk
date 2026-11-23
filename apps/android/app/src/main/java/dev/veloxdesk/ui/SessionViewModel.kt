@@ -611,6 +611,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
                         hostX = x.toFloat(),
                         hostY = y.toFloat(),
                         visible = visible,
+                        hostReportedVisibility = true,
                         hasPosition = true,
                         shapeId = resolvedShapeId,
                         shape = resolvedShape,
@@ -728,7 +729,11 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             val clampedX = if (maxX > 0f) hostX.coerceIn(0f, maxX) else hostX.coerceAtLeast(0f)
             val clampedY = if (maxY > 0f) hostY.coerceIn(0f, maxY) else hostY.coerceAtLeast(0f)
             val isAndroidHost = state.sessionInfo?.hostOs.equals("android", ignoreCase = true)
-            val showCursor = state.touchMode == TouchMode.TRACKPAD || state.cursor.visible || !isAndroidHost
+            val showCursor = if (state.cursor.hostReportedVisibility) {
+                state.cursor.visible
+            } else {
+                state.touchMode == TouchMode.TRACKPAD || state.cursor.visible || !isAndroidHost
+            }
             state.copy(
                 cursor = state.cursor.copy(
                     hostX = clampedX,
@@ -749,11 +754,12 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             val baseY = if (state.cursor.hasPosition) state.cursor.hostY else h * 0.5f
             val nextX = (baseX + dx).coerceIn(0f, (w - 1).toFloat())
             val nextY = (baseY + dy).coerceIn(0f, (h - 1).toFloat())
+            val showCursor = if (state.cursor.hostReportedVisibility) state.cursor.visible else true
             state.copy(
                 cursor = state.cursor.copy(
                     hostX = nextX,
                     hostY = nextY,
-                    visible = true,
+                    visible = showCursor,
                     hasPosition = true,
                 ),
             )
