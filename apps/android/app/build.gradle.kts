@@ -33,7 +33,7 @@ android {
         applicationId = "dev.veloxdesk.viewer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
+        versionCode = 400
         versionName = "0.4.0"
 
         buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
