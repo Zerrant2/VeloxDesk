@@ -145,9 +145,11 @@ impl State {
 }
 
 /// Reject a connection (e.g. too many sessions): sends `Close` on the control stream if the
-/// viewer opens one quickly, then closes the connection.
+/// viewer opens one quickly, flushes cleanly, then closes the connection.
 pub async fn reject(ch: Arc<dyn TransportChannel>, code: u32, reason: &str) {
-    if let Ok(Ok((StreamKind::Control, send, _recv))) = timeout(Duration::from_secs(2), ch.accept_bi()).await {
+    if let Ok(Ok((StreamKind::Control, send, _keep_recv))) =
+        timeout(Duration::from_millis(200), ch.accept_bi()).await
+    {
         let mut w = ControlSender::new(send);
         let _ = w.send(&Msg::Close(Close { code, reason: reason.into() }).into()).await;
         let _ = w.finish().await;
@@ -217,6 +219,14 @@ pub async fn run_session_until(
     run_session_with_hooks(ch, cfg, backends, stop, SessionHooks::default()).await
 }
 
+async fn wait_stop(stop: &mut watch::Receiver<bool>) {
+    while !*stop.borrow() {
+        if stop.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 pub(crate) async fn run_session_with_hooks(
     ch: Arc<dyn TransportChannel>,
     cfg: Arc<HostConfig>,
@@ -225,21 +235,36 @@ pub(crate) async fn run_session_with_hooks(
     hooks: SessionHooks,
 ) -> veloxdesk_core_traits::Result<SessionSummary> {
     let sid = session_id();
-    // 1. control stream + Hello
+    // 1. control stream + Hello (cancellable on host shutdown or same-peer supersede)
     let (send, recv) = loop {
-        let (kind, s, r) = timeout(HANDSHAKE_TIMEOUT, ch.accept_bi()).await.map_err(|_| CoreError::Timeout)??;
+        let accepted = tokio::select! {
+            () = wait_stop(&mut stop) => {
+                ch.close(CLOSE_NORMAL, "host stopping");
+                return Err(CoreError::Closed);
+            }
+            res = timeout(HANDSHAKE_TIMEOUT, ch.accept_bi()) => res.map_err(|_| CoreError::Timeout)??,
+        };
+        let (kind, s, r) = accepted;
         if kind == StreamKind::Control {
             break (s, r);
         }
         tracing::debug!(?kind, "stream before control stream ignored");
     };
     let (mut writer, mut reader) = framed(send, recv);
-    let hello = match timeout(HANDSHAKE_TIMEOUT, reader.recv()).await.map_err(|_| CoreError::Timeout)??.msg {
-        Some(Msg::Hello(h)) => h,
-        other => {
-            let _ = writer.send(&Msg::Close(Close { code: CLOSE_PROTOCOL, reason: "expected Hello".into() }).into()).await;
-            ch.close(CLOSE_PROTOCOL, "expected Hello");
-            return Err(CoreError::invalid(format!("expected Hello, got {other:?}")));
+    let hello = tokio::select! {
+        () = wait_stop(&mut stop) => {
+            let _ = writer.send(&Msg::Close(Close { code: CLOSE_NORMAL, reason: "host stopping".into() }).into()).await;
+            let _ = writer.finish().await;
+            ch.close(CLOSE_NORMAL, "host stopping");
+            return Err(CoreError::Closed);
+        }
+        res = timeout(HANDSHAKE_TIMEOUT, reader.recv()) => match res.map_err(|_| CoreError::Timeout)??.msg {
+            Some(Msg::Hello(h)) => h,
+            other => {
+                let _ = writer.send(&Msg::Close(Close { code: CLOSE_PROTOCOL, reason: "expected Hello".into() }).into()).await;
+                ch.close(CLOSE_PROTOCOL, "expected Hello");
+                return Err(CoreError::invalid(format!("expected Hello, got {other:?}")));
+            }
         }
     };
     tracing::info!(session = sid, peer = %hello.device_id, name = %hello.device_name, os = %hello.os,

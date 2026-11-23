@@ -444,3 +444,135 @@ async fn rejects_spoofed_hello_identity_against_tls_key() {
     assert!(res.reason.contains("TLS"));
     assert!(host.await.unwrap().is_err());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_password_mode_switches_and_security_guard_and_peer_revocation() {
+    let host_id = DeviceIdentity::generate();
+    let viewer_id = DeviceIdentity::generate();
+    let injected = Arc::new(AtomicUsize::new(0));
+
+    let mut auth = HostAuthConfig::with_otp("OTP11111");
+    auth.host_public_key = Some(host_id.public_key());
+    let state = HostAuthState::from_config(&auth);
+    auth.shared_state = Some(state.clone());
+    let cfg = Arc::new(HostConfig { auth, ..Default::default() });
+
+    let params = Argon2Params { m_cost_kib: 1024, t_cost: 1, p_cost: 1 };
+    let perm_hash = PasswordHash::hash_with("PermSecret!99", params).unwrap();
+
+    // 1. Live switch to Permanent-only (OTP disabled, permanent hash set).
+    state.set_permanent_password_hash(Some(perm_hash));
+    assert_eq!(state.set_otp_enabled(false), None);
+
+    // 1a. Permanent-only offers ONLY PermanentPassword (not OneTimePassword, not None) and works repeatedly.
+    for _ in 0..2 {
+        let (hch, vch) = mem_pair(Some(viewer_id.public_key()));
+        let host = tokio::spawn(run_session(hch, cfg.clone(), test_backends(injected.clone())));
+        let (s, r) = vch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut w, mut r) = (EnvelopeWriter::new(s), EnvelopeReader::new(r));
+        w.send(&Msg::Hello(viewer_hello(&viewer_id)).into()).await.unwrap();
+        let Msg::AuthChallenge(ch) = recv_msg(&mut r).await else { panic!("expected AuthChallenge") };
+        assert_eq!(ch.methods, vec![AuthMethod::PermanentPassword as i32]);
+        let key = derive_password_key("PermSecret!99", &ch.salt, params).unwrap();
+        let proof = password_proof(&key, &ch.nonce);
+        w.send(&Msg::AuthResponse(AuthResponse { method: AuthMethod::PermanentPassword as i32, proof: proof.to_vec() }).into())
+            .await
+            .unwrap();
+        let Msg::AuthResult(res) = recv_msg(&mut r).await else { panic!("expected AuthResult") };
+        assert!(res.ok, "permanent password must succeed repeatedly");
+        let Msg::SessionConfig(_) = recv_msg(&mut r).await else { panic!("expected SessionConfig") };
+        w.send(&Msg::Close(Close::default()).into()).await.unwrap();
+        host.await.unwrap().unwrap();
+    }
+
+    // 1b. Permanent-only rejects an OneTimePassword attempt.
+    {
+        let (hch, vch) = mem_pair(Some(viewer_id.public_key()));
+        let host = tokio::spawn(run_session(hch, cfg.clone(), test_backends(injected.clone())));
+        let (s, r) = vch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut w, mut r) = (EnvelopeWriter::new(s), EnvelopeReader::new(r));
+        w.send(&Msg::Hello(viewer_hello(&viewer_id)).into()).await.unwrap();
+        let Msg::AuthChallenge(_) = recv_msg(&mut r).await else { panic!("expected AuthChallenge") };
+        w.send(&Msg::AuthResponse(AuthResponse { method: AuthMethod::OneTimePassword as i32, proof: vec![0u8; 32] }).into())
+            .await
+            .unwrap();
+        let Msg::AuthResult(res) = recv_msg(&mut r).await else { panic!("expected AuthResult") };
+        assert!(!res.ok);
+        assert!(host.await.unwrap().is_err());
+    }
+
+    // 2. Live switch to Both (OTP enabled + permanent hash set): both work, OTP rotates on use.
+    let otp = state.set_otp_enabled(true).expect("OTP enabled");
+    {
+        let (hch, vch) = mem_pair(Some(viewer_id.public_key()));
+        let host = tokio::spawn(run_session(hch, cfg.clone(), test_backends(injected.clone())));
+        let (s, r) = vch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut w, mut r) = (EnvelopeWriter::new(s), EnvelopeReader::new(r));
+        w.send(&Msg::Hello(viewer_hello(&viewer_id)).into()).await.unwrap();
+        let Msg::AuthChallenge(ch) = recv_msg(&mut r).await else { panic!("expected AuthChallenge") };
+        assert!(ch.methods.contains(&(AuthMethod::PermanentPassword as i32)));
+        assert!(ch.methods.contains(&(AuthMethod::OneTimePassword as i32)));
+        assert!(!ch.methods.contains(&(AuthMethod::None as i32)));
+        let key = derive_password_key(&otp, &ch.salt, params).unwrap();
+        let proof = password_proof(&key, &ch.nonce);
+        w.send(&Msg::AuthResponse(AuthResponse { method: AuthMethod::PermanentPassword as i32, proof: proof.to_vec() }).into())
+            .await
+            .unwrap();
+        let Msg::AuthResult(res) = recv_msg(&mut r).await else { panic!("expected AuthResult") };
+        assert!(res.ok, "OTP should succeed via single-prompt PermanentPassword path when Both enabled");
+        let Msg::SessionConfig(_) = recv_msg(&mut r).await else { panic!("expected SessionConfig") };
+        w.send(&Msg::Close(Close::default()).into()).await.unwrap();
+        host.await.unwrap().unwrap();
+    }
+    assert_ne!(state.current_otp().as_deref(), Some(otp.as_str()), "OTP must rotate on use in Both mode");
+
+    // 3. Security guard: clearing BOTH OTP and permanent password with allow_no_auth=false
+    //    must NEVER offer AuthMethod::None and must reject untrusted peers immediately.
+    state.set_permanent_password_hash(None);
+    state.set_otp_enabled(false);
+    {
+        let (hch, vch) = mem_pair(Some(viewer_id.public_key()));
+        let host = tokio::spawn(run_session(hch, cfg.clone(), test_backends(injected.clone())));
+        let (s, r) = vch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut w, mut r) = (EnvelopeWriter::new(s), EnvelopeReader::new(r));
+        w.send(&Msg::Hello(viewer_hello(&viewer_id)).into()).await.unwrap();
+        let Msg::AuthResult(res) = recv_msg(&mut r).await else { panic!("expected immediate AuthResult rejection") };
+        assert!(!res.ok);
+        assert!(host.await.unwrap().is_err());
+    }
+
+    // 4. Live trusted peer addition & immediate revocation via remove_trusted_peer.
+    state.add_trusted_peer(TrustedPeer::new(viewer_id.public_key(), "viewer-1"));
+    {
+        let (hch, vch) = mem_pair(Some(viewer_id.public_key()));
+        let host = tokio::spawn(run_session(hch, cfg.clone(), test_backends(injected.clone())));
+        let (s, r) = vch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut w, mut r) = (EnvelopeWriter::new(s), EnvelopeReader::new(r));
+        w.send(&Msg::Hello(viewer_hello(&viewer_id)).into()).await.unwrap();
+        let Msg::AuthChallenge(ch) = recv_msg(&mut r).await else { panic!("expected AuthChallenge") };
+        assert_eq!(ch.methods, vec![AuthMethod::PublicKey as i32]);
+        let host_pk: [u8; 32] = ch.host_public_key.as_slice().try_into().unwrap();
+        let sig = sign_pubkey_challenge(&viewer_id, &ch.nonce, &host_pk);
+        w.send(&Msg::AuthResponse(AuthResponse { method: AuthMethod::PublicKey as i32, proof: sig.to_vec() }).into())
+            .await
+            .unwrap();
+        let Msg::AuthResult(res) = recv_msg(&mut r).await else { panic!("expected AuthResult") };
+        assert!(res.ok);
+        let Msg::SessionConfig(_) = recv_msg(&mut r).await else { panic!("expected SessionConfig") };
+        w.send(&Msg::Close(Close::default()).into()).await.unwrap();
+        host.await.unwrap().unwrap();
+    }
+
+    assert!(state.remove_trusted_peer(&viewer_id.public_key()));
+    assert!(!state.remove_trusted_peer(&viewer_id.public_key()));
+    {
+        let (hch, vch) = mem_pair(Some(viewer_id.public_key()));
+        let host = tokio::spawn(run_session(hch, cfg, test_backends(injected)));
+        let (s, r) = vch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut w, mut r) = (EnvelopeWriter::new(s), EnvelopeReader::new(r));
+        w.send(&Msg::Hello(viewer_hello(&viewer_id)).into()).await.unwrap();
+        let Msg::AuthResult(res) = recv_msg(&mut r).await else { panic!("expected immediate AuthResult rejection after revocation") };
+        assert!(!res.ok);
+        assert!(host.await.unwrap().is_err());
+    }
+}

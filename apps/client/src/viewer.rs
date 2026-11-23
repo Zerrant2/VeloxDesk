@@ -116,6 +116,7 @@ mod net {
     pub fn connect(opts: ConnectOptions, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<SessionHandle> {
         let shared = Arc::new(SessionShared::default());
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let shared_bg = shared.clone();
         std::thread::Builder::new()
             .name("viewer-net".into())
@@ -131,6 +132,7 @@ mod net {
                         let _ = proxy.send_event(UserEvent::Session(SessionEvent::Closed(
                             tr(opts.lang()).fmt_err_async_runtime(&e.to_string()),
                         )));
+                        let _ = done_tx.send(());
                         return;
                     }
                 };
@@ -138,9 +140,10 @@ mod net {
                 if let Some(reason) = closed_reason {
                     let _ = proxy.send_event(UserEvent::Session(SessionEvent::Closed(reason)));
                 }
+                let _ = done_tx.send(());
             })
             .context("spawning viewer network thread")?;
-        Ok(SessionHandle { shared, cmd: cmd_tx })
+        Ok(SessionHandle { shared, cmd: cmd_tx, done: Some(done_rx) })
     }
 
     enum DecoderMsg {
@@ -743,6 +746,17 @@ mod net {
         let (mut ctrl_tx, mut ctrl_rx) = framed(send, recv);
         let hello = build_hello(&id, &opts);
         if let Err(e) = ctrl_tx.send(&Msg::Hello(hello).into()).await {
+            if let Ok(Ok(Envelope { msg: Some(Msg::Close(c)) })) =
+                timeout(Duration::from_millis(100), ctrl_rx.recv()).await
+            {
+                let reason = if c.reason.is_empty() {
+                    tr(opts.lang()).fmt_host_rejected_code(c.code)
+                } else {
+                    c.reason
+                };
+                ch.close(0, "host closed");
+                return Some(reason);
+            }
             ch.close(1, "send hello failed");
             return Some(tr(opts.lang()).fmt_err_send_hello(&e.to_string()));
         }
@@ -1125,6 +1139,8 @@ mod net {
         let _ = timeout(Duration::from_millis(200), input_writer).await;
         let _ = timeout(Duration::from_millis(200), gp_writer).await;
         ch.close(0, "session ended");
+        // Briefly yield so quinn flushes the CONNECTION_CLOSE UDP packet before runtime teardown.
+        tokio::time::sleep(Duration::from_millis(15)).await;
         decoder.stop();
         close_reason
     }

@@ -126,6 +126,8 @@ impl ConnectOptions {
 pub struct SessionHandle {
     pub shared: Arc<SessionShared>,
     pub cmd: tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
+    pub done: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl SessionHandle {
@@ -137,5 +139,8 @@ impl SessionHandle {
 impl Drop for SessionHandle {
     fn drop(&mut self) {
         let _ = self.cmd.send(SessionCommand::Disconnect);
+        if let Some(rx) = self.done.take() {
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(150));
+        }
     }
 }

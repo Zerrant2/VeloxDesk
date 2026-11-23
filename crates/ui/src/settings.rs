@@ -200,6 +200,70 @@ impl FpsCap {
     }
 }
 
+/// How incoming connections to this desk authenticate with passwords.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PasswordMode {
+    /// Only the rotating one-time password (OTP) is accepted.
+    #[default]
+    OneTime,
+    /// Only the configured permanent password is accepted (falls back to OTP if none is set).
+    Permanent,
+    /// Both the permanent password and the rotating OTP are accepted.
+    Both,
+}
+
+impl PasswordMode {
+    pub const ALL: [PasswordMode; 3] = [PasswordMode::OneTime, PasswordMode::Permanent, PasswordMode::Both];
+
+    pub fn label_for(self, lang: Language) -> &'static str {
+        let t = crate::i18n::tr(lang);
+        match self {
+            PasswordMode::OneTime => t.pw_mode_onetime,
+            PasswordMode::Permanent => t.pw_mode_permanent,
+            PasswordMode::Both => t.pw_mode_both,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.label_for(Language::En)
+    }
+}
+
+/// Persisted trusted viewer identity remembered from an interactive Accept dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedTrustedPeer {
+    pub public_key_hex: String,
+    pub device_id: String,
+    pub name: String,
+    pub fingerprint: String,
+    pub allow_input: bool,
+    pub allow_clipboard: bool,
+    pub allow_file_transfer: bool,
+    pub allow_audio: bool,
+    pub allow_terminal: bool,
+    pub allow_tunnel: bool,
+    pub allow_privacy_mode: bool,
+}
+
+impl Default for SavedTrustedPeer {
+    fn default() -> Self {
+        Self {
+            public_key_hex: String::new(),
+            device_id: String::new(),
+            name: String::new(),
+            fingerprint: String::new(),
+            allow_input: true,
+            allow_clipboard: true,
+            allow_file_transfer: true,
+            allow_audio: true,
+            allow_terminal: true,
+            allow_tunnel: true,
+            allow_privacy_mode: false,
+        }
+    }
+}
+
 /// Max entries kept in the recent-connections list.
 pub const MAX_RECENT: usize = 10;
 
@@ -263,6 +327,12 @@ pub struct Settings {
     pub gaming: StreamSettings,
     /// Require interactive Accept/Reject approval dialog for incoming connections to this desk.
     pub require_accept: bool,
+    /// Host password authentication mode (OTP only, Permanent only, or Both).
+    pub password_mode: PasswordMode,
+    /// Argon2id PHC hash (`$argon2id$...`) of the permanent host password (never plaintext).
+    pub permanent_password_hash: Option<String>,
+    /// Persisted trusted viewer devices allowed passwordless Ed25519 reconnect.
+    pub trusted_peers: Vec<SavedTrustedPeer>,
 }
 
 impl Default for Settings {
@@ -275,6 +345,9 @@ impl Default for Settings {
             desktop: StreamSettings::default_for(Mode::Desktop),
             gaming: StreamSettings::default_for(Mode::Gaming),
             require_accept: true,
+            password_mode: PasswordMode::default(),
+            permanent_password_hash: None,
+            trusted_peers: Vec::new(),
         }
     }
 }
@@ -347,6 +420,9 @@ struct RawSettings {
     desktop: Option<RawStreamSettings>,
     gaming: Option<RawStreamSettings>,
     require_accept: Option<bool>,
+    password_mode: Option<PasswordMode>,
+    permanent_password_hash: Option<String>,
+    trusted_peers: Option<Vec<SavedTrustedPeer>>,
     #[serde(flatten)]
     legacy: RawStreamSettings,
 }
@@ -385,11 +461,45 @@ impl<'de> Deserialize<'de> for Settings {
             desktop,
             gaming,
             require_accept: raw.require_accept.unwrap_or(true),
+            password_mode: raw.password_mode.unwrap_or_default(),
+            permanent_password_hash: raw.permanent_password_hash.filter(|s| !s.trim().is_empty()),
+            trusted_peers: raw.trusted_peers.unwrap_or_default(),
         })
     }
 }
 
 impl Settings {
+    /// Whether a permanent host password hash is currently configured.
+    pub fn has_permanent_password(&self) -> bool {
+        self.permanent_password_hash.as_deref().is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Whether the embedded host should keep a rotating OTP enabled (safety invariant:
+    /// never leaves the host with neither OTP nor a permanent password).
+    pub fn effective_otp_enabled(&self) -> bool {
+        self.password_mode != PasswordMode::Permanent || !self.has_permanent_password()
+    }
+
+    /// Insert or update a remembered trusted peer matched by `public_key_hex`.
+    pub fn upsert_trusted_peer(&mut self, peer: SavedTrustedPeer) {
+        if let Some(existing) = self
+            .trusted_peers
+            .iter_mut()
+            .find(|p| p.public_key_hex.eq_ignore_ascii_case(&peer.public_key_hex))
+        {
+            *existing = peer;
+        } else {
+            self.trusted_peers.push(peer);
+        }
+    }
+
+    /// Remove a remembered trusted peer by `public_key_hex`. Returns `true` if removed.
+    pub fn remove_trusted_peer(&mut self, public_key_hex: &str) -> bool {
+        let before = self.trusted_peers.len();
+        self.trusted_peers
+            .retain(|p| !p.public_key_hex.eq_ignore_ascii_case(public_key_hex));
+        self.trusted_peers.len() < before
+    }
     pub fn profile(&self, mode: Mode) -> &StreamSettings {
         match mode {
             Mode::Desktop => &self.desktop,
@@ -622,5 +732,68 @@ mod tests {
         assert!(path.is_file());
         assert_eq!(Settings::load(&path).unwrap(), s);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn password_mode_and_trusted_peers_roundtrip_and_v020_compat() {
+        // Legacy v0.2.0 JSON without password_mode / permanent_password_hash / trusted_peers
+        let v020: Settings = serde_json::from_str(
+            r#"{"language":"Ru","mode":"Desktop","require_accept":true,"desktop":{"quality":"High"}}"#,
+        )
+        .unwrap();
+        assert_eq!(v020.password_mode, PasswordMode::OneTime);
+        assert!(v020.permanent_password_hash.is_none());
+        assert!(v020.trusted_peers.is_empty());
+        assert!(v020.effective_otp_enabled());
+
+        // Full v0.3.0 roundtrip
+        let mut s = Settings {
+            password_mode: PasswordMode::Permanent,
+            permanent_password_hash: Some("$argon2id$v=19$m=65536,t=3,p=1$salt$hash".into()),
+            require_accept: false,
+            ..Default::default()
+        };
+        assert!(s.has_permanent_password());
+        assert!(!s.effective_otp_enabled());
+
+        let peer = SavedTrustedPeer {
+            public_key_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            device_id: "987654321".into(),
+            name: "Work-Laptop".into(),
+            fingerprint: "abcdef0123456789abcdef0123456789".into(),
+            allow_input: true,
+            allow_clipboard: true,
+            allow_file_transfer: false,
+            allow_audio: true,
+            allow_terminal: false,
+            allow_tunnel: false,
+            allow_privacy_mode: true,
+        };
+        s.upsert_trusted_peer(peer.clone());
+        assert_eq!(s.trusted_peers.len(), 1);
+
+        // Case-insensitive upsert updates in place
+        let mut updated = peer.clone();
+        updated.public_key_hex = updated.public_key_hex.to_uppercase();
+        updated.name = "Renamed-Laptop".into();
+        s.upsert_trusted_peer(updated);
+        assert_eq!(s.trusted_peers.len(), 1);
+        assert_eq!(s.trusted_peers[0].name, "Renamed-Laptop");
+
+        let dir = std::env::temp_dir().join(format!("veloxdesk-ui-v030-{}", std::process::id()));
+        let path = dir.join("v030.json");
+        s.save(&path).unwrap();
+        let reloaded = Settings::load(&path).unwrap();
+        assert_eq!(reloaded, s);
+        let _ = std::fs::remove_dir_all(dir);
+
+        // Remove trusted peer (case-insensitive)
+        assert!(s.remove_trusted_peer(&peer.public_key_hex));
+        assert!(s.trusted_peers.is_empty());
+        assert!(!s.remove_trusted_peer(&peer.public_key_hex));
+
+        // Permanent mode with no hash falls back to OTP enabled
+        s.permanent_password_hash = None;
+        assert!(s.effective_otp_enabled());
     }
 }

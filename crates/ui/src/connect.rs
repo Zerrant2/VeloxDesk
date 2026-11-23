@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use veloxdesk_protocol::{DEFAULT_DIRECT_PORT, DEFAULT_RENDEZVOUS_PORT};
 
 use crate::i18n::tr;
-use crate::settings::{Language, Mode, Settings};
+use crate::settings::{Language, Mode, PasswordMode, Settings};
 
 /// Parse a 9-digit VeloxDesk Device ID (ignores spaces and dashes, e.g. `"123 456 789"`).
 pub fn parse_device_id(input: &str) -> Option<String> {
@@ -438,37 +438,55 @@ impl ConnectScreen {
 
             ui.add_space(10.0);
 
-            // One-Time Password block
-            ui.label(egui::RichText::new(t.otp_label).small().weak());
-            let otp_display = if self.host_otp.is_empty() {
-                "—".to_string()
-            } else if self.show_otp {
-                self.host_otp.clone()
+            // Password / OTP block (reflects PasswordMode: OneTime, Permanent, Both)
+            let perm_only_active =
+                settings.password_mode == PasswordMode::Permanent && settings.has_permanent_password();
+            if perm_only_active {
+                ui.label(egui::RichText::new(t.settings_permanent_password).small().weak());
+                ui.colored_label(
+                    egui::Color32::from_rgb(130, 225, 160),
+                    egui::RichText::new(t.connect_permanent_active).strong(),
+                );
             } else {
-                "•".repeat(self.host_otp.len().max(8))
-            };
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(&otp_display).monospace().size(18.0));
-                let has_otp = !self.host_otp.is_empty();
-                if ui
-                    .add_enabled(has_otp, egui::Button::new(if self.show_otp { t.hide_btn } else { t.show_btn }))
-                    .clicked()
-                {
-                    self.show_otp = !self.show_otp;
-                }
-                if ui.add_enabled(has_otp, egui::Button::new(t.copy_btn)).clicked() {
-                    self.copied_notice = Some(t.otp_copied.into());
-                    *action = Some(ConnectAction::CopyText(self.host_otp.clone()));
-                }
-                if ui
-                    .add_enabled(self.host_running, egui::Button::new(t.refresh_btn))
-                    .on_hover_text(t.otp_refresh_tooltip)
-                    .clicked()
-                {
-                    self.copied_notice = None;
-                    *action = Some(ConnectAction::RotateOtp);
-                }
-            });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t.otp_label).small().weak());
+                    if settings.password_mode == PasswordMode::Both && settings.has_permanent_password() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(130, 210, 255),
+                            egui::RichText::new(t.connect_plus_permanent_badge).small().strong(),
+                        );
+                    }
+                });
+                let otp_display = if self.host_otp.is_empty() {
+                    "—".to_string()
+                } else if self.show_otp {
+                    self.host_otp.clone()
+                } else {
+                    "•".repeat(self.host_otp.len().max(8))
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(&otp_display).monospace().size(18.0));
+                    let has_otp = !self.host_otp.is_empty();
+                    if ui
+                        .add_enabled(has_otp, egui::Button::new(if self.show_otp { t.hide_btn } else { t.show_btn }))
+                        .clicked()
+                    {
+                        self.show_otp = !self.show_otp;
+                    }
+                    if ui.add_enabled(has_otp, egui::Button::new(t.copy_btn)).clicked() {
+                        self.copied_notice = Some(t.otp_copied.into());
+                        *action = Some(ConnectAction::CopyText(self.host_otp.clone()));
+                    }
+                    if ui
+                        .add_enabled(self.host_running, egui::Button::new(t.refresh_btn))
+                        .on_hover_text(t.otp_refresh_tooltip)
+                        .clicked()
+                    {
+                        self.copied_notice = None;
+                        *action = Some(ConnectAction::RotateOtp);
+                    }
+                });
+            }
 
             if let Some(note) = &self.copied_notice {
                 ui.colored_label(egui::Color32::from_rgb(130, 225, 160), note);
@@ -1409,6 +1427,43 @@ mod tests {
             });
             out3.textures_delta.clear();
             assert!(out3.shapes.iter().any(|c| find_text_rect(&c.shape, tr(lang).update_retry_btn).is_some()));
+        }
+    }
+
+    #[test]
+    fn connect_screen_reflects_all_password_modes_en_and_ru() {
+        let ctx = egui::Context::default();
+        let make_input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            ..Default::default()
+        };
+
+        for lang in Language::ALL {
+            let t = tr(lang);
+            let mut settings = Settings {
+                language: lang,
+                password_mode: PasswordMode::Permanent,
+                permanent_password_hash: Some("$argon2id$v=19$m=65536,t=3,p=1$salt$hash".into()),
+                ..Default::default()
+            };
+            let mut screen = ConnectScreen::new(&settings);
+            screen.host_running = true;
+            screen.host_otp = "AB12CD34".into();
+
+            // Permanent-only with hash set: shows "Permanent password active" and hides OTP Refresh.
+            let mut out_perm = ctx.run_ui(make_input(), |ui| {
+                let _ = screen.show(ui, &mut settings, false);
+            });
+            out_perm.textures_delta.clear();
+            assert!(out_perm.shapes.iter().any(|c| find_text_rect(&c.shape, t.connect_permanent_active).is_some()));
+
+            // Both with hash set: shows OTP + "+ Permanent" badge.
+            settings.password_mode = PasswordMode::Both;
+            let mut out_both = ctx.run_ui(make_input(), |ui| {
+                let _ = screen.show(ui, &mut settings, false);
+            });
+            out_both.textures_delta.clear();
+            assert!(out_both.shapes.iter().any(|c| find_text_rect(&c.shape, t.connect_plus_permanent_badge).is_some()));
         }
     }
 }

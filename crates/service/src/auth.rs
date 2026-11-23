@@ -216,6 +216,7 @@ impl HostAuthConfig {
 }
 
 type OtpRotatedCallback = Arc<dyn Fn(String) + Send + Sync>;
+pub(crate) type TrustedPeerCallback = Arc<dyn Fn(TrustedPeer) + Send + Sync>;
 
 struct AuthInner {
     current_otp: Option<String>,
@@ -223,6 +224,7 @@ struct AuthInner {
     permanent_password_hash: Option<PasswordHash>,
     require_accept_override: Option<bool>,
     on_otp_rotated: Option<OtpRotatedCallback>,
+    on_trusted_peer_added: Option<TrustedPeerCallback>,
 }
 
 /// Shared mutable authentication state across sessions on a host (rotating OTP and runtime
@@ -244,6 +246,7 @@ impl HostAuthState {
                 permanent_password_hash: cfg.permanent_password_hash.clone(),
                 require_accept_override: None,
                 on_otp_rotated: None,
+                on_trusted_peer_added: None,
             }),
         })
     }
@@ -274,6 +277,44 @@ impl HostAuthState {
     /// Install an optional callback invoked whenever the OTP rotates (manually or after login).
     pub(crate) fn set_on_otp_rotated(&self, cb: Option<OtpRotatedCallback>) {
         self.lock().on_otp_rotated = cb;
+    }
+
+    /// Install an optional callback invoked whenever a trusted peer is added or updated.
+    pub(crate) fn set_on_trusted_peer_added(&self, cb: Option<TrustedPeerCallback>) {
+        self.lock().on_trusted_peer_added = cb;
+    }
+
+    /// Set or clear the permanent Argon2id password hash live (takes effect on the next connection).
+    pub fn set_permanent_password_hash(&self, hash: Option<PasswordHash>) {
+        self.lock().permanent_password_hash = hash;
+    }
+
+    /// Enable or disable one-time password authentication live.
+    ///
+    /// - When `enabled == true`: if no OTP is currently active, generates a fresh OTP, stores it,
+    ///   fires the OTP-rotation callback, and returns `Some(otp)`. If an OTP is already active,
+    ///   returns `Some(existing)` without rotating.
+    /// - When `enabled == false`: clears the active OTP (`None`) and returns `None`.
+    pub fn set_otp_enabled(&self, enabled: bool) -> Option<String> {
+        let (result, notify) = {
+            let mut g = self.lock();
+            if enabled {
+                if let Some(existing) = &g.current_otp {
+                    (Some(existing.clone()), None)
+                } else {
+                    let next = fresh_otp(None);
+                    g.current_otp = Some(next.clone());
+                    (Some(next.clone()), g.on_otp_rotated.clone().map(|cb| (cb, next)))
+                }
+            } else {
+                g.current_otp = None;
+                (None, None)
+            }
+        };
+        if let Some((cb, otp)) = notify {
+            cb(otp);
+        }
+        result
     }
 
     /// Currently active one-time password, if OTP login is enabled.
@@ -323,12 +364,26 @@ impl HostAuthState {
     }
 
     pub fn add_trusted_peer(&self, peer: TrustedPeer) {
-        let mut g = self.lock();
-        if let Some(existing) = g.trusted_peers.iter_mut().find(|p| p.public_key == peer.public_key) {
-            *existing = peer;
-        } else {
-            g.trusted_peers.push(peer);
+        let cb = {
+            let mut g = self.lock();
+            if let Some(existing) = g.trusted_peers.iter_mut().find(|p| p.public_key == peer.public_key) {
+                *existing = peer.clone();
+            } else {
+                g.trusted_peers.push(peer.clone());
+            }
+            g.on_trusted_peer_added.clone()
+        };
+        if let Some(cb) = cb {
+            cb(peer);
         }
+    }
+
+    /// Remove a trusted peer by its Ed25519 public key. Returns `true` if a matching peer was removed.
+    pub fn remove_trusted_peer(&self, pk: &[u8; 32]) -> bool {
+        let mut g = self.lock();
+        let before = g.trusted_peers.len();
+        g.trusted_peers.retain(|p| &p.public_key != pk);
+        g.trusted_peers.len() != before
     }
 
     pub fn trusted_peers(&self) -> Vec<TrustedPeer> {
@@ -454,8 +509,8 @@ pub(crate) async fn authenticate(
         methods.push(AuthMethod::OneTimePassword as i32);
     }
     let require_accept = state.effective_require_accept(cfg.auth.require_accept);
-    let allow_method_none =
-        cfg.auth.allow_no_auth || (require_accept && perm_hash.is_none() && active_otp.is_none());
+    let allow_method_none = cfg.auth.allow_no_auth
+        || (require_accept && cfg.auth.approval_handler.is_some() && perm_hash.is_none() && active_otp.is_none());
     if allow_method_none {
         methods.push(AuthMethod::None as i32);
     }
@@ -708,5 +763,54 @@ mod tests {
         assert_eq!(hex.len(), 64);
         assert_eq!(parse_hex_pubkey(&hex).unwrap(), pk);
         assert!(parse_hex_pubkey("deadbeef").is_err());
+    }
+
+    #[test]
+    fn live_mutations_otp_permanent_password_and_trusted_peers() {
+        let cfg = HostAuthConfig::with_otp("INIT1234");
+        let st = HostAuthState::from_config(&cfg);
+
+        let rotated: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let rotated_c = rotated.clone();
+        st.set_on_otp_rotated(Some(Arc::new(move |otp| rotated_c.lock().unwrap().push(otp))));
+
+        let added_peers: Arc<Mutex<Vec<TrustedPeer>>> = Arc::new(Mutex::new(Vec::new()));
+        let added_c = added_peers.clone();
+        st.set_on_trusted_peer_added(Some(Arc::new(move |p| added_c.lock().unwrap().push(p))));
+
+        // set_otp_enabled(true) when already Some returns existing without rotating or firing callback.
+        assert_eq!(st.set_otp_enabled(true).as_deref(), Some("INIT1234"));
+        assert!(rotated.lock().unwrap().is_empty());
+
+        // set_otp_enabled(false) clears OTP.
+        assert_eq!(st.set_otp_enabled(false), None);
+        assert_eq!(st.current_otp(), None);
+
+        // set_otp_enabled(true) when None generates a fresh OTP and fires callback.
+        let fresh = st.set_otp_enabled(true).expect("fresh OTP generated");
+        assert_eq!(fresh.len(), DEFAULT_OTP_LEN);
+        assert_eq!(st.current_otp().as_deref(), Some(fresh.as_str()));
+        assert_eq!(rotated.lock().unwrap().as_slice(), &[fresh]);
+
+        // set_permanent_password_hash(Some/None) updates live.
+        let ph = PasswordHash::hash_with(
+            "perm-secret",
+            Argon2Params { m_cost_kib: 1024, t_cost: 1, p_cost: 1 },
+        )
+        .unwrap();
+        st.set_permanent_password_hash(Some(ph.clone()));
+        assert_eq!(st.permanent_password_hash(), Some(ph));
+        st.set_permanent_password_hash(None);
+        assert_eq!(st.permanent_password_hash(), None);
+
+        // add_trusted_peer fires callback; remove_trusted_peer removes and returns bool.
+        let pk = [0x55u8; 32];
+        let peer = TrustedPeer::new(pk, "work-laptop");
+        st.add_trusted_peer(peer.clone());
+        assert_eq!(added_peers.lock().unwrap().as_slice(), &[peer]);
+        assert!(st.find_trusted(&pk).is_some());
+        assert!(st.remove_trusted_peer(&pk));
+        assert!(st.find_trusted(&pk).is_none());
+        assert!(!st.remove_trusted_peer(&pk));
     }
 }

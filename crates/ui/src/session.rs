@@ -4,11 +4,12 @@ use std::path::Path;
 
 use veloxdesk_protocol::control::DisplayInfo;
 
-use crate::connect::UpdateUiState;
+use crate::auth::format_fingerprint;
+use crate::connect::{UpdateUiState, format_device_id};
 use crate::i18n::tr;
-use crate::settings::{FpsCap, Language, Mode, Present, Quality, Scale, Settings};
+use crate::settings::{FpsCap, Language, Mode, PasswordMode, Present, Quality, Scale, Settings};
 
-/// What the toolbar asks the session to do.
+/// What the toolbar / settings window asks the application to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolbarAction {
     SetLanguage(Language),
@@ -32,6 +33,11 @@ pub enum ToolbarAction {
     OpenSettings,
     CheckForUpdates,
     StartUpdate,
+    SetPasswordMode(PasswordMode),
+    SetPermanentPassword(String),
+    ClearPermanentPassword,
+    SetRequireAccept(bool),
+    RemoveTrustedPeer(String),
     Disconnect,
 }
 
@@ -302,15 +308,36 @@ pub fn settings_window_full(
     build_display: Option<&str>,
     update_state: Option<&UpdateUiState>,
 ) -> Vec<ToolbarAction> {
+    settings_window_with_security(ctx, open, settings, settings_path, build_display, update_state, None)
+}
+
+/// Full Settings window including optional live permanent-password status notice (`"Hashing password…"` / `"Saved"`).
+pub fn settings_window_with_security(
+    ctx: &egui::Context,
+    open: &mut bool,
+    settings: &mut Settings,
+    settings_path: Option<&Path>,
+    build_display: Option<&str>,
+    update_state: Option<&UpdateUiState>,
+    pw_status: Option<&str>,
+) -> Vec<ToolbarAction> {
     let tab_id = egui::Id::unique("veloxdesk-settings-profile-tab");
+    let pw_buf_id = egui::Id::unique("veloxdesk-settings-perm-pw-buf");
+    let pw_err_id = egui::Id::unique("veloxdesk-settings-perm-pw-err");
     if !*open {
-        ctx.data_mut(|d| d.remove::<Mode>(tab_id));
+        ctx.data_mut(|d| {
+            d.remove::<Mode>(tab_id);
+            d.remove::<String>(pw_buf_id);
+            d.remove::<bool>(pw_err_id);
+        });
         return Vec::new();
     }
 
     let mut out = Vec::new();
     let before = settings.clone();
     let mut editing_mode: Mode = ctx.data_mut(|d| d.get_temp(tab_id).unwrap_or(settings.mode));
+    let mut pw_buf: String = ctx.data_mut(|d| d.get_temp(pw_buf_id).unwrap_or_default());
+    let mut pw_too_short: bool = ctx.data_mut(|d| d.get_temp(pw_err_id).unwrap_or(false));
     let lang = settings.language;
     let t = tr(lang);
 
@@ -320,10 +347,14 @@ pub fn settings_window_full(
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
-            egui::Grid::new("veloxdesk-settings")
-                .num_columns(2)
-                .spacing([16.0, 8.0])
+            egui::ScrollArea::vertical()
+                .id_salt("veloxdesk-settings-scroll")
+                .max_height(600.0)
                 .show(ui, |ui| {
+                    egui::Grid::new("veloxdesk-settings")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
                     ui.label(t.settings_language_label).on_hover_text(t.tip_language);
                     ui.horizontal(|ui| {
                         for l in Language::ALL {
@@ -514,17 +545,160 @@ pub fn settings_window_full(
                     });
                     ui.end_row();
                 });
+
+                    // v0.3.0 Host Access & Security section
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new(t.settings_security_heading).strong());
+                    ui.add_space(4.0);
+
+                    egui::Grid::new("veloxdesk-settings-security")
+                        .num_columns(2)
+                        .spacing([16.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(t.settings_password_mode).on_hover_text(t.tip_password_mode);
+                            egui::ComboBox::from_id_salt("set-password-mode")
+                                .selected_text(settings.password_mode.label_for(lang))
+                                .show_ui(ui, |ui| {
+                                    for pm in PasswordMode::ALL {
+                                        ui.selectable_value(&mut settings.password_mode, pm, pm.label_for(lang));
+                                    }
+                                })
+                                .response
+                                .on_hover_text(t.tip_password_mode);
+                            ui.end_row();
+
+                            if settings.password_mode == PasswordMode::Permanent && !settings.has_permanent_password() {
+                                ui.label("");
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(245, 200, 110),
+                                    egui::RichText::new(t.pw_mode_permanent_fallback_hint).small(),
+                                );
+                                ui.end_row();
+                            }
+
+                            ui.label(t.settings_permanent_password)
+                                .on_hover_text(t.tip_permanent_password);
+                            ui.vertical(|ui| {
+                                let has_perm = settings.has_permanent_password();
+                                ui.horizontal(|ui| {
+                                    let (color, badge) = if has_perm {
+                                        (egui::Color32::from_rgb(130, 225, 160), t.pw_status_set)
+                                    } else {
+                                        (egui::Color32::from_rgb(160, 160, 170), t.pw_status_not_set)
+                                    };
+                                    ui.colored_label(color, egui::RichText::new(badge).strong())
+                                        .on_hover_text(t.tip_permanent_password);
+                                    if let Some(status) = pw_status
+                                        && !status.is_empty()
+                                    {
+                                        ui.weak(status);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    let resp = ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut pw_buf)
+                                                .password(true)
+                                                .hint_text(t.pw_new_placeholder)
+                                                .desired_width(180.0),
+                                        )
+                                        .on_hover_text(t.tip_permanent_password);
+                                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    if ui.button(t.pw_save_btn).on_hover_text(t.tip_pw_save).clicked() || enter {
+                                        if pw_buf.chars().count() < 6 {
+                                            pw_too_short = true;
+                                        } else {
+                                            pw_too_short = false;
+                                            let submitted = std::mem::take(&mut pw_buf);
+                                            out.push(ToolbarAction::SetPermanentPassword(submitted));
+                                        }
+                                    }
+                                    if has_perm
+                                        && ui.button(t.pw_clear_btn).on_hover_text(t.tip_pw_clear).clicked()
+                                    {
+                                        pw_too_short = false;
+                                        pw_buf.clear();
+                                        out.push(ToolbarAction::ClearPermanentPassword);
+                                    }
+                                });
+                                if pw_too_short {
+                                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), t.pw_too_short_err);
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(t.settings_require_accept)
+                                .on_hover_text(t.tip_settings_require_accept);
+                            ui.checkbox(&mut settings.require_accept, t.require_accept_label)
+                                .on_hover_text(t.tip_settings_require_accept);
+                            ui.end_row();
+
+                            ui.label(t.settings_trusted_devices).on_hover_text(t.tip_trusted_devices);
+                            ui.vertical(|ui| {
+                                if settings.trusted_peers.is_empty() {
+                                    ui.weak(t.trusted_devices_empty).on_hover_text(t.tip_trusted_devices);
+                                } else {
+                                    let mut revoke_key: Option<String> = None;
+                                    for peer in &settings.trusted_peers {
+                                        ui.horizontal(|ui| {
+                                            let name = if peer.name.trim().is_empty() {
+                                                t.unknown_device
+                                            } else {
+                                                peer.name.as_str()
+                                            };
+                                            ui.label(egui::RichText::new(name).strong());
+                                            if !peer.device_id.is_empty() {
+                                                ui.weak(format_device_id(&peer.device_id));
+                                            }
+                                            if !peer.fingerprint.is_empty() {
+                                                ui.weak(format_fingerprint(&peer.fingerprint));
+                                            }
+                                            if crate::icons::icon_small_button(
+                                                ui,
+                                                egui::vec2(22.0, 20.0),
+                                                crate::icons::delete_atom(12.0),
+                                            )
+                                            .on_hover_text(t.trusted_remove_tooltip)
+                                            .clicked()
+                                            {
+                                                revoke_key = Some(peer.public_key_hex.clone());
+                                            }
+                                        });
+                                    }
+                                    if let Some(key) = revoke_key {
+                                        out.push(ToolbarAction::RemoveTrustedPeer(key));
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        });
+                });
         });
 
     if *open {
-        ctx.data_mut(|d| d.insert_temp(tab_id, editing_mode));
+        ctx.data_mut(|d| {
+            d.insert_temp(tab_id, editing_mode);
+            d.insert_temp(pw_buf_id, pw_buf);
+            d.insert_temp(pw_err_id, pw_too_short);
+        });
     } else {
-        ctx.data_mut(|d| d.remove::<Mode>(tab_id));
+        ctx.data_mut(|d| {
+            d.remove::<Mode>(tab_id);
+            d.remove::<String>(pw_buf_id);
+            d.remove::<bool>(pw_err_id);
+        });
     }
 
     if *settings != before {
         if settings.language != before.language {
             out.push(ToolbarAction::SetLanguage(settings.language));
+        }
+        if settings.password_mode != before.password_mode {
+            out.push(ToolbarAction::SetPasswordMode(settings.password_mode));
+        }
+        if settings.require_accept != before.require_accept {
+            out.push(ToolbarAction::SetRequireAccept(settings.require_accept));
         }
         if settings.mode != before.mode {
             out.push(ToolbarAction::SetMode(settings.mode));
@@ -858,6 +1032,14 @@ mod tests {
             ("tip_gaming_mouse", en.tip_gaming_mouse, ru.tip_gaming_mouse),
             ("tip_clipboard", en.tip_clipboard, ru.tip_clipboard),
             ("tip_rendezvous_server", en.tip_rendezvous_server, ru.tip_rendezvous_server),
+            ("tip_version", en.tip_version, ru.tip_version),
+            ("tip_updates", en.tip_updates, ru.tip_updates),
+            ("tip_password_mode", en.tip_password_mode, ru.tip_password_mode),
+            ("tip_permanent_password", en.tip_permanent_password, ru.tip_permanent_password),
+            ("tip_pw_save", en.tip_pw_save, ru.tip_pw_save),
+            ("tip_pw_clear", en.tip_pw_clear, ru.tip_pw_clear),
+            ("tip_settings_require_accept", en.tip_settings_require_accept, ru.tip_settings_require_accept),
+            ("tip_trusted_devices", en.tip_trusted_devices, ru.tip_trusted_devices),
         ];
         for (name, e, r) in pairs {
             assert!(!e.trim().is_empty(), "{name} EN empty");

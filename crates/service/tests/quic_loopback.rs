@@ -740,3 +740,120 @@ async fn host_m4_terminal_privacy_guard_and_file_transfer_over_quic() {
     tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_peer_reconnect_supersedes_stale_session_while_other_peer_gets_busy() {
+    let host_id = DeviceIdentity::generate();
+    let peer_a = DeviceIdentity::generate();
+    let peer_b = DeviceIdentity::generate();
+
+    let listener = listen("127.0.0.1:0".parse().unwrap(), &host_id).await.expect("listen");
+    let addr = listener.local_addr();
+    let inj_log = Arc::new(Mutex::new(InjLog::default()));
+    let backends = HostBackends {
+        capture: Arc::new(|_| Ok(Box::new(StaticCapture { sent: false }) as Box<dyn FrameCapture>)),
+        encoder: Arc::new(|c, _| Ok(Box::new(FakeEncoder { cfg: c.clone(), next_id: 0 }) as Box<dyn VideoEncoder>)),
+        injector: Arc::new({
+            let log = inj_log.clone();
+            move || Ok(Box::new(RecInjector(log.clone())) as Box<dyn InputInjector>)
+        }),
+        video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
+        rate: Arc::new(|s, mn, mx| Box::new(TransportAbr(AbrController::new(s, mn, mx)))),
+        audio_capture: None,
+        audio_encoder: None,
+        audio_playback: None,
+        clipboard: None,
+        privacy: None,
+        file_transfer: None,
+        tunnel_policy: None,
+    };
+    let cfg = HostConfig {
+        bind: addr,
+        max_sessions: 1,
+        ipc_port: None,
+        ..Default::default()
+    };
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let host_task = tokio::spawn(serve_until(listener, cfg, backends, async {
+        let _ = stop_rx.await;
+    }));
+
+    // 1. Peer A connects and completes handshake.
+    let ch_a1 = connect(addr, &peer_a, Some(host_id.public_key())).await.expect("connect A1");
+    let (s_a1, r_a1) = ch_a1.open_bi(StreamKind::Control).await.expect("open control A1");
+    let (mut w_a1, mut r_a1) = framed(s_a1, r_a1);
+    w_a1.send(
+        &Msg::Hello(Hello {
+            device_id: peer_a.device_id(),
+            public_key: peer_a.public_key().to_vec(),
+            protocol_version: 1,
+            ..Default::default()
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+    let Msg::AuthResult(a1) = recv_until(&mut r_a1, |m| matches!(m, Msg::AuthResult(_))).await else { unreachable!() };
+    assert!(a1.ok);
+    let Msg::SessionConfig(_) = recv_until(&mut r_a1, |m| matches!(m, Msg::SessionConfig(_))).await else {
+        unreachable!()
+    };
+
+    // 2. Peer B (different identity) attempts to connect while Peer A is active -> rejected with CLOSE_BUSY.
+    let ch_b = connect(addr, &peer_b, Some(host_id.public_key())).await.expect("connect B");
+    let (s_b, r_b) = ch_b.open_bi(StreamKind::Control).await.expect("open control B");
+    let (mut w_b, mut r_b) = framed(s_b, r_b);
+    let _ = w_b
+        .send(
+            &Msg::Hello(Hello {
+                device_id: peer_b.device_id(),
+                public_key: peer_b.public_key().to_vec(),
+                protocol_version: 1,
+                ..Default::default()
+            })
+            .into(),
+        )
+        .await;
+    let Msg::Close(cb) = recv_until(&mut r_b, |m| matches!(m, Msg::Close(_))).await else { unreachable!() };
+    assert_eq!(cb.code, CLOSE_BUSY);
+    assert!(cb.reason.contains("busy"), "expected busy reason, got {:?}", cb.reason);
+
+    // 3. Peer A reconnects on a brand-new QUIC connection WITHOUT closing ch_a1 (simulating force-close/restart).
+    //    Host must supersede A1 and accept A2 on the 1st attempt!
+    let ch_a2 = connect(addr, &peer_a, Some(host_id.public_key())).await.expect("connect A2");
+    let (s_a2, r_a2) = ch_a2.open_bi(StreamKind::Control).await.expect("open control A2");
+    let (mut w_a2, mut r_a2) = framed(s_a2, r_a2);
+    w_a2.send(
+        &Msg::Hello(Hello {
+            device_id: peer_a.device_id(),
+            public_key: peer_a.public_key().to_vec(),
+            protocol_version: 1,
+            ..Default::default()
+        })
+        .into(),
+    )
+    .await
+    .unwrap();
+    let Msg::AuthResult(a2) = recv_until(&mut r_a2, |m| matches!(m, Msg::AuthResult(_))).await else { unreachable!() };
+    assert!(a2.ok, "same-peer reconnect must succeed on 1st attempt");
+    let Msg::SessionConfig(_) = recv_until(&mut r_a2, |m| matches!(m, Msg::SessionConfig(_))).await else {
+        unreachable!()
+    };
+
+    // Old session A1 should have received Close (or EOF) cleanly.
+    let a1_closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match r_a1.recv().await {
+                Ok(Envelope { msg: Some(Msg::Close(_)), .. }) | Err(_) => break true,
+                Ok(_) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(a1_closed, "stale session A1 must be closed when superseded by A2");
+
+    // 4. Clean shutdown.
+    let _ = stop_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+}

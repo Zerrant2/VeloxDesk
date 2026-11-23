@@ -85,6 +85,41 @@ pub fn folder(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     painter.rect_filled(body, egui::CornerRadius::same(2), color);
 }
 
+/// Draw a trash-can / delete silhouette inside `rect`.
+pub fn delete(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let r = rect.shrink(rect.width().min(rect.height()) * 0.12);
+    let stroke = egui::Stroke::new((r.width().min(r.height()) * 0.14).max(1.3), color);
+    // Lid handle + top bar
+    let lid_y = r.top() + r.height() * 0.22;
+    painter.line_segment([egui::pos2(r.left(), lid_y), egui::pos2(r.right(), lid_y)], stroke);
+    painter.line_segment(
+        [
+            egui::pos2(r.left() + r.width() * 0.32, r.top() + r.height() * 0.06),
+            egui::pos2(r.right() - r.width() * 0.32, r.top() + r.height() * 0.06),
+        ],
+        stroke,
+    );
+    // Can body
+    let body = egui::Rect::from_min_max(
+        egui::pos2(r.left() + r.width() * 0.16, lid_y + 1.0),
+        egui::pos2(r.right() - r.width() * 0.16, r.bottom()),
+    );
+    painter.rect_stroke(body, egui::CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+    // Center vertical rib
+    let cx = body.center().x;
+    painter.line_segment(
+        [egui::pos2(cx, body.top() + body.height() * 0.22), egui::pos2(cx, body.bottom() - body.height() * 0.18)],
+        stroke,
+    );
+}
+
+/// Paint-based [`egui::Atom`] for [`delete`].
+pub fn delete_atom(size: f32) -> egui::Atom<'static> {
+    egui::Atom::paint(egui::vec2(size, size), |ui, args| {
+        delete(ui.painter(), args.rect, args.fallback_text_color);
+    })
+}
+
 /// Paint-based [`egui::Atom`] for [`close_cross`].
 pub fn close_cross_atom(size: f32) -> egui::Atom<'static> {
     egui::Atom::paint(egui::vec2(size, size), |ui, args| {

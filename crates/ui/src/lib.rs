@@ -29,7 +29,10 @@ pub use files::{
 pub use i18n::{Strings, tr};
 pub use session::{
     SessionInfo, SessionToolbar, ToolbarAction, settings_window, settings_window_at, settings_window_full,
+    settings_window_with_security,
 };
-pub use settings::{FpsCap, Language, Mode, Present, Quality, Scale, Settings, StreamSettings};
+pub use settings::{
+    FpsCap, Language, Mode, PasswordMode, Present, Quality, SavedTrustedPeer, Scale, Settings, StreamSettings,
+};
 pub use terminal::{TerminalAction, TerminalWindow, strip_ansi};
 pub use tunnels::{ActiveTunnel, TunnelAction, TunnelSpec, TunnelsWindow, parse_tunnel_spec, parse_tunnel_spec_i18n};

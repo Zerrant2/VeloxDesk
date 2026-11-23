@@ -68,5 +68,9 @@ required-features = ["full"]
 name = "m5_unified_host"
 required-features = ["full"]
 
+[[test]]
+name = "v030_host_security"
+required-features = ["full"]
+
 [lints]
 workspace = true

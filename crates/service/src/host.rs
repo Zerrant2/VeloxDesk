@@ -4,11 +4,11 @@
 
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use veloxdesk_core_traits::video::EncodedPacket;
 use veloxdesk_core_traits::{CoreError, Result, Timestamp, TransportChannel};
@@ -16,7 +16,7 @@ use veloxdesk_crypto::DeviceIdentity;
 use veloxdesk_protocol::control::{Nack, ReceiverReport};
 use veloxdesk_transport::{AbrController, Listener, P2pListener, QuicChannel, VideoSender};
 
-use crate::auth::HostAuthState;
+use crate::auth::{HostAuthState, TrustedPeer};
 use crate::backends::{EncoderFactory, HostBackends, RateController, RateDecision, VideoSink};
 use crate::config::HostConfig;
 use crate::daemon::detect_desktop;
@@ -24,7 +24,7 @@ use crate::ipc::{IpcRequest, IpcResponse, IpcServer};
 use crate::session::{CLOSE_BUSY, SessionHooks, reject, run_session_with_hooks};
 
 /// Lifecycle events emitted by [`RunningHost`] (consumed by GUI, tray, or daemon observers).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HostStatusEvent {
     Listening {
         bind: SocketAddr,
@@ -41,6 +41,9 @@ pub enum HostStatusEvent {
     },
     OtpRotated {
         otp: String,
+    },
+    TrustedPeerAdded {
+        peer: TrustedPeer,
     },
     Error(String),
 }
@@ -169,9 +172,13 @@ impl RunningHost {
             }
         };
         if let Some(cb) = &on_event {
-            let cb = cb.clone();
+            let cb_otp = cb.clone();
             auth_state.set_on_otp_rotated(Some(Arc::new(move |otp| {
-                cb(HostStatusEvent::OtpRotated { otp });
+                cb_otp(HostStatusEvent::OtpRotated { otp });
+            })));
+            let cb_peer = cb.clone();
+            auth_state.set_on_trusted_peer_added(Some(Arc::new(move |peer| {
+                cb_peer(HostStatusEvent::TrustedPeerAdded { peer });
             })));
         }
 
@@ -405,6 +412,88 @@ pub async fn serve_p2p_until(
     .await
 }
 
+const SUPERSEDE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct ActiveSessionEntry {
+    session_id: u64,
+    peer_pk: Option<[u8; 32]>,
+    stop_tx: watch::Sender<bool>,
+}
+
+struct ActiveSessionGuard {
+    session_id: u64,
+    registry: Arc<Mutex<Vec<ActiveSessionEntry>>>,
+}
+
+impl ActiveSessionGuard {
+    fn register(
+        registry: Arc<Mutex<Vec<ActiveSessionEntry>>>,
+        session_id: u64,
+        peer_pk: Option<[u8; 32]>,
+        stop_tx: watch::Sender<bool>,
+    ) -> Self {
+        registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ActiveSessionEntry { session_id, peer_pk, stop_tx });
+        Self { session_id, registry }
+    }
+}
+
+impl Drop for ActiveSessionGuard {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|e| e.session_id != self.session_id);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_registered_session(
+    ch: Arc<dyn TransportChannel>,
+    permit: OwnedSemaphorePermit,
+    registry: Arc<Mutex<Vec<ActiveSessionEntry>>>,
+    entry_id: u64,
+    cfg: Arc<HostConfig>,
+    backends: HostBackends,
+    mut host_stop: watch::Receiver<bool>,
+    mut disc: watch::Receiver<u64>,
+    hooks: SessionHooks,
+) {
+    let _permit = permit;
+    let (sess_stop_tx, sess_stop_rx) = watch::channel(false);
+    // Registered AFTER `_permit` so `_reg_guard` drops BEFORE `_permit` is released,
+    // ensuring a waiting superseding session sees a clean registry as soon as it acquires the permit.
+    let _reg_guard = ActiveSessionGuard::register(registry, entry_id, ch.peer_public_key(), sess_stop_tx.clone());
+    let fwd = tokio::spawn(async move {
+        tokio::select! {
+            () = wait_watch_true(&mut host_stop) => {
+                let _ = sess_stop_tx.send(true);
+            }
+            res = disc.changed() => {
+                if res.is_ok() {
+                    let _ = sess_stop_tx.send(true);
+                }
+            }
+            () = sess_stop_tx.closed() => {}
+        }
+    });
+    match run_session_with_hooks(ch, cfg, backends, sess_stop_rx, hooks).await {
+        Ok(s) => tracing::info!(
+            session = s.session_id,
+            peer = %s.peer_device_id,
+            frames = s.frames_sent,
+            dropped = s.frames_dropped,
+            input = s.input_events,
+            reason = %s.close_reason,
+            "session finished"
+        ),
+        Err(e) => tracing::warn!("session error: {e}"),
+    }
+    fwd.abort();
+}
+
 async fn serve_listener_core(
     listener: HostListener,
     mut cfg: HostConfig,
@@ -429,6 +518,8 @@ async fn serve_listener_core(
     }
     let cfg = Arc::new(cfg);
     let permits = Arc::new(Semaphore::new(cfg.max_sessions));
+    let active_registry: Arc<Mutex<Vec<ActiveSessionEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let next_entry_id = Arc::new(AtomicU64::new(1));
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut sessions = JoinSet::new();
     tokio::pin!(shutdown);
@@ -450,15 +541,26 @@ async fn serve_listener_core(
                         let ch: Arc<dyn TransportChannel> = Arc::new(ch);
                         match permits.clone().try_acquire_owned() {
                             Ok(permit) => {
+                                let entry_id = next_entry_id.fetch_add(1, Ordering::Relaxed);
                                 let cfg = cfg.clone();
                                 let backends = backends.clone();
-                                let mut host_stop = stop_rx.clone();
+                                let host_stop = stop_rx.clone();
                                 let mut disc = disconnect_rx.clone();
                                 let _ = disc.borrow_and_update();
                                 let hooks = hooks.clone();
+                                let registry = active_registry.clone();
+                                // Pre-register immediately so a rapid reconnect sees this session before spawn runs.
+                                let (sess_stop_tx, sess_stop_rx) = watch::channel(false);
+                                let reg_guard = ActiveSessionGuard::register(
+                                    registry,
+                                    entry_id,
+                                    ch.peer_public_key(),
+                                    sess_stop_tx.clone(),
+                                );
                                 sessions.spawn(async move {
                                     let _permit = permit;
-                                    let (sess_stop_tx, sess_stop_rx) = watch::channel(false);
+                                    let _reg_guard = reg_guard;
+                                    let mut host_stop = host_stop;
                                     let fwd = tokio::spawn(async move {
                                         tokio::select! {
                                             () = wait_watch_true(&mut host_stop) => {
@@ -488,10 +590,61 @@ async fn serve_listener_core(
                                 });
                             }
                             Err(_) => {
-                                tracing::info!("rejecting viewer: max_sessions ({}) reached", cfg.max_sessions);
-                                tokio::spawn(async move {
-                                    reject(ch, CLOSE_BUSY, "host busy").await;
-                                });
+                                let incoming_pk = ch.peer_public_key();
+                                let superseded = if let Some(pk) = incoming_pk {
+                                    let g = active_registry.lock().unwrap_or_else(|e| e.into_inner());
+                                    let mut matched = false;
+                                    for entry in g.iter() {
+                                        if entry.peer_pk == Some(pk) {
+                                            let _ = entry.stop_tx.send(true);
+                                            matched = true;
+                                        }
+                                    }
+                                    matched
+                                } else {
+                                    false
+                                };
+
+                                if superseded {
+                                    tracing::info!(
+                                        "same peer reconnected while max_sessions ({}) reached; superseding stale session",
+                                        cfg.max_sessions
+                                    );
+                                    let entry_id = next_entry_id.fetch_add(1, Ordering::Relaxed);
+                                    let permits_c = permits.clone();
+                                    let registry = active_registry.clone();
+                                    let cfg = cfg.clone();
+                                    let backends = backends.clone();
+                                    let mut wait_stop = stop_rx.clone();
+                                    let host_stop = stop_rx.clone();
+                                    let mut disc = disconnect_rx.clone();
+                                    let _ = disc.borrow_and_update();
+                                    let hooks = hooks.clone();
+                                    sessions.spawn(async move {
+                                        let acquired = tokio::select! {
+                                            () = wait_watch_true(&mut wait_stop) => None,
+                                            res = tokio::time::timeout(SUPERSEDE_WAIT_TIMEOUT, permits_c.acquire_owned()) => {
+                                                res.ok().and_then(std::result::Result::ok)
+                                            }
+                                        };
+                                        if let Some(permit) = acquired {
+                                            run_registered_session(
+                                                ch, permit, registry, entry_id, cfg, backends, host_stop, disc, hooks,
+                                            )
+                                            .await;
+                                        } else if *wait_stop.borrow() {
+                                            ch.close(CLOSE_BUSY, "host stopping");
+                                        } else {
+                                            tracing::warn!("timed out waiting to supersede stale session; rejecting with CLOSE_BUSY");
+                                            reject(ch, CLOSE_BUSY, "host busy").await;
+                                        }
+                                    });
+                                } else {
+                                    tracing::info!("rejecting viewer: max_sessions ({}) reached", cfg.max_sessions);
+                                    tokio::spawn(async move {
+                                        reject(ch, CLOSE_BUSY, "host busy").await;
+                                    });
+                                }
                             }
                         }
                     }
@@ -818,5 +971,78 @@ mod tests {
         assert!(recorded.iter().any(|e| matches!(e, HostStatusEvent::OtpRotated { .. })));
         assert!(recorded.iter().any(|e| matches!(e, HostStatusEvent::SessionStarted { .. })));
         assert!(recorded.iter().any(|e| matches!(e, HostStatusEvent::SessionEnded { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_host_emits_trusted_peer_added_event() {
+        let host_id = DeviceIdentity::generate();
+        let expected_host_pk = host_id.public_key();
+        let viewer_id = DeviceIdentity::generate();
+        let expected_viewer_pk = viewer_id.public_key();
+
+        let events: Arc<Mutex<Vec<HostStatusEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_c = events.clone();
+
+        let approval: crate::auth::ApprovalHandler =
+            Arc::new(|req| Box::pin(async move { crate::auth::ApprovalDecision::accept_and_trust(req.default_permissions) }));
+
+        let cfg = HostConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            ipc_port: None,
+            audio_enabled: false,
+            auth: crate::auth::HostAuthConfig::require_accept_with(approval),
+            ..Default::default()
+        };
+
+        let host = RunningHost::start(
+            cfg,
+            host_id,
+            synthetic_backends(),
+            Some(Arc::new(move |ev| events_c.lock().unwrap().push(ev))),
+        )
+        .await
+        .expect("RunningHost::start");
+
+        let ch = connect(host.local_addr(), &viewer_id, Some(expected_host_pk)).await.expect("connect");
+        let (send, recv) = ch.open_bi(StreamKind::Control).await.unwrap();
+        let (mut writer, mut reader) = framed(send, recv);
+        writer
+            .send(
+                &Msg::Hello(Hello {
+                    protocol_version: veloxdesk_protocol::PROTOCOL_VERSION,
+                    device_id: viewer_id.device_id(),
+                    device_name: "trusted-laptop".into(),
+                    os: "windows".into(),
+                    public_key: viewer_id.public_key().to_vec(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let ch_msg = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+        assert!(matches!(ch_msg.msg, Some(Msg::AuthChallenge(_))));
+        writer
+            .send(&Msg::AuthResponse(AuthResponse { method: AuthMethod::None as i32, proof: Vec::new() }).into())
+            .await
+            .unwrap();
+
+        let res_msg = tokio::time::timeout(Duration::from_secs(5), reader.recv()).await.unwrap().unwrap();
+        let Some(Msg::AuthResult(res)) = res_msg.msg else { panic!("expected AuthResult") };
+        assert!(res.ok);
+
+        host.stop();
+        tokio::time::timeout(Duration::from_secs(5), host.join()).await.unwrap().unwrap();
+
+        let recorded = events.lock().unwrap();
+        assert!(
+            recorded.iter().any(|e| matches!(
+                e,
+                HostStatusEvent::TrustedPeerAdded { peer }
+                    if peer.public_key == expected_viewer_pk && peer.name == "trusted-laptop"
+            )),
+            "expected TrustedPeerAdded event, got {recorded:?}"
+        );
     }
 }

@@ -668,6 +668,7 @@ fn r4_desktop_and_gaming_profiles_independent_and_persist() {
         desktop: desktop_cfg,
         gaming: gaming_cfg,
         require_accept: false,
+        ..Default::default()
     };
 
     // active() / active_mut() tracks mode without leaking across profiles.
@@ -848,12 +849,14 @@ fn r5_settings_tooltips_complete_and_render_in_both_languages_and_profiles() {
 #[test]
 fn r6_r7_version_display_build_script_and_update_actions() {
     let root = workspace_root();
+    let pkg_ver = env!("CARGO_PKG_VERSION");
 
     // 1. Workspace Cargo.toml version and build.rs format contract.
     let root_toml = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
+    let expected_ver_line = format!("version = \"{pkg_ver}\"");
     assert!(
-        root_toml.contains("version = \"0.2.0\""),
-        "workspace version in root Cargo.toml must be 0.2.0"
+        root_toml.contains(&expected_ver_line),
+        "workspace version in root Cargo.toml must match {expected_ver_line}"
     );
 
     let build_rs = std::fs::read_to_string(root.join("apps/client/build.rs")).expect("read apps/client/build.rs");
@@ -867,10 +870,10 @@ fn r6_r7_version_display_build_script_and_update_actions() {
         "build.rs must format VELOXDESK_BUILD_DISPLAY as v<semver> (<sha>)"
     );
 
-    assert!(is_valid_build_display("v0.2.0 (26e488f)", "0.2.0"));
-    assert!(is_valid_build_display("v0.2.0 (dev)", "0.2.0"));
-    assert!(!is_valid_build_display("0.2.0 (26e488f)", "0.2.0"));
-    assert!(!is_valid_build_display("v0.2.0 (12345)", "0.2.0"));
+    assert!(is_valid_build_display(&format!("v{pkg_ver} (26e488f)"), pkg_ver));
+    assert!(is_valid_build_display(&format!("v{pkg_ver} (dev)"), pkg_ver));
+    assert!(!is_valid_build_display(&format!("{pkg_ver} (26e488f)"), pkg_ver));
+    assert!(!is_valid_build_display(&format!("v{pkg_ver} (12345)"), pkg_ver));
 
     // 2. If veloxdesk binary is compiled in the same target profile dir, verify `--version` output live.
     if let Ok(exe) = std::env::current_exe() {
@@ -893,9 +896,9 @@ fn r6_r7_version_display_build_script_and_update_actions() {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let display = stdout
                 .strip_prefix("veloxdesk ")
-                .unwrap_or_else(|| panic!("expected `veloxdesk v0.2.0 (<sha>)`, got {stdout:?}"));
+                .unwrap_or_else(|| panic!("expected `veloxdesk v{pkg_ver} (<sha>)`, got {stdout:?}"));
             assert!(
-                is_valid_build_display(display, "0.2.0"),
+                is_valid_build_display(display, pkg_ver),
                 "unexpected `veloxdesk --version` format: {stdout:?}"
             );
         }
@@ -956,6 +959,7 @@ fn r6_r7_version_display_build_script_and_update_actions() {
         assert_eq!(action, Some(ConnectAction::StartUpdate));
 
         // Settings window shows build_display + Check for updates button emitting ToolbarAction::CheckForUpdates.
+        // Scroll to the bottom of the Settings ScrollArea since Host Access & Security sits above Version/Updates.
         let sctx = egui::Context::default();
         let mut open = true;
         let mut sw = sctx.run_ui(make_input(viewport, Some(0.0), Vec::new()), |ui| {
@@ -980,6 +984,40 @@ fn r6_r7_version_display_build_script_and_update_actions() {
             );
         });
         sw.textures_delta.clear();
+        let scroll_anchor = sw
+            .shapes
+            .iter()
+            .find_map(|c| find_text_rect(&c.shape, t.settings_quality))
+            .map_or(egui::pos2(300.0, 300.0), |r| r.center());
+        for step in 0..3 {
+            sw = sctx.run_ui(
+                make_input(
+                    viewport,
+                    Some(0.04 + 0.02 * step as f64),
+                    vec![
+                        egui::Event::PointerMoved(scroll_anchor),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -900.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Trackpad,
+                        },
+                    ],
+                ),
+                |ui| {
+                    let _ = settings_window_full(
+                        ui.ctx(),
+                        &mut open,
+                        &mut settings,
+                        None,
+                        Some("v0.2.0 (26e488f)"),
+                        Some(&UpdateUiState::Idle),
+                    );
+                },
+            );
+            sw.textures_delta.clear();
+        }
         assert!(
             shapes_contain_text(&sw.shapes, "v0.2.0 (26e488f)"),
             "Settings window must display build_display ({lang:?})"
@@ -995,7 +1033,7 @@ fn r6_r7_version_display_build_script_and_update_actions() {
             let mut out = sctx.run_ui(
                 make_input(
                     viewport,
-                    Some(0.10 + 0.02 * i as f64),
+                    Some(0.14 + 0.02 * i as f64),
                     vec![
                         egui::Event::PointerMoved(check_btn),
                         egui::Event::PointerButton {

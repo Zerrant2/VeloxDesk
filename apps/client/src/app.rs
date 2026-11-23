@@ -22,12 +22,12 @@ use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, Window
 use veloxdesk_render::{RenderBreakdown, SurfaceOptions, VideoSurface, egui};
 use veloxdesk_ui::{
     AcceptDecision, AcceptPrompt, ConnectAction, ConnectScreen, ConnectTarget, FileAction, FileManagerWindow, Language,
-    Mode, PasswordAction, PasswordPrompt, Present, SessionInfo, SessionToolbar, Settings, TailscaleInfo,
+    Mode, PasswordAction, PasswordMode, PasswordPrompt, Present, SessionInfo, SessionToolbar, Settings, TailscaleInfo,
     TerminalAction, TerminalWindow, ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, UpdateUiState,
-    format_device_id, parse_rendezvous_addr_i18n, parse_target_i18n, settings_window_full, tr,
+    format_device_id, parse_rendezvous_addr_i18n, parse_target_i18n, settings_window_with_security, tr,
 };
 
-use crate::embedded_host::{EmbeddedHostEvent, EmbeddedHostHandle};
+use crate::embedded_host::{self, EmbeddedHostAuthOpts, EmbeddedHostEvent, EmbeddedHostHandle};
 use crate::input::{self, RelativeAccum, WheelAccum};
 use crate::latest::Latest;
 use crate::session::{ConnectOptions, SessionCommand, SessionEvent, SessionHandle};
@@ -83,6 +83,7 @@ pub enum UserEvent {
     Tray(TrayAction),
     Tailscale(TailscaleInfo),
     Update(UpdateEvent),
+    PasswordHashed { seq: u64, result: Result<String, String> },
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +252,8 @@ pub struct App {
     host_last_peer: Option<String>,
     available_release: Option<ReleaseInfo>,
     manual_update_check: bool,
+    pw_status: Option<String>,
+    pw_hash_seq: u64,
     tray: Option<TrayHandle>,
     files: FileManagerWindow,
     terminal: TerminalWindow,
@@ -260,6 +263,10 @@ pub struct App {
     pressed: HashSet<KeyCode>,
     wheel: WheelAccum,
     rel: RelativeAccum,
+    pending_abs_move: Option<(i32, i32, u32)>,
+    last_abs_send: Instant,
+    last_rel_send: Instant,
+    redraw_requested: bool,
     pointer_locked: bool,
     chrome: WindowChromeState,
     session_info: SessionInfo,
@@ -273,15 +280,23 @@ impl App {
     pub fn new(
         launch: Launch,
         proxy: EventLoopProxy<UserEvent>,
-        settings: Settings,
+        mut settings: Settings,
         present: Option<Present>,
         viewer_opts: ViewerCliOpts,
     ) -> Self {
+        // MAJOR #3: sanitize corrupt permanent_password_hash on load so UI and host never desync.
+        if let Some(phc) = settings.permanent_password_hash.as_deref()
+            && !embedded_host::is_valid_phc_hash(phc)
+        {
+            tracing::warn!("clearing corrupt permanent_password_hash found in settings");
+            settings.permanent_password_hash = None;
+        }
         let lang_atomic = Arc::new(AtomicU8::new(settings.language.to_u8()));
         let mut connect = ConnectScreen::new(&settings);
         connect.device_id = crate::device_id_label();
         connect.settings_path = viewer_opts.settings_path.clone();
         connect.build_display = env!("VELOXDESK_BUILD_DISPLAY").to_string();
+        let past = Instant::now() - Duration::from_secs(1);
         Self {
             launch: Some(launch),
             proxy,
@@ -299,6 +314,8 @@ impl App {
             host_last_peer: None,
             available_release: None,
             manual_update_check: false,
+            pw_status: None,
+            pw_hash_seq: 0,
             tray: None,
             files: FileManagerWindow::default(),
             terminal: TerminalWindow::default(),
@@ -308,6 +325,10 @@ impl App {
             pressed: HashSet::new(),
             wheel: WheelAccum::default(),
             rel: RelativeAccum::default(),
+            pending_abs_move: None,
+            last_abs_send: past,
+            last_rel_send: past,
+            redraw_requested: false,
             pointer_locked: false,
             chrome: WindowChromeState::default(),
             session_info: SessionInfo::default(),
@@ -319,10 +340,53 @@ impl App {
         }
     }
 
+    fn effective_perm_phc(&self) -> Option<String> {
+        if self.settings.password_mode == PasswordMode::OneTime {
+            None
+        } else {
+            self.settings.permanent_password_hash.clone()
+        }
+    }
+
+    fn request_redraw(&mut self) {
+        if !self.redraw_requested
+            && let Some(s) = &self.surface
+        {
+            self.redraw_requested = true;
+            s.window().request_redraw();
+        }
+    }
+
+    fn flush_pending_rel(&mut self) {
+        if let Some(ev) = self.rel.take() {
+            self.last_rel_send = Instant::now();
+            self.send_input(ev);
+        }
+    }
+
+    fn flush_pending_abs(&mut self) {
+        if let Some((x, y, d)) = self.pending_abs_move.take() {
+            self.last_abs_send = Instant::now();
+            self.send_input(input::mouse_move(x, y, d));
+        }
+    }
+
+    fn session_ui_active(&self) -> bool {
+        self.toolbar.expanded
+            || self.settings_open
+            || self.files.open
+            || self.terminal.open
+            || self.tunnels.open
+            || self.password_prompt.is_some()
+            || self.accept_prompt.is_some()
+            || matches!(self.state, State::Session { got_frame: false, .. })
+    }
+
     fn sync_language(&mut self) {
         let lang = self.settings.language;
         self.lang_atomic.store(lang.to_u8(), Ordering::Relaxed);
         self.connect.copied_notice = None;
+        self.pw_status = None;
         if let Some(s) = &mut self.surface {
             s.set_hud_labels(hud_labels_for(lang));
         }
@@ -436,9 +500,15 @@ impl App {
         };
         self.connect.host_error = None;
         self.connect.host_status = t.host_starting.into();
+        let auth_opts = EmbeddedHostAuthOpts {
+            password_mode: self.settings.password_mode,
+            permanent_password_hash: self.settings.permanent_password_hash.clone(),
+            trusted_peers: self.settings.trusted_peers.clone(),
+            require_accept: self.settings.require_accept,
+        };
         match EmbeddedHostHandle::start(
             rendezvous,
-            self.settings.require_accept,
+            auth_opts,
             self.proxy.clone(),
             self.lang_atomic.clone(),
         ) {
@@ -590,6 +660,7 @@ impl App {
     fn end_session(&mut self, reason: Option<String>) {
         self.release_pointer();
         self.pressed.clear();
+        self.pending_abs_move = None;
         self.chrome.end_session();
         self.toolbar.expanded = self.chrome.toolbar_expanded;
         self.state = State::Connect;
@@ -855,6 +926,60 @@ impl App {
                     s.window().request_redraw();
                 }
             }
+            ToolbarAction::SetPasswordMode(mode) => {
+                self.settings.password_mode = mode;
+                self.save_settings();
+                let otp_on = self.settings.effective_otp_enabled();
+                let perm_phc = self.effective_perm_phc();
+                if let Some(h) = &self.embedded_host {
+                    h.set_permanent_password_phc(perm_phc);
+                    h.set_otp_enabled(otp_on);
+                }
+                if !otp_on {
+                    self.connect.host_otp.clear();
+                }
+                self.request_redraw();
+            }
+            ToolbarAction::SetPermanentPassword(pw) => {
+                self.pw_hash_seq = self.pw_hash_seq.wrapping_add(1);
+                let seq = self.pw_hash_seq;
+                self.pw_status = Some(tr(self.settings.language).pw_saving_status.into());
+                let proxy = self.proxy.clone();
+                let _ = std::thread::Builder::new().name("veloxdesk-argon2".into()).spawn(move || {
+                    let result = embedded_host::hash_password_phc(&pw).map_err(|e| format!("{e:#}"));
+                    let _ = proxy.send_event(UserEvent::PasswordHashed { seq, result });
+                });
+                self.request_redraw();
+            }
+            ToolbarAction::ClearPermanentPassword => {
+                self.pw_hash_seq = self.pw_hash_seq.wrapping_add(1);
+                self.settings.permanent_password_hash = None;
+                self.save_settings();
+                self.pw_status = Some(tr(self.settings.language).pw_cleared_notice.into());
+                let otp_on = self.settings.effective_otp_enabled();
+                if let Some(h) = &self.embedded_host {
+                    h.set_permanent_password_phc(None);
+                    h.set_otp_enabled(otp_on);
+                }
+                self.request_redraw();
+            }
+            ToolbarAction::SetRequireAccept(req) => {
+                self.settings.require_accept = req;
+                self.save_settings();
+                if let Some(h) = &self.embedded_host {
+                    h.set_require_accept(req);
+                }
+            }
+            ToolbarAction::RemoveTrustedPeer(hex) => {
+                self.settings.remove_trusted_peer(&hex);
+                self.save_settings();
+                if let Some(h) = &self.embedded_host {
+                    h.remove_trusted_peer(hex);
+                }
+                if let Some(s) = &self.surface {
+                    s.window().request_redraw();
+                }
+            }
             ToolbarAction::Disconnect => {
                 if self.launch_was_test() {
                     event_loop.exit();
@@ -877,18 +1002,20 @@ impl App {
         }
     }
 
-    fn apply_window_chrome(&self) {
+    fn apply_window_chrome(&mut self) {
         if let Some(s) = &self.surface {
             let w = s.window();
             let target_fs = self.chrome.fullscreen.then_some(Fullscreen::Borderless(None));
             if w.fullscreen().is_some() != self.chrome.fullscreen {
                 w.set_fullscreen(target_fs);
             }
-            if self.chrome.decorations {
+            // BUG #1: NEVER call `set_decorations(true)` while entering/in borderless fullscreen —
+            // on Windows it corrupts the borderless WS_POPUP style and breaks DXGI flip presentation.
+            if !self.chrome.fullscreen && self.chrome.decorations {
                 w.set_decorations(true);
             }
-            w.request_redraw();
         }
+        self.request_redraw();
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -925,6 +1052,7 @@ impl App {
         let tunnels = &mut self.tunnels;
         let settings_open = &mut self.settings_open;
         let settings_path = self.viewer_opts.settings_path.as_deref();
+        let pw_status = self.pw_status.as_deref();
         let info = &mut self.session_info;
         info.files_open = files.open;
         info.terminal_open = terminal.open;
@@ -993,13 +1121,14 @@ impl App {
             {
                 actions.push(UiAction::Accept(dec));
             }
-            for a in settings_window_full(
+            for a in settings_window_with_security(
                 ui.ctx(),
                 settings_open,
                 settings,
                 settings_path,
                 Some(&connect.build_display),
                 Some(&connect.update_state),
+                pw_status,
             ) {
                 actions.push(UiAction::Toolbar(a));
             }
@@ -1028,7 +1157,9 @@ impl App {
                     }
                 }
                 UiAction::Connect(ConnectAction::RotateOtp) => {
-                    if let Some(h) = &self.embedded_host {
+                    if self.settings.effective_otp_enabled()
+                        && let Some(h) = &self.embedded_host
+                    {
                         h.rotate_otp();
                     }
                 }
@@ -1128,59 +1259,62 @@ impl App {
         stats
     }
 
-    fn on_frame_event(&mut self, event_loop: &ActiveEventLoop) {
-        match &self.state {
-            State::TestPattern(_) => self.present_test_pattern(event_loop),
-            State::Session { handle, .. } => {
-                let shared = handle.shared.clone();
-                let Some(msg) = shared.frames.take() else { return };
-                let stats = self.render(event_loop, Some(&msg.frame));
-                if let State::Session { got_frame, .. } = &mut self.state {
-                    *got_frame = true;
-                }
-                let Some(stats) = stats else { return };
-                let presented = Timestamp::now();
-                shared.render_us.store(stats.render_us, Ordering::Relaxed);
-                let clock = shared.clock.lock().clone();
-                let mut hud = shared.hud.lock();
-                hud.on_presented(
-                    PresentedFrame {
-                        frame_id: msg.frame_id,
-                        capture_ts: msg.frame.capture_ts,
-                        recv_complete: msg.recv_complete,
-                        presented,
-                        decode_us: msg.decode_us,
-                        render_us: stats.render_us,
-                    },
-                    Some(&clock),
-                );
-                hud.snapshot.resolution = (msg.frame.width, msg.frame.height);
-                hud.snapshot.decoder = self.decoder.0.clone();
-                hud.snapshot.hw_decode = self.decoder.1;
-                hud.snapshot.zero_copy = stats.zero_copy;
-                let active_pads = shared.active_gamepads.load(Ordering::Relaxed);
-                self.session_info.active_gamepads = active_pads;
-                if let Some(snap) = hud.maybe_publish(Instant::now()) {
-                    drop(hud);
-                    let t = tr(self.settings.language);
-                    let audio_ms = shared.audio_buf_us.load(Ordering::Relaxed) as f64 / 1000.0;
-                    let mut parts = Vec::new();
-                    if audio_ms > 0.0 || self.settings.active().audio_enabled {
-                        parts.push(t.fmt_hud_audio_buf(audio_ms));
-                    }
-                    if active_pads > 0 {
-                        parts.push(t.fmt_hud_gamepads(active_pads));
-                    }
-                    if self.pointer_locked {
-                        parts.push(t.hud_pointer_locked.into());
-                    }
-                    if let Some(s) = &mut self.surface {
-                        s.set_hud(snap);
-                        s.set_hud_extra((!parts.is_empty()).then(|| parts.join(" · ")));
-                    }
-                }
+    fn present_session_redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let shared = match &self.state {
+            State::Session { handle, .. } => handle.shared.clone(),
+            _ => {
+                let _ = self.render(event_loop, None);
+                return;
             }
-            _ => {}
+        };
+        let Some(msg) = shared.frames.take() else {
+            let _ = self.render(event_loop, None);
+            return;
+        };
+        let stats = self.render(event_loop, Some(&msg.frame));
+        if let State::Session { got_frame, .. } = &mut self.state {
+            *got_frame = true;
+        }
+        let Some(stats) = stats else { return };
+        let presented = Timestamp::now();
+        shared.render_us.store(stats.render_us, Ordering::Relaxed);
+        let clock = shared.clock.lock().clone();
+        let mut hud = shared.hud.lock();
+        hud.on_presented(
+            PresentedFrame {
+                frame_id: msg.frame_id,
+                capture_ts: msg.frame.capture_ts,
+                recv_complete: msg.recv_complete,
+                presented,
+                decode_us: msg.decode_us,
+                render_us: stats.render_us,
+            },
+            Some(&clock),
+        );
+        hud.snapshot.resolution = (msg.frame.width, msg.frame.height);
+        hud.snapshot.decoder = self.decoder.0.clone();
+        hud.snapshot.hw_decode = self.decoder.1;
+        hud.snapshot.zero_copy = stats.zero_copy;
+        let active_pads = shared.active_gamepads.load(Ordering::Relaxed);
+        self.session_info.active_gamepads = active_pads;
+        if let Some(snap) = hud.maybe_publish(Instant::now()) {
+            drop(hud);
+            let t = tr(self.settings.language);
+            let audio_ms = shared.audio_buf_us.load(Ordering::Relaxed) as f64 / 1000.0;
+            let mut parts = Vec::new();
+            if audio_ms > 0.0 || self.settings.active().audio_enabled {
+                parts.push(t.fmt_hud_audio_buf(audio_ms));
+            }
+            if active_pads > 0 {
+                parts.push(t.fmt_hud_gamepads(active_pads));
+            }
+            if self.pointer_locked {
+                parts.push(t.hud_pointer_locked.into());
+            }
+            if let Some(s) = &mut self.surface {
+                s.set_hud(snap);
+                s.set_hud_extra((!parts.is_empty()).then(|| parts.join(" · ")));
+            }
         }
     }
 
@@ -1190,7 +1324,10 @@ impl App {
             let tick = if tp.opts.fps > 0 {
                 match tp.ticks.take() {
                     Some(t) => t,
-                    None => return,
+                    None => {
+                        let _ = self.render(event_loop, None);
+                        return;
+                    }
                 }
             } else {
                 Timestamp::now()
@@ -1401,6 +1538,14 @@ impl App {
             EmbeddedHostEvent::OtpRotated { otp } => {
                 self.connect.host_otp = otp;
             }
+            EmbeddedHostEvent::OtpCleared => {
+                self.connect.host_otp.clear();
+            }
+            EmbeddedHostEvent::TrustedPeerAdded(peer) => {
+                tracing::info!(id = %peer.device_id, name = %peer.name, "persisting trusted peer");
+                self.settings.upsert_trusted_peer(peer);
+                self.save_settings();
+            }
             EmbeddedHostEvent::ApprovalRequested { info, default_permissions, reply } => {
                 self.accept_prompt = Some((AcceptPrompt::new(info, default_permissions), reply));
                 if let Some(s) = &self.surface {
@@ -1525,7 +1670,9 @@ impl App {
                 }
             }
             TrayAction::RotateOtp => {
-                if let Some(h) = &self.embedded_host {
+                if self.settings.effective_otp_enabled()
+                    && let Some(h) = &self.embedded_host
+                {
                     h.rotate_otp();
                 }
             }
@@ -1729,73 +1876,152 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Frame => self.on_frame_event(event_loop),
+            // BUG #1: coalesce all video/test-pattern frame presents into `WindowEvent::RedrawRequested`
+            // instead of presenting synchronously inside `user_event` (prevents double-presents & stalls).
+            UserEvent::Frame => self.request_redraw(),
             UserEvent::Session(ev) => self.handle_session_event(ev),
             UserEvent::Host(ev) => self.handle_host_event(ev),
             UserEvent::Tray(action) => self.handle_tray_action(action, event_loop),
             UserEvent::Tailscale(info) => {
                 self.connect.tailscale = info;
-                if let Some(s) = &self.surface {
-                    s.window().request_redraw();
-                }
+                self.request_redraw();
             }
             UserEvent::Update(ev) => self.handle_update_event(ev, event_loop),
+            UserEvent::PasswordHashed { seq, result } => {
+                // MAJOR #2: ignore stale Argon2id completions if user clicked Save again or Clear.
+                if seq != self.pw_hash_seq {
+                    return;
+                }
+                match result {
+                    Ok(phc) => {
+                        self.settings.permanent_password_hash = Some(phc);
+                        self.save_settings();
+                        self.pw_status = Some(tr(self.settings.language).pw_saved_notice.into());
+                        let otp_on = self.settings.effective_otp_enabled();
+                        let perm_phc = self.effective_perm_phc();
+                        if let Some(h) = &self.embedded_host {
+                            h.set_permanent_password_phc(perm_phc);
+                            h.set_otp_enabled(otp_on);
+                        }
+                        if !otp_on {
+                            self.connect.host_otp.clear();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("permanent password hashing failed: {e}");
+                        self.pw_status = Some(e);
+                    }
+                }
+                self.request_redraw();
+            }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(surface) = self.surface.as_mut() else { return };
+        if self.surface.is_none() {
+            return;
+        }
         // Handle RedrawRequested BEFORE feeding egui_winit: egui_winit returns `repaint: true`
         // for RedrawRequested itself, which would otherwise trigger an infinite busy render loop!
         if matches!(event, WindowEvent::RedrawRequested) {
-            if matches!(&self.state, State::TestPattern(tp) if tp.opts.fps == 0) {
-                self.present_test_pattern(event_loop);
-            } else {
-                let _ = self.render(event_loop, None);
+            self.redraw_requested = false;
+            match &self.state {
+                State::Session { .. } => self.present_session_redraw(event_loop),
+                State::TestPattern(_) => self.present_test_pattern(event_loop),
+                State::Connect | State::Connecting(_) => {
+                    let _ = self.render(event_loop, None);
+                }
             }
             return;
         }
+
+        let in_session = matches!(self.state, State::Session { .. });
+        let bypass_egui_mouse = in_session
+            && self.pointer_locked
+            && matches!(
+                event,
+                WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+            );
+
+        let (response_consumed, response_repaint, egui_wants_pointer) = {
+            let Some(surface) = self.surface.as_mut() else { return };
+            let (consumed, repaint) = if bypass_egui_mouse {
+                (false, false)
+            } else {
+                let r = surface.on_window_event(&event);
+                (r.consumed, r.repaint)
+            };
+            let wants_ptr = if bypass_egui_mouse {
+                false
+            } else {
+                surface.egui_ctx().egui_wants_pointer_input()
+            };
+            (consumed, repaint, wants_ptr)
+        };
+
         // Moving/occluding/closing the window does not invalidate pixels; requesting a GPU
-        // redraw on `Moved` stalls Windows' modal drag loop.
+        // redraw on `Moved` stalls Windows' modal drag loop (`26e488f`).
+        // During an active session with no open UI overlays, also suppress mouse/keyboard-driven
+        // repaints so 1000 Hz gaming mice never trigger fullscreen DXGI Present() storms (BUG #1).
+        let ui_active = self.session_ui_active();
         let skip_repaint = matches!(
             event,
             WindowEvent::Moved(_)
                 | WindowEvent::Occluded(_)
                 | WindowEvent::CloseRequested
                 | WindowEvent::Destroyed
-        );
-        let response = surface.on_window_event(&event);
-        if response.repaint && !skip_repaint {
-            surface.window().request_redraw();
+        ) || (in_session && match &event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let cursor_near_toolbar = position.y <= 52.0;
+                !ui_active && !egui_wants_pointer && !cursor_near_toolbar
+            }
+            WindowEvent::KeyboardInput { .. }
+            | WindowEvent::ModifiersChanged(_)
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::MouseInput { .. } => !ui_active && !egui_wants_pointer && !response_consumed,
+            _ => false,
+        });
+        if response_repaint && !skip_repaint {
+            self.request_redraw();
         }
-        let egui_wants_pointer = surface.egui_ctx().egui_wants_pointer_input();
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                surface.resize(size.width, size.height);
-                surface.window().request_redraw();
+                if let Some(surface) = self.surface.as_mut() {
+                    surface.resize(size.width, size.height);
+                }
+                self.request_redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::Focused(false) => {
                 self.release_all_keys();
                 self.release_pointer();
             }
-            WindowEvent::KeyboardInput { event, .. } => self.on_keyboard(&event, response.consumed),
+            WindowEvent::KeyboardInput { event, .. } => self.on_keyboard(&event, response_consumed),
             WindowEvent::CursorMoved { position, .. } => {
                 if self.pointer_locked || egui_wants_pointer {
                     return;
                 }
-                if let State::Session { config, .. } = &self.state
-                    && let Some((vx, vy)) = surface.window_to_video((position.x, position.y))
-                {
-                    let (x, y, d) = self.video_to_host(config, vx, vy);
-                    self.send_input(input::mouse_move(x, y, d));
+                let mapped = match (&self.state, self.surface.as_ref()) {
+                    (State::Session { config, .. }, Some(surface)) => surface
+                        .window_to_video((position.x, position.y))
+                        .map(|(vx, vy)| self.video_to_host(config, vx, vy)),
+                    _ => None,
+                };
+                if let Some((x, y, d)) = mapped {
+                    self.pending_abs_move = Some((x, y, d));
+                    if self.last_abs_send.elapsed() >= Duration::from_millis(2) {
+                        self.flush_pending_abs();
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if !matches!(self.state, State::Session { .. }) || (egui_wants_pointer && !self.pointer_locked) {
+                if !in_session || (egui_wants_pointer && !self.pointer_locked) {
                     return;
                 }
+                self.flush_pending_abs();
+                self.flush_pending_rel();
                 let down = state == ElementState::Pressed;
                 if down && self.relative_mode() && !self.pointer_locked {
                     self.lock_pointer();
@@ -1805,9 +2031,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if !matches!(self.state, State::Session { .. }) || (egui_wants_pointer && !self.pointer_locked) {
+                if !in_session || (egui_wants_pointer && !self.pointer_locked) {
                     return;
                 }
+                self.flush_pending_abs();
+                self.flush_pending_rel();
                 if let Some(ev) = self.wheel.push(delta) {
                     self.send_input(ev);
                 }
@@ -1821,22 +2049,25 @@ impl ApplicationHandler<UserEvent> for App {
             && self.pointer_locked
         {
             self.rel.push(delta.0, delta.1);
+            if self.last_rel_send.elapsed() >= Duration::from_millis(2) {
+                self.flush_pending_rel();
+            }
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(ev) = self.rel.take() {
-            self.send_input(ev);
-        }
+        self.flush_pending_rel();
+        self.flush_pending_abs();
         let Some(s) = &self.surface else { return };
         if matches!(&self.state, State::TestPattern(tp) if tp.opts.fps == 0) {
-            s.window().request_redraw();
+            self.request_redraw();
             event_loop.set_control_flow(ControlFlow::Poll);
             return;
         }
-        match s.repaint_deadline() {
+        let deadline = s.repaint_deadline();
+        match deadline {
             Some(t) if t <= Instant::now() => {
-                s.window().request_redraw();
+                self.request_redraw();
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
@@ -1846,12 +2077,6 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.release_all_keys();
-        self.release_pointer();
-        self.chrome.end_session();
-        self.toolbar.expanded = false;
-        self.accept_prompt = None;
-        self.stop_embedded_host();
-        self.tray = None;
         if let State::Session { handle, .. } = &self.state {
             let hud = handle.shared.hud.lock();
             let (r, t) = (&hud.render_samples, &hud.total_samples);
@@ -1864,7 +2089,12 @@ impl ApplicationHandler<UserEvent> for App {
                 r.len()
             );
         }
-        self.state = State::Connect;
+        // BUG #2: cleanly disconnect any active/connecting viewer session so `SessionHandle::drop`
+        // flushes QUIC CONNECTION_CLOSE before process termination.
+        self.end_session(None);
+        self.accept_prompt = None;
+        self.stop_embedded_host();
+        self.tray = None;
     }
 }
 
