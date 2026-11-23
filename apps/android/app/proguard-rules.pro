@@ -14,6 +14,8 @@
     public void onStats(float, int, float, float, float, float, float, float, float, float, int);
     public void onClipboardText(java.lang.String);
     public void onRumble(int, int, int);
+    public void onCursorShape(long, int, int, int, int, byte[]);
+    public void onCursorPosition(int, int, boolean, long);
     public void onClosed(java.lang.String, boolean);
 }
 -keep class * implements dev.veloxdesk.bridge.VeloxHostCallback {

@@ -66,6 +66,8 @@ struct JniSessionCallbacks {
     m_on_stats: CachedMethodId,
     m_on_clipboard_text: CachedMethodId,
     m_on_rumble: CachedMethodId,
+    m_on_cursor_shape: CachedMethodId,
+    m_on_cursor_position: CachedMethodId,
     m_on_closed: CachedMethodId,
 }
 
@@ -95,6 +97,10 @@ impl JniSessionCallbacks {
         let m_on_clipboard_text =
             CachedMethodId(env.get_method_id(&cls, "onClipboardText", "(Ljava/lang/String;)V")?);
         let m_on_rumble = CachedMethodId(env.get_method_id(&cls, "onRumble", "(III)V")?);
+        let m_on_cursor_shape =
+            CachedMethodId(env.get_method_id(&cls, "onCursorShape", "(JIIII[B)V")?);
+        let m_on_cursor_position =
+            CachedMethodId(env.get_method_id(&cls, "onCursorPosition", "(IIZJ)V")?);
         let m_on_closed =
             CachedMethodId(env.get_method_id(&cls, "onClosed", "(Ljava/lang/String;Z)V")?);
 
@@ -110,11 +116,20 @@ impl JniSessionCallbacks {
             m_on_stats,
             m_on_clipboard_text,
             m_on_rumble,
+            m_on_cursor_shape,
+            m_on_cursor_position,
             m_on_closed,
         })
     }
 
     fn with_env<F>(&self, op: &str, f: F)
+    where
+        F: FnOnce(&mut JNIEnv<'_>) -> jni::errors::Result<()>,
+    {
+        self.with_env_frame(op, 16, f);
+    }
+
+    fn with_env_frame<F>(&self, op: &str, capacity: i32, f: F)
     where
         F: FnOnce(&mut JNIEnv<'_>) -> jni::errors::Result<()>,
     {
@@ -125,7 +140,7 @@ impl JniSessionCallbacks {
                 return;
             }
         };
-        let res = env.with_local_frame(16, |env| {
+        let res = env.with_local_frame(capacity, |env| {
             let call_res = f(env);
             if env.exception_check().unwrap_or(false) {
                 let _ = env.exception_clear();
@@ -359,6 +374,53 @@ impl SessionCallbacks for JniSessionCallbacks {
                 env.call_method_unchecked(
                     &self.callback_obj,
                     self.m_on_rumble.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            Ok(())
+        });
+    }
+
+    fn on_cursor_shape(&self, shape_id: u64, width: u32, height: u32, hotspot_x: u32, hotspot_y: u32, rgba: &[u8]) {
+        self.with_env_frame("onCursorShape", 8, |env| {
+            let j_rgba = env.byte_array_from_slice(rgba)?;
+            let args = [
+                JValue::Long(shape_id as jlong).as_jni(),
+                JValue::Int(width as jint).as_jni(),
+                JValue::Int(height as jint).as_jni(),
+                JValue::Int(hotspot_x as jint).as_jni(),
+                JValue::Int(hotspot_y as jint).as_jni(),
+                JValue::Object(&j_rgba).as_jni(),
+            ];
+            // SAFETY: method ID and signature `(JIIII[B)V` match `VeloxSessionCallback.onCursorShape`.
+            let call_res = unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_cursor_shape.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )
+            };
+            let _ = env.delete_local_ref(j_rgba);
+            call_res?;
+            Ok(())
+        });
+    }
+
+    fn on_cursor_position(&self, x: i32, y: i32, visible: bool, shape_id: u64) {
+        self.with_env_frame("onCursorPosition", 8, |env| {
+            let args = [
+                JValue::Int(x).as_jni(),
+                JValue::Int(y).as_jni(),
+                JValue::Bool(jboolean::from(visible)).as_jni(),
+                JValue::Long(shape_id as jlong).as_jni(),
+            ];
+            // SAFETY: method ID and signature `(IIZJ)V` match `VeloxSessionCallback.onCursorPosition`.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_cursor_position.0,
                     ReturnType::Primitive(Primitive::Void),
                     &args,
                 )?;

@@ -1,12 +1,14 @@
 package dev.veloxdesk.ui
 
 import android.app.Application
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.veloxdesk.BuildConfig
@@ -73,6 +75,7 @@ data class SessionUiState(
     val clipboardEnabled: Boolean = true,
     val bitrateKbps: Int = BitratePreset.BALANCED.kbps,
     val stickyModifiers: Int = 0,
+    val cursor: CursorOverlayState = CursorOverlayState(),
     val lastEndedReason: String? = null,
     val lastEndedWasError: Boolean = false,
 )
@@ -89,6 +92,16 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     private val activeHandle = AtomicLong(0L)
     private val sessionGen = AtomicLong(0L)
     private val firstFrameSeen = AtomicBoolean(false)
+
+    private val cursorCacheLock = Any()
+    private val cursorShapeCache = object : LinkedHashMap<Long, CursorShapeBitmap>(
+        MAX_CURSOR_CACHE_ENTRIES,
+        0.75f,
+        true,
+    ) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, CursorShapeBitmap>?): Boolean =
+            size > MAX_CURSOR_CACHE_ENTRIES
+    }
 
     private val _uiState = MutableStateFlow(SessionUiState())
     val uiState: StateFlow<SessionUiState> = _uiState.asStateFlow()
@@ -121,6 +134,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
     private val inputSink = object : InputSink {
         override fun sendMouseMove(x: Int, y: Int, display: Int) {
+            updateLocalCursorPosition(x.toFloat(), y.toFloat())
             val h = activeHandle.get()
             if (h != 0L && VeloxNative.isLoaded) {
                 VeloxNative.nativeSendMouseMove(h, x, y, display)
@@ -128,6 +142,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         }
 
         override fun sendMouseRelative(dx: Int, dy: Int) {
+            applyLocalCursorDelta(dx, dy)
             val h = activeHandle.get()
             if (h != 0L && VeloxNative.isLoaded) {
                 VeloxNative.nativeSendMouseRelative(h, dx, dy)
@@ -242,6 +257,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         val normalizedTarget = AppPreferences.normalizeTarget(target)
         val gen = sessionGen.incrementAndGet()
         firstFrameSeen.set(false)
+        synchronized(cursorCacheLock) { cursorShapeCache.clear() }
         onSessionConnectedRecord = onConnectedHost
 
         touchController.touchMode = profile.touchMode
@@ -408,8 +424,18 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
                 displays = displays,
             )
 
-            _uiState.update {
-                it.copy(
+            _uiState.update { state ->
+                val initialCursor = if (!state.cursor.hasPosition && width > 0 && height > 0) {
+                    state.cursor.copy(
+                        hostX = width * 0.5f,
+                        hostY = height * 0.5f,
+                        hasPosition = true,
+                        visible = state.touchMode == TouchMode.TRACKPAD,
+                    )
+                } else {
+                    state.cursor
+                }
+                state.copy(
                     statusCode = BridgeConstants.STATUS_CONNECTED,
                     authPrompt = null,
                     sessionInfo = info,
@@ -417,6 +443,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
                     activeDisplay = activeDisplay,
                     videoWidth = width,
                     videoHeight = height,
+                    cursor = initialCursor,
                 )
             }
             mainHandler.post {
@@ -526,6 +553,72 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             gamepadController.applyRumble(appContext, padId, lowFreq, highFreq)
         }
 
+        override fun onCursorShape(
+            shapeId: Long,
+            width: Int,
+            height: Int,
+            hotspotX: Int,
+            hotspotY: Int,
+            rgba: ByteArray,
+        ) {
+            if (sessionGen.get() != gen) return
+            if (width !in 1..MAX_CURSOR_DIM || height !in 1..MAX_CURSOR_DIM) return
+            if (rgba.size != width * height * 4) return
+
+            val argb = rgbaBytesToArgbInts(rgba)
+            val bitmap = runCatching {
+                Bitmap.createBitmap(argb, width, height, Bitmap.Config.ARGB_8888).asImageBitmap()
+            }.getOrNull()
+
+            val shape = CursorShapeBitmap(
+                shapeId = shapeId,
+                width = width,
+                height = height,
+                hotspotX = hotspotX.coerceIn(0, width - 1),
+                hotspotY = hotspotY.coerceIn(0, height - 1),
+                imageBitmap = bitmap,
+            )
+            synchronized(cursorCacheLock) {
+                cursorShapeCache[shapeId] = shape
+            }
+
+            _uiState.update { state ->
+                val cur = state.cursor
+                if (cur.shapeId == shapeId || (cur.shape == null && shapeId != 0L)) {
+                    state.copy(cursor = cur.copy(shapeId = shapeId, shape = shape))
+                } else {
+                    state
+                }
+            }
+        }
+
+        override fun onCursorPosition(x: Int, y: Int, visible: Boolean, shapeId: Long) {
+            if (sessionGen.get() != gen) return
+            val cachedShape = if (shapeId != 0L) {
+                synchronized(cursorCacheLock) { cursorShapeCache[shapeId] }
+            } else {
+                null
+            }
+            _uiState.update { state ->
+                val cur = state.cursor
+                val resolvedShapeId = if (shapeId != 0L) shapeId else cur.shapeId
+                val resolvedShape = when {
+                    shapeId != 0L -> cachedShape ?: if (cur.shape?.shapeId == shapeId) cur.shape else null
+                    else -> cur.shape
+                }
+                state.copy(
+                    cursor = cur.copy(
+                        hostX = x.toFloat(),
+                        hostY = y.toFloat(),
+                        visible = visible,
+                        hasPosition = true,
+                        shapeId = resolvedShapeId,
+                        shape = resolvedShape,
+                    ),
+                )
+            }
+        }
+
         override fun onClosed(reason: String, isError: Boolean) {
             if (sessionGen.get() != gen) return
             activeHandle.set(0L)
@@ -592,6 +685,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         videoDecoder.detachSurface()
         audioPlayer.stop()
         firstFrameSeen.set(false)
+        synchronized(cursorCacheLock) { cursorShapeCache.clear() }
     }
 
     fun onAppBackgrounded() {
@@ -621,6 +715,50 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun onTouchEvent(event: MotionEvent): Boolean = touchController.onTouchEvent(event)
+
+    /**
+     * Immediately updates the local cursor overlay coordinates in host pixels for 0 ms visual
+     * feedback during trackpad drags or direct touches (authoritatively synced by `onCursorPosition`).
+     */
+    fun updateLocalCursorPosition(hostX: Float, hostY: Float) {
+        if (!hostX.isFinite() || !hostY.isFinite()) return
+        _uiState.update { state ->
+            val maxX = (state.videoWidth - 1).coerceAtLeast(0).toFloat()
+            val maxY = (state.videoHeight - 1).coerceAtLeast(0).toFloat()
+            val clampedX = if (maxX > 0f) hostX.coerceIn(0f, maxX) else hostX.coerceAtLeast(0f)
+            val clampedY = if (maxY > 0f) hostY.coerceIn(0f, maxY) else hostY.coerceAtLeast(0f)
+            val isAndroidHost = state.sessionInfo?.hostOs.equals("android", ignoreCase = true)
+            val showCursor = state.touchMode == TouchMode.TRACKPAD || state.cursor.visible || !isAndroidHost
+            state.copy(
+                cursor = state.cursor.copy(
+                    hostX = clampedX,
+                    hostY = clampedY,
+                    visible = showCursor,
+                    hasPosition = true,
+                ),
+            )
+        }
+    }
+
+    private fun applyLocalCursorDelta(dx: Int, dy: Int) {
+        if (dx == 0 && dy == 0) return
+        _uiState.update { state ->
+            val w = state.videoWidth.coerceAtLeast(1)
+            val h = state.videoHeight.coerceAtLeast(1)
+            val baseX = if (state.cursor.hasPosition) state.cursor.hostX else w * 0.5f
+            val baseY = if (state.cursor.hasPosition) state.cursor.hostY else h * 0.5f
+            val nextX = (baseX + dx).coerceIn(0f, (w - 1).toFloat())
+            val nextY = (baseY + dy).coerceIn(0f, (h - 1).toFloat())
+            state.copy(
+                cursor = state.cursor.copy(
+                    hostX = nextX,
+                    hostY = nextY,
+                    visible = true,
+                    hasPosition = true,
+                ),
+            )
+        }
+    }
 
     fun resetZoom() {
         touchController.resetZoom()
@@ -830,6 +968,8 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     companion object {
         private const val HID_ENTER = 0x28
         private const val HID_BACKSPACE = 0x2A
+        private const val MAX_CURSOR_CACHE_ENTRIES = 16
+        private const val MAX_CURSOR_DIM = 256
 
         internal fun parseDisplaysJson(json: String): List<DisplayDescriptor> {
             if (json.isBlank()) return emptyList()

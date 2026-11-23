@@ -51,6 +51,15 @@ pub fn load_or_create_identity(files_dir: &Path) -> anyhow::Result<DeviceIdentit
     DeviceIdentity::load_or_create(&path).with_context(|| format!("loading device identity at {}", path.display()))
 }
 
+/// Validate a host `CursorShape` bitmap (`1..=256` on each axis and exact `width * height * 4` RGBA bytes).
+pub fn is_valid_cursor_shape(width: u32, height: u32, rgba_len: usize) -> bool {
+    width > 0
+        && height > 0
+        && width <= 256
+        && height <= 256
+        && rgba_len == (width as usize) * (height as usize) * 4
+}
+
 /// Callback sink decoupling the pure-Rust viewer core from JNI (also used directly in live tests).
 pub trait SessionCallbacks: Send + Sync + 'static {
     fn on_status(&self, status_code: i32, detail: &str);
@@ -73,6 +82,8 @@ pub trait SessionCallbacks: Send + Sync + 'static {
     fn on_stats(&self, stats: &HudMetrics);
     fn on_clipboard_text(&self, text: &str);
     fn on_rumble(&self, pad_id: i32, low_freq: i32, high_freq: i32);
+    fn on_cursor_shape(&self, _shape_id: u64, _width: u32, _height: u32, _hotspot_x: u32, _hotspot_y: u32, _rgba: &[u8]) {}
+    fn on_cursor_position(&self, _x: i32, _y: i32, _visible: bool, _shape_id: u64) {}
     fn on_closed(&self, reason: &str, is_error: bool);
 }
 
@@ -1189,6 +1200,29 @@ async fn run_session_async(
                         Some(Msg::Rumble(r)) => {
                             callbacks.on_rumble(r.pad_id as i32, r.low_freq as i32, r.high_freq as i32);
                         }
+                        Some(Msg::CursorShape(cs)) => {
+                            if is_valid_cursor_shape(cs.width, cs.height, cs.rgba.len()) {
+                                callbacks.on_cursor_shape(
+                                    cs.id,
+                                    cs.width,
+                                    cs.height,
+                                    cs.hotspot_x,
+                                    cs.hotspot_y,
+                                    &cs.rgba,
+                                );
+                            } else {
+                                tracing::debug!(
+                                    id = cs.id,
+                                    w = cs.width,
+                                    h = cs.height,
+                                    len = cs.rgba.len(),
+                                    "ignoring invalid CursorShape"
+                                );
+                            }
+                        }
+                        Some(Msg::CursorPosition(cp)) => {
+                            callbacks.on_cursor_position(cp.x, cp.y, cp.visible, cp.shape_id);
+                        }
                         Some(Msg::Close(c)) => {
                             let reason = if c.reason.is_empty() {
                                 format!("Host closed session (code {})", c.code)
@@ -1442,5 +1476,17 @@ mod tests {
         let cb: Arc<dyn SessionCallbacks> = Arc::new(NoopCallbacks);
         let res = respond_to_challenge(&challenge, &id, None, &mut pw, &mut rx, &cb).await;
         assert!(res.is_err(), "respond_to_challenge must fail closed when tls_peer_pk is None");
+    }
+
+    #[test]
+    fn cursor_shape_validation_bounds() {
+        assert!(is_valid_cursor_shape(16, 16, 16 * 16 * 4));
+        assert!(is_valid_cursor_shape(256, 256, 256 * 256 * 4));
+        assert!(!is_valid_cursor_shape(0, 16, 0));
+        assert!(!is_valid_cursor_shape(16, 0, 0));
+        assert!(!is_valid_cursor_shape(257, 16, 257 * 16 * 4));
+        assert!(!is_valid_cursor_shape(16, 257, 16 * 257 * 4));
+        assert!(!is_valid_cursor_shape(16, 16, 16 * 16 * 4 - 1));
+        assert!(!is_valid_cursor_shape(16, 16, 16 * 16 * 4 + 4));
     }
 }

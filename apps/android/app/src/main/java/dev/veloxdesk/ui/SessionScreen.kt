@@ -291,6 +291,19 @@ fun SessionScreen(
                         translationY = state.viewport.panY
                     },
             )
+
+            // Hardware cursor / trackpad pointer overlay aligned 1:1 with the video surface
+            if (state.hasFirstVideoFrame) {
+                CursorOverlayCanvas(
+                    cursor = state.cursor,
+                    touchMode = state.touchMode,
+                    videoWidth = state.videoWidth,
+                    videoHeight = state.videoHeight,
+                    scaleMode = state.scaleMode,
+                    viewport = state.viewport,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
         }
 
         // Connecting / waiting status overlay (hidden once first frame arrives)

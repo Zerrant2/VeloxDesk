@@ -16,8 +16,8 @@ use veloxdesk_core_traits::Timestamp;
 use veloxdesk_core_traits::audio::{AudioCapture, AudioCaptureConfig, AudioFormat, AudioFrame};
 use veloxdesk_core_traits::input::{DisplayGeometry, InputCaps, InputFeedback, InputInjector};
 use veloxdesk_core_traits::video::{
-    CaptureCaps, CaptureConfig, CapturedFrame, ColorRange, ColorSpace, Display, DisplayId, Frame, FrameCapture,
-    FrameData, PixelFormat, Plane, VideoCodec,
+    CaptureCaps, CaptureConfig, CapturedFrame, ColorRange, ColorSpace, CursorImage, CursorState, Display, DisplayId,
+    Frame, FrameCapture, FrameData, PixelFormat, Plane, VideoCodec,
 };
 use veloxdesk_crypto::DeviceIdentity;
 use veloxdesk_crypto::auth::{Argon2Params, PasswordHash};
@@ -148,6 +148,16 @@ fn test_backends(
 
 // ───────────────────────── Callback Recorder ─────────────────────────
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecordedCursorShape {
+    shape_id: u64,
+    width: u32,
+    height: u32,
+    hotspot_x: u32,
+    hotspot_y: u32,
+    rgba: Vec<u8>,
+}
+
 #[derive(Default)]
 struct RecordedCallbacks {
     statuses: Mutex<Vec<(i32, String)>>,
@@ -160,6 +170,8 @@ struct RecordedCallbacks {
     audio_nonzero_samples: AtomicUsize,
     stats_events: Mutex<Vec<HudMetrics>>,
     clipboard_texts: Mutex<Vec<String>>,
+    cursor_shapes: Mutex<Vec<RecordedCursorShape>>,
+    cursor_positions: Mutex<Vec<(i32, i32, bool, u64)>>,
     closed: Mutex<Option<(String, bool)>>,
     closed_flag: AtomicBool,
 }
@@ -221,6 +233,21 @@ impl SessionCallbacks for RecordedCallbacks {
     }
 
     fn on_rumble(&self, _pad_id: i32, _low_freq: i32, _high_freq: i32) {}
+
+    fn on_cursor_shape(&self, shape_id: u64, width: u32, height: u32, hotspot_x: u32, hotspot_y: u32, rgba: &[u8]) {
+        self.cursor_shapes.lock().unwrap().push(RecordedCursorShape {
+            shape_id,
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+            rgba: rgba.to_vec(),
+        });
+    }
+
+    fn on_cursor_position(&self, x: i32, y: i32, visible: bool, shape_id: u64) {
+        self.cursor_positions.lock().unwrap().push((x, y, visible, shape_id));
+    }
 
     fn on_closed(&self, reason: &str, is_error: bool) {
         *self.closed.lock().unwrap() = Some((reason.to_string(), is_error));
@@ -658,6 +685,140 @@ async fn live_opus_audio_pcm16_stream() {
         cb.audio_callbacks.load(Ordering::Relaxed),
         cb.audio_nonzero_samples.load(Ordering::Relaxed)
     );
+
+    table.remove(h).unwrap().disconnect();
+    assert!(wait_until(Duration::from_secs(3), || cb.closed_flag.load(Ordering::Acquire)).await);
+    host.stop();
+    let _ = std::fs::remove_dir_all(&files_dir);
+}
+
+// ───────────────────────── Test 7: Live CursorShape & CursorPosition Delivery ─────────────────────────
+
+struct CursorSynthCapture {
+    frame_n: u32,
+}
+
+impl FrameCapture for CursorSynthCapture {
+    fn caps(&self) -> CaptureCaps {
+        CaptureCaps {
+            backend: "synth-cursor-android-test",
+            formats: vec![PixelFormat::Bgra8],
+            separate_cursor: true,
+            ..Default::default()
+        }
+    }
+
+    fn displays(&self) -> Result<Vec<Display>> {
+        Ok(vec![Display {
+            id: DisplayId("ANDROID-CURSOR-TEST".into()),
+            index: 0,
+            name: "Synth Cursor 320x180".into(),
+            x: 0,
+            y: 0,
+            width: 320,
+            height: 180,
+            refresh_hz: 60,
+            scale_factor: 1.0,
+            primary: true,
+            hdr: false,
+        }])
+    }
+
+    fn start(&mut self, _cfg: &CaptureConfig) -> Result<()> {
+        Ok(())
+    }
+
+    fn next_frame(&mut self, timeout_dur: Duration) -> Result<Option<CapturedFrame>> {
+        std::thread::sleep(timeout_dur.min(Duration::from_millis(16)));
+        self.frame_n = self.frame_n.wrapping_add(1);
+        let buf = vec![0x22u8; 320 * 180 * 4];
+        let frame = Frame {
+            width: 320,
+            height: 180,
+            format: PixelFormat::Bgra8,
+            color_space: ColorSpace::Srgb,
+            color_range: ColorRange::Full,
+            data: FrameData::Cpu(vec![Plane { data: Bytes::from(buf), stride: 320 * 4 }]),
+            capture_ts: Timestamp::now(),
+        };
+        let shape = if self.frame_n <= 2 {
+            // 4x4 white RGBA cursor shape with hotspot (1, 2)
+            Some(CursorImage {
+                id: 77,
+                width: 4,
+                height: 4,
+                hotspot_x: 1,
+                hotspot_y: 2,
+                rgba: Bytes::from(vec![0xFFu8; 4 * 4 * 4]),
+            })
+        } else {
+            None
+        };
+        let cursor = Some(CursorState {
+            x: 100 + (self.frame_n as i32),
+            y: 50 + (self.frame_n as i32),
+            visible: true,
+            shape,
+        });
+        Ok(Some(CapturedFrame { frame, dirty_rects: Vec::new(), cursor, capture_us: 20, convert_us: 5 }))
+    }
+
+    fn stop(&mut self) {}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_cursor_shape_and_position_delivery() {
+    let host_id = DeviceIdentity::generate();
+    let files_dir = temp_files_dir("cursor");
+    let injected = Arc::new(Mutex::new(Vec::new()));
+
+    let mut backends = test_backends(injected, None);
+    backends.capture = Arc::new(|_| Ok(Box::new(CursorSynthCapture { frame_n: 0 })));
+
+    let cfg = HostConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        max_fps: 30,
+        bitrate_kbps: 1_500,
+        codec: VideoCodec::H264,
+        prefer_hw: false,
+        prefer_gpu: false,
+        allow_input: true,
+        audio_enabled: false,
+        max_sessions: 1,
+        ipc_port: None,
+        auth: HostAuthConfig::open(),
+        ..Default::default()
+    };
+
+    let host = RunningHost::start(cfg, host_id, backends, None)
+        .await
+        .expect("RunningHost::start");
+    let target = host.local_addr().to_string();
+    let table = Arc::new(HandleTable::new());
+
+    let connect_cfg = make_connect_config(files_dir.clone(), target, None, false);
+    let cb = Arc::new(RecordedCallbacks::default());
+    let h = table.spawn_session(connect_cfg, cb.clone()).unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !cb.cursor_shapes.lock().unwrap().is_empty() && !cb.cursor_positions.lock().unwrap().is_empty()
+        })
+        .await,
+        "expected CursorShape and CursorPosition callbacks from live RunningHost; shapes={}, pos={}",
+        cb.cursor_shapes.lock().unwrap().len(),
+        cb.cursor_positions.lock().unwrap().len()
+    );
+
+    let shape = cb.cursor_shapes.lock().unwrap()[0].clone();
+    assert_eq!(shape.shape_id, 77);
+    assert_eq!((shape.width, shape.height, shape.hotspot_x, shape.hotspot_y), (4, 4, 1, 2));
+    assert_eq!(shape.rgba, vec![0xFFu8; 4 * 4 * 4]);
+
+    let (cx, cy, visible, pos_shape_id) = cb.cursor_positions.lock().unwrap()[0];
+    assert!(visible);
+    assert!(cx >= 101 && cy >= 51);
+    assert_eq!(pos_shape_id, 77);
 
     table.remove(h).unwrap().disconnect();
     assert!(wait_until(Duration::from_secs(3), || cb.closed_flag.load(Ordering::Acquire)).await);

@@ -75,6 +75,19 @@ interface VeloxSessionCallback {
     // JNI: (III)V
     fun onRumble(padId: Int, lowFreq: Int, highFreq: Int)
 
+    // JNI: (JIIII[B)V
+    fun onCursorShape(
+        shapeId: Long,
+        width: Int,
+        height: Int,
+        hotspotX: Int,
+        hotspotY: Int,
+        rgba: ByteArray,
+    )
+
+    // JNI: (IIZJ)V
+    fun onCursorPosition(x: Int, y: Int, visible: Boolean, shapeId: Long)
+
     // JNI: (Ljava/lang/String;Z)V
     fun onClosed(reason: String, isError: Boolean)
 }
