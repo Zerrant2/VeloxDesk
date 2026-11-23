@@ -11,6 +11,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -29,18 +31,26 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ScreenShare
+import androidx.compose.material.icons.automirrored.rounded.StopScreenShare
+import androidx.compose.material.icons.rounded.BrightnessAuto
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Clear
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Computer
 import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.DesktopWindows
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.LightMode
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.SportsEsports
+import androidx.compose.material.icons.rounded.TouchApp
 import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -81,19 +91,23 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.veloxdesk.R
 import dev.veloxdesk.bridge.BridgeConstants
+import dev.veloxdesk.bridge.HostPasswordMode
+import dev.veloxdesk.bridge.HostUiState
 import dev.veloxdesk.data.AppLanguage
 import dev.veloxdesk.data.AppPreferences
 import dev.veloxdesk.data.AppSettings
+import dev.veloxdesk.data.AppThemeMode
 import dev.veloxdesk.data.RecentConnection
 import dev.veloxdesk.data.ReleaseInfo
 import dev.veloxdesk.data.UpdateChecker
 import dev.veloxdesk.ui.i18n.str
-import dev.veloxdesk.ui.theme.VeloxColors
+import dev.veloxdesk.ui.theme.VeloxTheme
 import kotlinx.coroutines.launch
 
 @Composable
 fun ConnectScreen(
     settings: AppSettings,
+    hostState: HostUiState,
     ownDeviceId: String,
     ownFingerprint: String,
     buildDisplay: String,
@@ -105,24 +119,34 @@ fun ConnectScreen(
     lastEndedWasError: Boolean,
     onDismissEndedReason: () -> Unit,
     onLanguageChange: (AppLanguage) -> Unit,
+    onCycleTheme: () -> Unit,
     onOpenSettings: () -> Unit,
+    onStartSharing: () -> Unit,
+    onStopSharing: () -> Unit,
+    onRotateOtp: () -> Unit,
+    onDismissHostError: () -> Unit,
+    onEnableAccessibility: () -> Unit,
     onModeSelected: (Int) -> Unit,
     onConnect: (target: String, mode: Int) -> Unit,
     onRemoveRecent: (target: String) -> Unit,
     onCheckUpdates: () -> Unit,
     snackbarHostState: SnackbarHostState,
 ) {
+    val colors = VeloxTheme.colors
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var targetInput by rememberSaveable { mutableStateOf("") }
     var targetError by remember { mutableStateOf(false) }
 
-    val formattedOwnId = remember(ownDeviceId) {
-        if (ownDeviceId.isBlank()) "" else AppPreferences.formatDeviceId(ownDeviceId)
+    val effectiveDeviceId = hostState.deviceId.ifBlank { ownDeviceId }
+    val formattedOwnId = remember(effectiveDeviceId) {
+        if (effectiveDeviceId.isBlank()) "" else AppPreferences.formatDeviceId(effectiveDeviceId)
     }
     val needsRendezvous = AppPreferences.isNineDigitDeviceId(targetInput) && settings.rendezvousServer.isBlank()
     val copiedIdMsg = str(R.string.copied_device_id)
     val copiedFpMsg = str(R.string.copied_fingerprint)
+    val copiedOtpMsg = str(R.string.copied_otp)
+    val copiedIpMsg = str(R.string.copied_ip)
 
     fun copyToClipboard(label: String, text: String, toastMessage: String) {
         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -143,13 +167,15 @@ fun ConnectScreen(
     }
 
     Scaffold(
-        containerColor = VeloxColors.Background,
+        containerColor = colors.background,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             ConnectTopBar(
                 language = settings.language,
+                themeMode = settings.themeMode,
                 nativeLoaded = nativeLoaded,
                 onLanguageChange = onLanguageChange,
+                onCycleTheme = onCycleTheme,
                 onOpenSettings = onOpenSettings,
             )
         },
@@ -202,13 +228,16 @@ fun ConnectScreen(
                 )
             }
 
-            // "This Device" card
-            ThisDeviceCard(
+            // "Share This Device" card (Android Host Mode)
+            ShareThisDeviceCard(
+                settings = settings,
+                hostState = hostState,
                 formattedDeviceId = formattedOwnId,
                 fingerprint = ownFingerprint,
+                nativeLoaded = nativeLoaded,
                 onCopyDeviceId = {
-                    if (formattedOwnId.isNotEmpty()) {
-                        copyToClipboard("VeloxDesk ID", ownDeviceId, copiedIdMsg)
+                    if (effectiveDeviceId.isNotEmpty()) {
+                        copyToClipboard("VeloxDesk ID", effectiveDeviceId, copiedIdMsg)
                     }
                 },
                 onCopyFingerprint = {
@@ -216,9 +245,20 @@ fun ConnectScreen(
                         copyToClipboard("VeloxDesk Fingerprint", ownFingerprint, copiedFpMsg)
                     }
                 },
+                onCopyIp = { ip ->
+                    copyToClipboard("VeloxDesk IP", ip, copiedIpMsg)
+                },
+                onCopyOtp = { otp ->
+                    copyToClipboard("VeloxDesk OTP", otp, copiedOtpMsg)
+                },
+                onRotateOtp = onRotateOtp,
+                onStartSharing = onStartSharing,
+                onStopSharing = onStopSharing,
+                onDismissHostError = onDismissHostError,
+                onEnableAccessibility = onEnableAccessibility,
             )
 
-            // "Remote PC" card
+            // "Connect to Remote Device" card
             RemotePcCard(
                 targetInput = targetInput,
                 onTargetChange = {
@@ -253,12 +293,15 @@ fun ConnectScreen(
 @Composable
 private fun ConnectTopBar(
     language: AppLanguage,
+    themeMode: AppThemeMode,
     nativeLoaded: Boolean,
     onLanguageChange: (AppLanguage) -> Unit,
+    onCycleTheme: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
+    val colors = VeloxTheme.colors
     Surface(
-        color = VeloxColors.Background,
+        color = colors.background,
         modifier = Modifier
             .fillMaxWidth()
             .statusBarsPadding(),
@@ -273,13 +316,13 @@ private fun ConnectTopBar(
                 modifier = Modifier
                     .size(34.dp)
                     .clip(RoundedCornerShape(10.dp))
-                    .background(VeloxColors.Surface),
+                    .background(colors.surface),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     imageVector = Icons.Rounded.DesktopWindows,
                     contentDescription = null,
-                    tint = VeloxColors.Primary,
+                    tint = colors.primary,
                     modifier = Modifier.size(20.dp),
                 )
             }
@@ -289,23 +332,36 @@ private fun ConnectTopBar(
                     Text(
                         text = str(R.string.app_name),
                         style = MaterialTheme.typography.titleLarge,
-                        color = VeloxColors.TextPrimary,
+                        color = colors.textPrimary,
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Box(
                         modifier = Modifier
                             .size(8.dp)
                             .clip(CircleShape)
-                            .background(if (nativeLoaded) VeloxColors.Emerald else VeloxColors.Danger),
+                            .background(if (nativeLoaded) colors.success else colors.danger),
                     )
                 }
             }
 
+            // Quick theme cycle button (System -> Dark -> Light)
+            IconButton(onClick = onCycleTheme) {
+                Icon(
+                    imageVector = when (themeMode) {
+                        AppThemeMode.SYSTEM -> Icons.Rounded.BrightnessAuto
+                        AppThemeMode.DARK -> Icons.Rounded.DarkMode
+                        AppThemeMode.LIGHT -> Icons.Rounded.LightMode
+                    },
+                    contentDescription = str(R.string.btn_cycle_theme),
+                    tint = colors.textPrimary,
+                )
+            }
+
             // EN / RU compact segmented pill
             Surface(
-                color = VeloxColors.Surface,
+                color = colors.surface,
                 shape = RoundedCornerShape(999.dp),
-                border = BorderStroke(1.dp, VeloxColors.Border),
+                border = BorderStroke(1.dp, colors.border),
             ) {
                 Row(modifier = Modifier.padding(2.dp)) {
                     AppLanguage.entries.forEach { lang ->
@@ -313,7 +369,7 @@ private fun ConnectTopBar(
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(999.dp))
-                                .background(if (selected) VeloxColors.Primary else Color.Transparent)
+                                .background(if (selected) colors.primary else Color.Transparent)
                                 .clickable { onLanguageChange(lang) }
                                 .padding(horizontal = 10.dp, vertical = 5.dp),
                         ) {
@@ -321,19 +377,19 @@ private fun ConnectTopBar(
                                 text = lang.shortLabel,
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold,
-                                color = if (selected) VeloxColors.OnPrimary else VeloxColors.TextSecondary,
+                                color = if (selected) colors.onPrimary else colors.textSecondary,
                             )
                         }
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.width(6.dp))
+            Spacer(modifier = Modifier.width(4.dp))
             IconButton(onClick = onOpenSettings) {
                 Icon(
                     imageVector = Icons.Rounded.Settings,
                     contentDescription = str(R.string.btn_settings),
-                    tint = VeloxColors.TextPrimary,
+                    tint = colors.textPrimary,
                 )
             }
         }
@@ -346,10 +402,11 @@ private fun AlertBanner(
     isError: Boolean,
     onDismiss: (() -> Unit)? = null,
 ) {
+    val colors = VeloxTheme.colors
     Surface(
-        color = if (isError) VeloxColors.DangerContainer else VeloxColors.SurfaceElevated,
+        color = if (isError) colors.dangerContainer else colors.surfaceElevated,
         shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, if (isError) VeloxColors.Danger.copy(alpha = 0.5f) else VeloxColors.Border),
+        border = BorderStroke(1.dp, if (isError) colors.danger.copy(alpha = 0.5f) else colors.border),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
@@ -359,14 +416,14 @@ private fun AlertBanner(
             Icon(
                 imageVector = Icons.Rounded.WarningAmber,
                 contentDescription = null,
-                tint = if (isError) VeloxColors.Danger else VeloxColors.Amber,
+                tint = if (isError) colors.danger else colors.warning,
                 modifier = Modifier.size(20.dp),
             )
             Spacer(modifier = Modifier.width(10.dp))
             Text(
                 text = text,
                 style = MaterialTheme.typography.bodySmall,
-                color = VeloxColors.TextPrimary,
+                color = colors.textPrimary,
                 modifier = Modifier.weight(1f),
             )
             if (onDismiss != null) {
@@ -374,7 +431,7 @@ private fun AlertBanner(
                     Icon(
                         imageVector = Icons.Rounded.Close,
                         contentDescription = str(R.string.btn_close),
-                        tint = VeloxColors.TextSecondary,
+                        tint = colors.textSecondary,
                         modifier = Modifier.size(16.dp),
                     )
                 }
@@ -388,10 +445,11 @@ private fun UpdateAvailableBanner(
     release: ReleaseInfo,
     onOpenRelease: () -> Unit,
 ) {
+    val colors = VeloxTheme.colors
     Surface(
-        color = Color(0xFF0C4A6E).copy(alpha = 0.65f),
+        color = colors.primaryBannerBg,
         shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, VeloxColors.Primary.copy(alpha = 0.6f)),
+        border = BorderStroke(1.dp, colors.primary.copy(alpha = 0.6f)),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
@@ -401,7 +459,7 @@ private fun UpdateAvailableBanner(
             Icon(
                 imageVector = Icons.Rounded.Download,
                 contentDescription = null,
-                tint = VeloxColors.Primary,
+                tint = colors.primary,
                 modifier = Modifier.size(20.dp),
             )
             Spacer(modifier = Modifier.width(10.dp))
@@ -409,20 +467,20 @@ private fun UpdateAvailableBanner(
                 Text(
                     text = str(R.string.update_available_title, release.tagName),
                     style = MaterialTheme.typography.titleMedium,
-                    color = VeloxColors.TextPrimary,
+                    color = colors.textPrimary,
                 )
                 if (release.apkName != null) {
                     Text(
                         text = release.apkName,
                         style = MaterialTheme.typography.bodySmall,
-                        color = VeloxColors.TextSecondary,
+                        color = colors.textSecondary,
                     )
                 }
             }
             TextButton(onClick = onOpenRelease) {
                 Text(
                     text = str(R.string.btn_open_release),
-                    color = VeloxColors.Primary,
+                    color = colors.primary,
                     fontWeight = FontWeight.Bold,
                 )
             }
@@ -430,38 +488,112 @@ private fun UpdateAvailableBanner(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ThisDeviceCard(
+private fun ShareThisDeviceCard(
+    settings: AppSettings,
+    hostState: HostUiState,
     formattedDeviceId: String,
     fingerprint: String,
+    nativeLoaded: Boolean,
     onCopyDeviceId: () -> Unit,
     onCopyFingerprint: () -> Unit,
+    onCopyIp: (String) -> Unit,
+    onCopyOtp: (String) -> Unit,
+    onRotateOtp: () -> Unit,
+    onStartSharing: () -> Unit,
+    onStopSharing: () -> Unit,
+    onDismissHostError: () -> Unit,
+    onEnableAccessibility: () -> Unit,
 ) {
+    val colors = VeloxTheme.colors
+    val statusText = when {
+        hostState.activePeerName != null -> str(R.string.host_status_connected, hostState.activePeerName)
+        hostState.isRunning -> str(R.string.host_status_sharing)
+        else -> str(R.string.host_status_offline)
+    }
+    val statusBg = when {
+        hostState.activePeerName != null -> colors.successContainer
+        hostState.isRunning -> colors.primaryBannerBg
+        else -> colors.background
+    }
+    val statusFg = when {
+        hostState.activePeerName != null -> colors.success
+        hostState.isRunning -> colors.primary
+        else -> colors.textMuted
+    }
+
     Card(
-        colors = CardDefaults.cardColors(containerColor = VeloxColors.Surface),
-        border = BorderStroke(1.dp, VeloxColors.Border),
+        colors = CardDefaults.cardColors(containerColor = colors.surface),
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (hostState.isRunning) colors.primary.copy(alpha = 0.55f) else colors.border,
+        ),
         shape = RoundedCornerShape(16.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = str(R.string.this_device_title),
-                style = MaterialTheme.typography.titleMedium,
-                color = VeloxColors.TextPrimary,
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = str(R.string.this_device_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = colors.textPrimary,
+                    modifier = Modifier.weight(1f),
+                )
+                Surface(
+                    color = statusBg,
+                    shape = RoundedCornerShape(999.dp),
+                    border = BorderStroke(1.dp, statusFg.copy(alpha = 0.45f)),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(statusFg),
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = statusFg,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
             Spacer(modifier = Modifier.height(2.dp))
             Text(
                 text = str(R.string.this_device_subtitle),
                 style = MaterialTheme.typography.bodySmall,
-                color = VeloxColors.TextSecondary,
+                color = colors.textSecondary,
             )
+
+            if (hostState.error != null) {
+                Spacer(modifier = Modifier.height(10.dp))
+                AlertBanner(
+                    text = hostState.error,
+                    isError = true,
+                    onDismiss = onDismissHostError,
+                )
+            }
+
             Spacer(modifier = Modifier.height(12.dp))
 
+            // 9-digit Device ID row
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(12.dp))
-                    .background(VeloxColors.Background)
+                    .background(colors.background)
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -469,7 +601,7 @@ private fun ThisDeviceCard(
                     Text(
                         text = str(R.string.device_id_label),
                         style = MaterialTheme.typography.labelMedium,
-                        color = VeloxColors.TextSecondary,
+                        color = colors.textSecondary,
                     )
                     Text(
                         text = formattedDeviceId.ifEmpty { str(R.string.unavailable) },
@@ -477,7 +609,7 @@ private fun ThisDeviceCard(
                         fontWeight = FontWeight.Bold,
                         fontSize = 22.sp,
                         letterSpacing = 1.5.sp,
-                        color = VeloxColors.Primary,
+                        color = colors.primary,
                     )
                 }
                 if (formattedDeviceId.isNotEmpty()) {
@@ -485,11 +617,133 @@ private fun ThisDeviceCard(
                         Icon(
                             imageVector = Icons.Rounded.ContentCopy,
                             contentDescription = str(R.string.btn_copy),
-                            tint = VeloxColors.Primary,
+                            tint = colors.primary,
                             modifier = Modifier.size(16.dp),
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text(str(R.string.btn_copy), color = VeloxColors.Primary)
+                        Text(str(R.string.btn_copy), color = colors.primary)
+                    }
+                }
+            }
+
+            // Detected LAN & Tailscale IPs
+            val hasIps = hostState.lanIps.isNotEmpty() || !hostState.tailscaleIp.isNullOrBlank()
+            if (hasIps) {
+                Spacer(modifier = Modifier.height(10.dp))
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    hostState.lanIps.forEach { ip ->
+                        CopyableIpChip(
+                            label = str(R.string.host_lan_ip_label),
+                            ip = ip,
+                            accent = colors.primary,
+                            onClick = { onCopyIp(ip) },
+                        )
+                    }
+                    val tsIp = hostState.tailscaleIp
+                    if (!tsIp.isNullOrBlank()) {
+                        CopyableIpChip(
+                            label = str(R.string.host_tailscale_ip_label),
+                            ip = tsIp,
+                            accent = colors.success,
+                            onClick = { onCopyIp(tsIp) },
+                        )
+                    }
+                }
+            }
+
+            // Active OTP / Permanent password status when sharing
+            if (hostState.isRunning) {
+                Spacer(modifier = Modifier.height(10.dp))
+                if (settings.effectiveHostOtpEnabled) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(colors.background)
+                            .padding(start = 14.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = str(R.string.host_otp_label),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = colors.textSecondary,
+                                )
+                                if (settings.hostPasswordMode == HostPasswordMode.BOTH.id &&
+                                    settings.hasHostPermanentPassword
+                                ) {
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Surface(
+                                        color = colors.successContainer,
+                                        shape = RoundedCornerShape(999.dp),
+                                    ) {
+                                        Text(
+                                            text = str(R.string.host_plus_perm_badge),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = colors.success,
+                                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                                        )
+                                    }
+                                }
+                            }
+                            Text(
+                                text = hostState.otp.ifBlank { "—" },
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 20.sp,
+                                letterSpacing = 2.sp,
+                                color = colors.textPrimary,
+                            )
+                        }
+                        if (hostState.otp.isNotBlank()) {
+                            IconButton(onClick = { onCopyOtp(hostState.otp) }) {
+                                Icon(
+                                    imageVector = Icons.Rounded.ContentCopy,
+                                    contentDescription = str(R.string.btn_copy),
+                                    tint = colors.primary,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                        IconButton(onClick = onRotateOtp) {
+                            Icon(
+                                imageVector = Icons.Rounded.Refresh,
+                                contentDescription = str(R.string.btn_rotate),
+                                tint = colors.textSecondary,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                    }
+                } else {
+                    Surface(
+                        color = colors.successContainer,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, colors.success.copy(alpha = 0.45f)),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Lock,
+                                contentDescription = null,
+                                tint = colors.success,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = str(R.string.host_perm_active_badge),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = colors.success,
+                            )
+                        }
                     }
                 }
             }
@@ -507,12 +761,12 @@ private fun ThisDeviceCard(
                     Text(
                         text = "${str(R.string.fingerprint_label)}: ",
                         style = MaterialTheme.typography.bodySmall,
-                        color = VeloxColors.TextMuted,
+                        color = colors.textMuted,
                     )
                     Text(
                         text = fingerprint,
                         style = MaterialTheme.typography.labelSmall,
-                        color = VeloxColors.TextSecondary,
+                        color = colors.textSecondary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
@@ -520,11 +774,171 @@ private fun ThisDeviceCard(
                     Icon(
                         imageVector = Icons.Rounded.ContentCopy,
                         contentDescription = str(R.string.btn_copy),
-                        tint = VeloxColors.TextMuted,
+                        tint = colors.textMuted,
                         modifier = Modifier.size(14.dp),
                     )
                 }
             }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Start / Stop Sharing button
+            if (hostState.isRunning) {
+                Button(
+                    onClick = onStopSharing,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = colors.danger,
+                        contentColor = Color.White,
+                    ),
+                    contentPadding = PaddingValues(vertical = 13.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.StopScreenShare,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = str(R.string.host_stop_sharing),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                    )
+                }
+            } else {
+                Button(
+                    onClick = onStartSharing,
+                    enabled = nativeLoaded && !hostState.isStarting,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = colors.primary,
+                        contentColor = colors.onPrimary,
+                    ),
+                    contentPadding = PaddingValues(vertical = 13.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (hostState.isStarting) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = colors.onPrimary,
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Rounded.ScreenShare,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = str(R.string.host_start_sharing),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                    )
+                }
+            }
+
+            // Accessibility Remote Control status bar
+            Spacer(modifier = Modifier.height(10.dp))
+            Surface(
+                color = if (hostState.accessibilityEnabled) colors.successContainer else colors.warningContainer,
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(
+                    1.dp,
+                    if (hostState.accessibilityEnabled) {
+                        colors.success.copy(alpha = 0.4f)
+                    } else {
+                        colors.warning.copy(alpha = 0.45f)
+                    },
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        imageVector = if (hostState.accessibilityEnabled) {
+                            Icons.Rounded.CheckCircle
+                        } else {
+                            Icons.Rounded.TouchApp
+                        },
+                        contentDescription = null,
+                        tint = if (hostState.accessibilityEnabled) colors.success else colors.warning,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (hostState.accessibilityEnabled) {
+                            str(R.string.host_control_enabled)
+                        } else {
+                            str(R.string.host_control_disabled)
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.textPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (!hostState.accessibilityEnabled) {
+                        TextButton(
+                            onClick = onEnableAccessibility,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        ) {
+                            Text(
+                                text = str(R.string.host_enable_control),
+                                color = colors.primary,
+                                fontWeight = FontWeight.Bold,
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CopyableIpChip(
+    label: String,
+    ip: String,
+    accent: Color,
+    onClick: () -> Unit,
+) {
+    val colors = VeloxTheme.colors
+    Surface(
+        color = colors.background,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, colors.border),
+        modifier = Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "$label:",
+                style = MaterialTheme.typography.labelSmall,
+                color = accent,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(modifier = Modifier.width(5.dp))
+            Text(
+                text = ip,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = colors.textPrimary,
+            )
+            Spacer(modifier = Modifier.width(5.dp))
+            Icon(
+                imageVector = Icons.Rounded.ContentCopy,
+                contentDescription = str(R.string.btn_copy),
+                tint = colors.textMuted,
+                modifier = Modifier.size(13.dp),
+            )
         }
     }
 }
@@ -541,9 +955,10 @@ private fun RemotePcCard(
     onOpenSettings: () -> Unit,
     onConnect: () -> Unit,
 ) {
+    val colors = VeloxTheme.colors
     Card(
-        colors = CardDefaults.cardColors(containerColor = VeloxColors.Surface),
-        border = BorderStroke(1.dp, VeloxColors.Border),
+        colors = CardDefaults.cardColors(containerColor = colors.surface),
+        border = BorderStroke(1.dp, colors.border),
         shape = RoundedCornerShape(16.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
@@ -551,13 +966,13 @@ private fun RemotePcCard(
             Text(
                 text = str(R.string.remote_pc_title),
                 style = MaterialTheme.typography.titleMedium,
-                color = VeloxColors.TextPrimary,
+                color = colors.textPrimary,
             )
             Spacer(modifier = Modifier.height(2.dp))
             Text(
                 text = str(R.string.remote_pc_subtitle),
                 style = MaterialTheme.typography.bodySmall,
-                color = VeloxColors.TextSecondary,
+                color = colors.textSecondary,
             )
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -569,7 +984,7 @@ private fun RemotePcCard(
                 placeholder = {
                     Text(
                         text = str(R.string.target_placeholder),
-                        color = VeloxColors.TextMuted,
+                        color = colors.textMuted,
                     )
                 },
                 trailingIcon = {
@@ -578,25 +993,25 @@ private fun RemotePcCard(
                             Icon(
                                 imageVector = Icons.Rounded.Clear,
                                 contentDescription = null,
-                                tint = VeloxColors.TextSecondary,
+                                tint = colors.textSecondary,
                             )
                         }
                     }
                 },
                 supportingText = if (targetError) {
-                    { Text(str(R.string.err_invalid_target), color = VeloxColors.Danger) }
+                    { Text(str(R.string.err_invalid_target), color = colors.danger) }
                 } else {
                     null
                 },
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
                 keyboardActions = KeyboardActions(onGo = { onConnect() }),
                 colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = VeloxColors.Primary,
-                    unfocusedBorderColor = VeloxColors.Border,
-                    focusedContainerColor = VeloxColors.Background,
-                    unfocusedContainerColor = VeloxColors.Background,
-                    focusedTextColor = VeloxColors.TextPrimary,
-                    unfocusedTextColor = VeloxColors.TextPrimary,
+                    focusedBorderColor = colors.primary,
+                    unfocusedBorderColor = colors.border,
+                    focusedContainerColor = colors.background,
+                    unfocusedContainerColor = colors.background,
+                    focusedTextColor = colors.textPrimary,
+                    unfocusedTextColor = colors.textPrimary,
                 ),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth(),
@@ -605,9 +1020,9 @@ private fun RemotePcCard(
             if (needsRendezvous) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Surface(
-                    color = VeloxColors.Amber.copy(alpha = 0.12f),
+                    color = colors.warningContainer,
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, VeloxColors.Amber.copy(alpha = 0.4f)),
+                    border = BorderStroke(1.dp, colors.warning.copy(alpha = 0.45f)),
                     modifier = Modifier.fillMaxWidth(),
                 ) {
                     Row(
@@ -617,11 +1032,11 @@ private fun RemotePcCard(
                         Text(
                             text = str(R.string.rendezvous_missing_hint),
                             style = MaterialTheme.typography.bodySmall,
-                            color = VeloxColors.Amber,
+                            color = colors.warning,
                             modifier = Modifier.weight(1f),
                         )
                         TextButton(onClick = onOpenSettings) {
-                            Text(str(R.string.btn_configure), color = VeloxColors.Primary)
+                            Text(str(R.string.btn_configure), color = colors.primary)
                         }
                     }
                 }
@@ -631,7 +1046,7 @@ private fun RemotePcCard(
             Text(
                 text = str(R.string.session_mode_label),
                 style = MaterialTheme.typography.labelMedium,
-                color = VeloxColors.TextSecondary,
+                color = colors.textSecondary,
             )
             Spacer(modifier = Modifier.height(6.dp))
 
@@ -661,8 +1076,8 @@ private fun RemotePcCard(
                 enabled = nativeLoaded && targetInput.isNotBlank(),
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = VeloxColors.Primary,
-                    contentColor = VeloxColors.OnPrimary,
+                    containerColor = colors.primary,
+                    contentColor = colors.onPrimary,
                 ),
                 contentPadding = PaddingValues(vertical = 14.dp),
                 modifier = Modifier.fillMaxWidth(),
@@ -691,6 +1106,7 @@ private fun ModeChip(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val colors = VeloxTheme.colors
     FilterChip(
         selected = selected,
         onClick = onClick,
@@ -709,18 +1125,18 @@ private fun ModeChip(
             )
         },
         colors = FilterChipDefaults.filterChipColors(
-            selectedContainerColor = VeloxColors.Primary.copy(alpha = 0.18f),
-            selectedLabelColor = VeloxColors.Primary,
-            selectedLeadingIconColor = VeloxColors.Primary,
-            containerColor = VeloxColors.Background,
-            labelColor = VeloxColors.TextSecondary,
-            iconColor = VeloxColors.TextSecondary,
+            selectedContainerColor = colors.primary.copy(alpha = 0.18f),
+            selectedLabelColor = colors.primary,
+            selectedLeadingIconColor = colors.primary,
+            containerColor = colors.background,
+            labelColor = colors.textSecondary,
+            iconColor = colors.textSecondary,
         ),
         border = FilterChipDefaults.filterChipBorder(
             enabled = true,
             selected = selected,
-            borderColor = VeloxColors.Border,
-            selectedBorderColor = VeloxColors.Primary,
+            borderColor = colors.border,
+            selectedBorderColor = colors.primary,
         ),
         shape = RoundedCornerShape(12.dp),
         modifier = modifier.height(44.dp),
@@ -733,9 +1149,10 @@ private fun RecentConnectionsCard(
     onConnectRecent: (RecentConnection) -> Unit,
     onRemoveRecent: (String) -> Unit,
 ) {
+    val colors = VeloxTheme.colors
     Card(
-        colors = CardDefaults.cardColors(containerColor = VeloxColors.Surface),
-        border = BorderStroke(1.dp, VeloxColors.Border),
+        colors = CardDefaults.cardColors(containerColor = colors.surface),
+        border = BorderStroke(1.dp, colors.border),
         shape = RoundedCornerShape(16.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
@@ -744,14 +1161,14 @@ private fun RecentConnectionsCard(
                 Icon(
                     imageVector = Icons.Rounded.History,
                     contentDescription = null,
-                    tint = VeloxColors.TextSecondary,
+                    tint = colors.textSecondary,
                     modifier = Modifier.size(18.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = str(R.string.recent_connections_title),
                     style = MaterialTheme.typography.titleMedium,
-                    color = VeloxColors.TextPrimary,
+                    color = colors.textPrimary,
                 )
             }
             Spacer(modifier = Modifier.height(10.dp))
@@ -760,12 +1177,12 @@ private fun RecentConnectionsCard(
                 Text(
                     text = str(R.string.recent_connections_empty),
                     style = MaterialTheme.typography.bodySmall,
-                    color = VeloxColors.TextMuted,
+                    color = colors.textMuted,
                 )
             } else {
                 recent.forEachIndexed { idx, entry ->
                     if (idx > 0) {
-                        HorizontalDivider(color = VeloxColors.Border.copy(alpha = 0.5f))
+                        HorizontalDivider(color = colors.border.copy(alpha = 0.5f))
                     }
                     Row(
                         modifier = Modifier
@@ -781,7 +1198,7 @@ private fun RecentConnectionsCard(
                                 Icons.Rounded.Computer
                             },
                             contentDescription = null,
-                            tint = VeloxColors.Primary,
+                            tint = colors.primary,
                             modifier = Modifier.size(20.dp),
                         )
                         Spacer(modifier = Modifier.width(12.dp))
@@ -790,7 +1207,7 @@ private fun RecentConnectionsCard(
                                 text = entry.label,
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.Medium,
-                                color = VeloxColors.TextPrimary,
+                                color = colors.textPrimary,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -802,7 +1219,7 @@ private fun RecentConnectionsCard(
                                         str(R.string.mode_desktop)
                                     },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = VeloxColors.TextSecondary,
+                                color = colors.textSecondary,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -811,7 +1228,7 @@ private fun RecentConnectionsCard(
                             Icon(
                                 imageVector = Icons.Rounded.DeleteOutline,
                                 contentDescription = str(R.string.btn_remove),
-                                tint = VeloxColors.TextMuted,
+                                tint = colors.textMuted,
                                 modifier = Modifier.size(18.dp),
                             )
                         }
@@ -828,9 +1245,10 @@ private fun ConnectBottomBar(
     checkingUpdate: Boolean,
     onCheckUpdates: () -> Unit,
 ) {
+    val colors = VeloxTheme.colors
     Surface(
-        color = VeloxColors.Surface,
-        border = BorderStroke(1.dp, VeloxColors.Border),
+        color = colors.surface,
+        border = BorderStroke(1.dp, colors.border),
         modifier = Modifier
             .fillMaxWidth()
             .navigationBarsPadding(),
@@ -844,7 +1262,7 @@ private fun ConnectBottomBar(
             Text(
                 text = buildDisplay,
                 style = MaterialTheme.typography.labelSmall,
-                color = VeloxColors.TextSecondary,
+                color = colors.textSecondary,
                 modifier = Modifier.weight(1f),
             )
             TextButton(
@@ -855,20 +1273,20 @@ private fun ConnectBottomBar(
                     CircularProgressIndicator(
                         modifier = Modifier.size(14.dp),
                         strokeWidth = 2.dp,
-                        color = VeloxColors.Primary,
+                        color = colors.primary,
                     )
                 } else {
                     Icon(
                         imageVector = Icons.Rounded.Refresh,
                         contentDescription = null,
-                        tint = VeloxColors.Primary,
+                        tint = colors.primary,
                         modifier = Modifier.size(16.dp),
                     )
                 }
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
                     text = str(R.string.btn_check_updates),
-                    color = VeloxColors.Primary,
+                    color = colors.primary,
                     style = MaterialTheme.typography.labelMedium,
                 )
             }

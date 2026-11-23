@@ -673,6 +673,7 @@ impl App {
         self.terminal.connected = false;
         self.tunnels.open = false;
         self.tunnels.active.clear();
+        self.session_info.host_os.clear();
         self.session_info.privacy_mode = false;
         self.session_info.files_open = false;
         self.session_info.terminal_open = false;
@@ -783,17 +784,7 @@ impl App {
 
     /// Host display pixel for a video pixel (the host may stream a scaled image).
     fn video_to_host(&self, config: &SessionConfig, vx: i32, vy: i32) -> (i32, i32, u32) {
-        let disp = config.displays.iter().find(|d| d.index == config.active_display);
-        let video = config.video.as_ref();
-        match (disp, video, self.surface.as_ref().and_then(|s| s.video_size())) {
-            (Some(d), _, Some((fw, fh))) if fw > 0 && fh > 0 && d.width > 0 => (
-                (vx as i64 * d.width as i64 / fw as i64) as i32,
-                (vy as i64 * d.height as i64 / fh as i64) as i32,
-                d.index,
-            ),
-            (_, Some(v), _) if v.width > 0 => (vx, vy, config.active_display),
-            _ => (vx, vy, config.active_display),
-        }
+        map_video_to_host(config, self.surface.as_ref().and_then(|s| s.video_size()), vx, vy)
     }
 
     fn apply_toolbar(&mut self, a: ToolbarAction, event_loop: &ActiveEventLoop) {
@@ -802,6 +793,14 @@ impl App {
                 self.sync_language();
                 self.save_settings();
                 if let Some(s) = &self.surface {
+                    s.window().request_redraw();
+                }
+            }
+            ToolbarAction::SetTheme(pref) => {
+                self.settings.theme = pref;
+                self.save_settings();
+                if let Some(s) = &self.surface {
+                    s.set_theme_preference(pref.to_egui());
                     s.window().request_redraw();
                 }
             }
@@ -913,6 +912,21 @@ impl App {
             }
             ToolbarAction::ToggleHud => self.toggle_hud(),
             ToolbarAction::ToggleFullscreen => self.toggle_fullscreen(),
+            ToolbarAction::AndroidBack => {
+                for ev in input::android_back_events() {
+                    self.send_input(ev);
+                }
+            }
+            ToolbarAction::AndroidHome => {
+                for ev in input::android_home_events() {
+                    self.send_input(ev);
+                }
+            }
+            ToolbarAction::AndroidRecents => {
+                for ev in input::android_recents_events() {
+                    self.send_input(ev);
+                }
+            }
             ToolbarAction::OpenSettings => self.settings_open = true,
             ToolbarAction::CheckForUpdates => {
                 self.check_for_updates_bg(true);
@@ -1075,9 +1089,11 @@ impl App {
                         egui::Area::new(egui::Id::unique("veloxdesk-wait"))
                             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                             .show(ui.ctx(), |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label(t.waiting_for_video);
+                                veloxdesk_ui::theme::overlay_frame(ui).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(t.waiting_for_video);
+                                    });
                                 });
                             });
                     }
@@ -1192,6 +1208,13 @@ impl App {
                 UiAction::Connect(ConnectAction::SetLanguage(_)) => {
                     self.sync_language();
                     if let Some(s) = &self.surface {
+                        s.window().request_redraw();
+                    }
+                }
+                UiAction::Connect(ConnectAction::SetTheme(pref)) => {
+                    self.settings.theme = pref;
+                    if let Some(s) = &self.surface {
+                        s.set_theme_preference(pref.to_egui());
                         s.window().request_redraw();
                     }
                 }
@@ -1402,8 +1425,21 @@ impl App {
                     _ => {}
                 }
             }
-            SessionEvent::PasswordPrompt { host_device_id, host_fingerprint, methods_hint, error } => {
-                let mut p = PasswordPrompt::new(host_device_id, host_fingerprint, methods_hint);
+            SessionEvent::PasswordPrompt {
+                host_device_id,
+                host_fingerprint,
+                methods_hint,
+                allow_otp,
+                allow_perm,
+                error,
+            } => {
+                let mut p = PasswordPrompt::new_with_methods(
+                    host_device_id,
+                    host_fingerprint,
+                    methods_hint,
+                    allow_otp,
+                    allow_perm,
+                );
                 p.error = error;
                 self.password_prompt = Some(p);
             }
@@ -1412,6 +1448,9 @@ impl App {
                 self.session_info.displays = cfg.displays.clone();
                 self.session_info.active_display = cfg.active_display;
                 self.session_info.host_name = cfg.host_name.clone();
+                if !cfg.host_os.is_empty() {
+                    self.session_info.host_os = cfg.host_os.clone();
+                }
                 if let Some(s) = &self.surface {
                     s.window()
                         .set_title(&tr(self.settings.language).fmt_window_title_host(&cfg.host_name));
@@ -1428,6 +1467,12 @@ impl App {
                     }
                     other => other,
                 };
+            }
+            SessionEvent::VideoConfig(v) => {
+                if let State::Session { handle, config, .. } = &mut self.state {
+                    handle.shared.hud.lock().snapshot.resolution = (v.width, v.height);
+                    config.video = Some(*v);
+                }
             }
             SessionEvent::DisplayList(displays) => {
                 self.session_info.displays = displays.clone();
@@ -1765,6 +1810,29 @@ impl App {
     }
 }
 
+fn map_video_to_host(config: &SessionConfig, frame_size: Option<(u32, u32)>, vx: i32, vy: i32) -> (i32, i32, u32) {
+    let disp = config.displays.iter().find(|d| d.index == config.active_display);
+    let video = config.video.as_ref();
+    match (disp, video, frame_size) {
+        (Some(d), _, Some((fw, fh))) if fw > 0 && fh > 0 && d.width > 0 && d.height > 0 => {
+            // Handle mid-session portrait <-> landscape rotation (e.g. Android host) even if a
+            // rotated video frame arrives before the matching DisplayList update.
+            let (dw, dh) = if d.width != d.height && fw != fh && (d.width > d.height) != (fw > fh) {
+                (d.height, d.width)
+            } else {
+                (d.width, d.height)
+            };
+            (
+                (vx as i64 * dw as i64 / fw as i64) as i32,
+                (vy as i64 * dh as i64 / fh as i64) as i32,
+                d.index,
+            )
+        }
+        (_, Some(v), _) if v.width > 0 => (vx, vy, config.active_display),
+        _ => (vx, vy, config.active_display),
+    }
+}
+
 fn print_test_report(tp: &TestPatternState, mode: Option<veloxdesk_core_traits::render::PresentMode>, info: Option<&veloxdesk_render::wgpu::AdapterInfo>) {
     let n = tp.render.len().max(1) as u32;
     let p = |s: &LatencySamples, q: f64| s.percentile(q).unwrap_or(0);
@@ -1832,6 +1900,7 @@ impl ApplicationHandler<UserEvent> for App {
         };
         match VideoSurface::new(window, opts) {
             Ok(mut s) => {
+                s.set_theme_preference(self.settings.theme.to_egui());
                 s.set_hud_visible(prof.show_hud);
                 s.set_hud_labels(hud_labels_for(self.settings.language));
                 self.session_info.hud_visible = prof.show_hud;
@@ -2201,5 +2270,37 @@ mod tests {
         assert!(!is_fullscreen_shortcut(KeyCode::KeyF, ModifiersState::empty()));
         assert!(!is_fullscreen_shortcut(KeyCode::F11, ModifiersState::empty()));
         assert!(!is_fullscreen_shortcut(KeyCode::F11, ctrl_shift));
+    }
+
+    #[test]
+    fn map_video_to_host_handles_android_portrait_and_landscape_rotation() {
+        use veloxdesk_protocol::control::DisplayInfo;
+
+        let mut cfg = SessionConfig {
+            host_name: "Pixel-9".into(),
+            host_os: "android".into(),
+            active_display: 0,
+            displays: vec![DisplayInfo {
+                index: 0,
+                name: "Android".into(),
+                width: 1080,
+                height: 2400,
+                primary: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // 1. Portrait stream (540x1200) -> scales 2x cleanly to 1080x2400 host coordinates.
+        assert_eq!(map_video_to_host(&cfg, Some((540, 1200)), 270, 600), (540, 1200, 0));
+
+        // 2. Rotated landscape frame (1200x540) arrives before DisplayList catches up:
+        //    orientation-aware fallback swaps display dimensions to 2400x1080 instead of stretching.
+        assert_eq!(map_video_to_host(&cfg, Some((1200, 540)), 600, 270), (1200, 540, 0));
+
+        // 3. DisplayList catches up to landscape (2400x1080) -> exact 2x mapping.
+        cfg.displays[0].width = 2400;
+        cfg.displays[0].height = 1080;
+        assert_eq!(map_video_to_host(&cfg, Some((1200, 540)), 600, 270), (1200, 540, 0));
     }
 }

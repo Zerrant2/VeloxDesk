@@ -99,6 +99,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
@@ -123,7 +124,23 @@ import dev.veloxdesk.input.KeyMapper
 import dev.veloxdesk.input.SpecialKeyDef
 import dev.veloxdesk.ui.i18n.str
 import dev.veloxdesk.ui.theme.VeloxColors
+import dev.veloxdesk.ui.theme.VeloxTheme
 import java.util.Locale
+
+/**
+ * Normalizes password/OTP input when auto-uppercase OTP mode is enabled:
+ * strips whitespace and converts ASCII lowercase letters to uppercase.
+ * Leaves input completely untouched when [uppercaseMode] is `false`.
+ */
+internal fun transformPasswordInput(input: String, uppercaseMode: Boolean): String {
+    if (!uppercaseMode) return input
+    val sb = StringBuilder(input.length)
+    for (ch in input) {
+        if (ch.isWhitespace()) continue
+        sb.append(if (ch in 'a'..'z') ch.uppercaseChar() else ch)
+    }
+    return sb.toString()
+}
 
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
@@ -381,11 +398,12 @@ fun SessionScreen(
 
         // Back-press / Disconnect confirmation dialog
         if (showDisconnectConfirm) {
+            val colors = VeloxTheme.colors
             AlertDialog(
                 onDismissRequest = { showDisconnectConfirm = false },
-                containerColor = VeloxColors.Surface,
-                titleContentColor = VeloxColors.TextPrimary,
-                textContentColor = VeloxColors.TextSecondary,
+                containerColor = colors.surface,
+                titleContentColor = colors.textPrimary,
+                textContentColor = colors.textSecondary,
                 title = { Text(str(R.string.disconnect_confirm_title)) },
                 text = {
                     val host = state.sessionInfo?.hostName?.ifBlank { null }
@@ -399,7 +417,7 @@ fun SessionScreen(
                             onDisconnect()
                         },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = VeloxColors.Danger,
+                            containerColor = colors.danger,
                             contentColor = Color.White,
                         ),
                     ) {
@@ -408,7 +426,7 @@ fun SessionScreen(
                 },
                 dismissButton = {
                     TextButton(onClick = { showDisconnectConfirm = false }) {
-                        Text(str(R.string.btn_cancel), color = VeloxColors.TextSecondary)
+                        Text(str(R.string.btn_cancel), color = colors.textSecondary)
                     }
                 },
             )
@@ -994,9 +1012,11 @@ private fun AuthPasswordDialog(
     onSubmit: (String) -> Unit,
     onCancel: () -> Unit,
 ) {
+    val colors = VeloxTheme.colors
     // Keep password strictly in transient memory (never rememberSaveable, never logged!)
     var password by remember(prompt) { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
+    var uppercaseMode by remember(prompt) { mutableStateOf(prompt.allowOtp && !prompt.allowPerm) }
 
     val methodsHint = when {
         prompt.allowPerm && prompt.allowOtp -> str(R.string.auth_hint_both)
@@ -1013,14 +1033,14 @@ private fun AuthPasswordDialog(
             dismissOnBackPress = true,
             dismissOnClickOutside = false,
         ),
-        containerColor = VeloxColors.Surface,
-        titleContentColor = VeloxColors.TextPrimary,
-        textContentColor = VeloxColors.TextSecondary,
+        containerColor = colors.surface,
+        titleContentColor = colors.textPrimary,
+        textContentColor = colors.textSecondary,
         icon = {
             Icon(
                 imageVector = Icons.Rounded.Lock,
                 contentDescription = null,
-                tint = VeloxColors.Primary,
+                tint = colors.primary,
             )
         },
         title = { Text(str(R.string.auth_title)) },
@@ -1030,7 +1050,7 @@ private fun AuthPasswordDialog(
                     Text(
                         text = str(R.string.auth_host_id, AppPreferences.formatDeviceId(prompt.hostDeviceId)),
                         style = MaterialTheme.typography.bodyMedium,
-                        color = VeloxColors.TextPrimary,
+                        color = colors.textPrimary,
                         fontWeight = FontWeight.Medium,
                     )
                 }
@@ -1039,31 +1059,33 @@ private fun AuthPasswordDialog(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(10.dp))
-                            .background(VeloxColors.Background)
+                            .background(colors.background)
                             .padding(10.dp),
                     ) {
                         Text(
                             text = str(R.string.auth_fingerprint),
                             style = MaterialTheme.typography.bodySmall,
-                            color = VeloxColors.TextMuted,
+                            color = colors.textMuted,
                         )
                         Spacer(modifier = Modifier.height(3.dp))
                         Text(
                             text = prompt.hostFingerprint,
                             fontFamily = FontFamily.Monospace,
                             fontSize = 12.sp,
-                            color = VeloxColors.Primary,
+                            color = colors.primary,
                         )
                     }
                 }
                 Text(
                     text = methodsHint,
                     style = MaterialTheme.typography.bodySmall,
-                    color = VeloxColors.TextSecondary,
+                    color = colors.textSecondary,
                 )
                 OutlinedTextField(
                     value = password,
-                    onValueChange = { password = it },
+                    onValueChange = { raw ->
+                        password = transformPasswordInput(raw, uppercaseMode)
+                    },
                     singleLine = true,
                     label = { Text(str(R.string.auth_password_label)) },
                     visualTransformation = if (showPassword) {
@@ -1072,19 +1094,54 @@ private fun AuthPasswordDialog(
                         PasswordVisualTransformation()
                     },
                     trailingIcon = {
-                        IconButton(onClick = { showPassword = !showPassword }) {
-                            Icon(
-                                imageVector = if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
-                                contentDescription = if (showPassword) {
-                                    str(R.string.auth_hide_password)
-                                } else {
-                                    str(R.string.auth_show_password)
-                                },
-                                tint = VeloxColors.TextSecondary,
-                            )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                            modifier = Modifier.padding(end = 4.dp),
+                        ) {
+                            if (prompt.allowOtp) {
+                                Surface(
+                                    color = if (uppercaseMode) colors.primary.copy(alpha = 0.2f) else Color.Transparent,
+                                    shape = RoundedCornerShape(6.dp),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (uppercaseMode) colors.primary else colors.border,
+                                    ),
+                                    modifier = Modifier.clickable {
+                                        uppercaseMode = !uppercaseMode
+                                        if (uppercaseMode) {
+                                            password = transformPasswordInput(password, true)
+                                        }
+                                    },
+                                ) {
+                                    Text(
+                                        text = str(R.string.auth_caps_chip),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (uppercaseMode) colors.primary else colors.textSecondary,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+                                    )
+                                }
+                            }
+                            IconButton(onClick = { showPassword = !showPassword }) {
+                                Icon(
+                                    imageVector = if (showPassword) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                    contentDescription = if (showPassword) {
+                                        str(R.string.auth_hide_password)
+                                    } else {
+                                        str(R.string.auth_show_password)
+                                    },
+                                    tint = colors.textSecondary,
+                                )
+                            }
                         }
                     },
                     keyboardOptions = KeyboardOptions(
+                        capitalization = if (uppercaseMode) {
+                            KeyboardCapitalization.Characters
+                        } else {
+                            KeyboardCapitalization.None
+                        },
                         keyboardType = KeyboardType.Password,
                         autoCorrectEnabled = false,
                         imeAction = ImeAction.Done,
@@ -1099,12 +1156,12 @@ private fun AuthPasswordDialog(
                         },
                     ),
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = VeloxColors.Primary,
-                        unfocusedBorderColor = VeloxColors.Border,
-                        focusedContainerColor = VeloxColors.Background,
-                        unfocusedContainerColor = VeloxColors.Background,
-                        focusedTextColor = VeloxColors.TextPrimary,
-                        unfocusedTextColor = VeloxColors.TextPrimary,
+                        focusedBorderColor = colors.primary,
+                        unfocusedBorderColor = colors.border,
+                        focusedContainerColor = colors.background,
+                        unfocusedContainerColor = colors.background,
+                        focusedTextColor = colors.textPrimary,
+                        unfocusedTextColor = colors.textPrimary,
                     ),
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth(),
@@ -1120,8 +1177,8 @@ private fun AuthPasswordDialog(
                 },
                 enabled = password.isNotEmpty(),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = VeloxColors.Primary,
-                    contentColor = VeloxColors.OnPrimary,
+                    containerColor = colors.primary,
+                    contentColor = colors.onPrimary,
                 ),
                 contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp),
             ) {
@@ -1135,7 +1192,7 @@ private fun AuthPasswordDialog(
                     onCancel()
                 },
             ) {
-                Text(str(R.string.btn_cancel), color = VeloxColors.TextSecondary)
+                Text(str(R.string.btn_cancel), color = colors.textSecondary)
             }
         },
     )

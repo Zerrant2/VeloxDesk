@@ -117,4 +117,79 @@ object VeloxNative {
 
     @JvmStatic
     external fun nativeSendClipboardText(handle: Long, text: String)
+
+    // ───────────────────────────── Host / Password Hashing (v0.4.0) ─────────────────────────────
+
+    @JvmStatic
+    external fun nativeHashPassword(password: String): String
+
+    @JvmStatic
+    external fun nativeIsValidPhcHash(phc: String): Boolean
+
+    @JvmStatic
+    external fun nativeHostStart(
+        filesDir: String,
+        rendezvousAddr: String,
+        deviceName: String,
+        width: Int,
+        height: Int,
+        fps: Int,
+        passwordMode: Int,
+        permanentHashPhc: String,
+        requireAccept: Boolean,
+        trustedPeersJson: String,
+        callback: VeloxHostCallback,
+    ): Long
+
+    @JvmStatic
+    external fun nativeHostStop(handle: Long)
+
+    @JvmStatic
+    external fun nativeHostPushVideoFrame(
+        handle: Long,
+        data: ByteArray,
+        isKeyframe: Boolean,
+        ptsUs: Long,
+        width: Int,
+        height: Int,
+    )
+
+    @JvmStatic
+    external fun nativeHostPushAudioPcm(
+        handle: Long,
+        pcm16: ShortArray,
+        sampleRate: Int,
+        channels: Int,
+    )
+
+    @JvmStatic
+    external fun nativeHostUpdateDisplay(handle: Long, width: Int, height: Int, fps: Int)
+
+    @JvmStatic
+    external fun nativeHostRotateOtp(handle: Long)
+
+    @JvmStatic
+    external fun nativeHostUpdateAuth(
+        handle: Long,
+        passwordMode: Int,
+        permanentHashPhc: String,
+        requireAccept: Boolean,
+    )
+
+    @JvmStatic
+    external fun nativeHostRemoveTrustedPeer(handle: Long, pubKeyHex: String)
+
+    @JvmStatic
+    external fun nativeHostRespondApproval(
+        handle: Long,
+        requestId: Long,
+        accepted: Boolean,
+        rememberPeer: Boolean,
+        allowInput: Boolean,
+        allowClipboard: Boolean,
+        allowAudio: Boolean,
+    )
+
+    @JvmStatic
+    external fun nativeHostSendClipboardText(handle: Long, text: String)
 }

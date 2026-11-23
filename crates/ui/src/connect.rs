@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use veloxdesk_protocol::{DEFAULT_DIRECT_PORT, DEFAULT_RENDEZVOUS_PORT};
 
 use crate::i18n::tr;
-use crate::settings::{Language, Mode, PasswordMode, Settings};
+use crate::settings::{Language, Mode, PasswordMode, Settings, ThemePreference};
 
 /// Parse a 9-digit VeloxDesk Device ID (ignores spaces and dashes, e.g. `"123 456 789"`).
 pub fn parse_device_id(input: &str) -> Option<String> {
@@ -165,6 +165,8 @@ pub enum ConnectAction {
     ExitFullscreen,
     /// Switch interface language from the Connect screen header.
     SetLanguage(Language),
+    /// Switch desktop color theme (`System` / `Dark` / `Light`) from the Connect screen header.
+    SetTheme(ThemePreference),
     /// Download, stage, replace executable, and relaunch into the available release.
     StartUpdate,
     /// Hide the update banner for the current run.
@@ -234,6 +236,16 @@ impl ConnectScreen {
                     t = tr(settings.language);
                     action = Some(ConnectAction::SetLanguage(settings.language));
                 }
+                ui.separator();
+                let before_theme = settings.theme;
+                for th in ThemePreference::ALL {
+                    ui.selectable_value(&mut settings.theme, th, th.label_for(settings.language))
+                        .on_hover_text(t.theme_switch_tooltip);
+                }
+                if settings.theme != before_theme {
+                    settings.save_to_or_default(self.settings_path.as_deref());
+                    action = Some(ConnectAction::SetTheme(settings.theme));
+                }
             });
             ui.add_space(4.0);
             let build_label = if self.build_display.is_empty() {
@@ -288,11 +300,12 @@ impl ConnectScreen {
 
     fn show_update_banner(&self, ui: &mut egui::Ui, lang: Language, action: &mut Option<ConnectAction>) {
         let t = tr(lang);
+        let pal = crate::theme::palette_for(ui);
         match &self.update_state {
             UpdateUiState::Available { current, latest, notes, html_url } if !self.update_dismissed => {
                 egui::Frame::group(ui.style())
-                    .fill(egui::Color32::from_rgb(28, 52, 74))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 155, 220)))
+                    .fill(pal.info_banner_bg)
+                    .stroke(egui::Stroke::new(1.0, pal.info_banner_stroke))
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
@@ -300,7 +313,7 @@ impl ConnectScreen {
                             ui.label(
                                 egui::RichText::new(t.fmt_update_available(latest, current))
                                     .strong()
-                                    .color(egui::Color32::from_rgb(185, 230, 255)),
+                                    .color(pal.info_banner_text),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button(t.update_later_btn).clicked() {
@@ -312,7 +325,7 @@ impl ConnectScreen {
                                 let btn = egui::Button::new(
                                     egui::RichText::new(t.update_now_btn)
                                         .strong()
-                                        .color(egui::Color32::from_rgb(130, 235, 150)),
+                                        .color(pal.success),
                                 );
                                 if ui.add(btn).clicked() {
                                     *action = Some(ConnectAction::StartUpdate);
@@ -328,15 +341,15 @@ impl ConnectScreen {
             }
             UpdateUiState::Downloading { progress, status } => {
                 egui::Frame::group(ui.style())
-                    .fill(egui::Color32::from_rgb(28, 52, 74))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 155, 220)))
+                    .fill(pal.info_banner_bg)
+                    .stroke(egui::Stroke::new(1.0, pal.info_banner_stroke))
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.spinner();
                             let label = if status.is_empty() { t.update_downloading } else { status.as_str() };
-                            ui.label(label);
+                            ui.label(egui::RichText::new(label).color(pal.info_banner_text));
                         });
                         if let Some(p) = progress {
                             ui.add_space(4.0);
@@ -347,14 +360,14 @@ impl ConnectScreen {
             }
             UpdateUiState::Error(err) if !self.update_dismissed => {
                 egui::Frame::group(ui.style())
-                    .fill(egui::Color32::from_rgb(68, 28, 28))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(210, 95, 95)))
+                    .fill(pal.error_banner_bg)
+                    .stroke(egui::Stroke::new(1.0, pal.error_banner_stroke))
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal_wrapped(|ui| {
                             ui.colored_label(
-                                egui::Color32::from_rgb(255, 145, 145),
+                                pal.error_banner_text,
                                 t.fmt_update_error(err),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -375,20 +388,18 @@ impl ConnectScreen {
 
     fn show_this_desk(&mut self, ui: &mut egui::Ui, settings: &mut Settings, action: &mut Option<ConnectAction>) {
         let t = tr(settings.language);
+        let pal = crate::theme::palette_for(ui);
         egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(t.this_desk_heading).size(18.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (dot_color, pill) = if self.active_sessions > 0 {
-                        (
-                            egui::Color32::from_rgb(100, 190, 255),
-                            t.active_sessions_pill(self.active_sessions),
-                        )
+                        (pal.info, t.active_sessions_pill(self.active_sessions))
                     } else if self.host_running {
-                        (egui::Color32::from_rgb(110, 230, 140), t.status_ready.into())
+                        (pal.success, t.status_ready.into())
                     } else {
-                        (egui::Color32::from_rgb(150, 150, 160), t.status_offline.into())
+                        (pal.muted, t.status_offline.into())
                     };
                     // Right-to-left places the first widget on the far right, so emit the pill
                     // first and the status dot second to paint `[dot] [pill]` right-aligned.
@@ -444,7 +455,7 @@ impl ConnectScreen {
             if perm_only_active {
                 ui.label(egui::RichText::new(t.settings_permanent_password).small().weak());
                 ui.colored_label(
-                    egui::Color32::from_rgb(130, 225, 160),
+                    pal.success,
                     egui::RichText::new(t.connect_permanent_active).strong(),
                 );
             } else {
@@ -452,7 +463,7 @@ impl ConnectScreen {
                     ui.label(egui::RichText::new(t.otp_label).small().weak());
                     if settings.password_mode == PasswordMode::Both && settings.has_permanent_password() {
                         ui.colored_label(
-                            egui::Color32::from_rgb(130, 210, 255),
+                            pal.info,
                             egui::RichText::new(t.connect_plus_permanent_badge).small().strong(),
                         );
                     }
@@ -489,7 +500,7 @@ impl ConnectScreen {
             }
 
             if let Some(note) = &self.copied_notice {
-                ui.colored_label(egui::Color32::from_rgb(130, 225, 160), note);
+                ui.colored_label(pal.success, note);
             }
 
             ui.add_space(10.0);
@@ -508,16 +519,16 @@ impl ConnectScreen {
             };
             ui.label(t.host_status_line(status_text));
             if let Some(err) = &self.host_error {
-                ui.colored_label(egui::Color32::from_rgb(255, 110, 110), err);
+                ui.colored_label(pal.danger, err);
             }
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let toggle_label = if self.host_running { t.stop_hosting_btn } else { t.start_hosting_btn };
                 let toggle_text = if self.host_running {
-                    egui::RichText::new(toggle_label).color(egui::Color32::from_rgb(255, 140, 130))
+                    egui::RichText::new(toggle_label).color(pal.danger)
                 } else {
-                    egui::RichText::new(toggle_label).color(egui::Color32::from_rgb(130, 235, 150))
+                    egui::RichText::new(toggle_label).color(pal.success)
                 };
                 if ui.add(egui::Button::new(toggle_text).min_size(egui::vec2(120.0, 28.0))).clicked() {
                     *action = Some(ConnectAction::ToggleHost(!self.host_running));
@@ -586,8 +597,9 @@ impl ConnectScreen {
                 });
             }
             if let Some(e) = &self.error {
+                let pal = crate::theme::palette_for(ui);
                 ui.add_space(4.0);
-                ui.colored_label(egui::Color32::from_rgb(255, 110, 110), e);
+                ui.colored_label(pal.danger, e);
             }
 
             if !settings.recent.is_empty() {
@@ -657,13 +669,10 @@ impl ConnectScreen {
             } else {
                 let mut connect_peer_addr: Option<String> = None;
                 egui::ScrollArea::vertical().id_salt("veloxdesk-ts-peers").max_height(180.0).show(ui, |ui| {
+                    let pal = crate::theme::palette_for(ui);
                     for peer in &self.tailscale.peers {
                         ui.horizontal(|ui| {
-                            let dot_color = if peer.online {
-                                egui::Color32::from_rgb(110, 230, 140)
-                            } else {
-                                egui::Color32::from_rgb(140, 140, 150)
-                            };
+                            let dot_color = if peer.online { pal.success } else { pal.muted };
                             crate::icons::status_dot_widget(ui, 10.0, dot_color);
                             ui.label(egui::RichText::new(&peer.name).strong());
                             ui.weak(&peer.ip);
@@ -1465,5 +1474,70 @@ mod tests {
             out_both.textures_delta.clear();
             assert!(out_both.shapes.iter().any(|c| find_text_rect(&c.shape, t.connect_plus_permanent_badge).is_some()));
         }
+    }
+
+    #[test]
+    fn connect_screen_header_theme_switcher_emits_set_theme_and_renders_dark_and_light() {
+        let dir = std::env::temp_dir().join(format!("veloxdesk-connect-theme-{}", std::process::id()));
+        let path = dir.join("veloxdesk-settings.json");
+        let ctx = egui::Context::default();
+        let make_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            events,
+            ..Default::default()
+        };
+        let mut settings = Settings::default();
+        let mut screen = ConnectScreen::new(&settings);
+        screen.settings_path = Some(path.clone());
+
+        let mut warm = ctx.run_ui(make_input(Vec::new()), |ui| {
+            let _ = screen.show(ui, &mut settings, false);
+        });
+        warm.textures_delta.clear();
+        let light_pos = warm
+            .shapes
+            .iter()
+            .find_map(|c| find_text_center(&c.shape, "Light"))
+            .expect("Light theme button in ConnectScreen header");
+
+        let mut action = None;
+        for pressed in [true, false] {
+            let mut out = ctx.run_ui(
+                make_input(vec![
+                    egui::Event::PointerMoved(light_pos),
+                    egui::Event::PointerButton {
+                        pos: light_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]),
+                |ui| {
+                    if let Some(a) = screen.show(ui, &mut settings, false) {
+                        action = Some(a);
+                    }
+                },
+            );
+            out.textures_delta.clear();
+        }
+        assert_eq!(action, Some(ConnectAction::SetTheme(ThemePreference::Light)));
+        assert_eq!(settings.theme, ThemePreference::Light);
+        assert_eq!(Settings::load(&path).unwrap().theme, ThemePreference::Light);
+
+        // Render both Dark and Light contexts with banners active.
+        for pref in [egui::ThemePreference::Dark, egui::ThemePreference::Light] {
+            ctx.set_theme(pref);
+            screen.update_state = UpdateUiState::Available {
+                current: "0.3.0".into(),
+                latest: "0.4.0".into(),
+                notes: "Themes & Android host".into(),
+                html_url: "https://example.invalid".into(),
+            };
+            let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                let _ = screen.show(ui, &mut settings, false);
+            });
+            out.textures_delta.clear();
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

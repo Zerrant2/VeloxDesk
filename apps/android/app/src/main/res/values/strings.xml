@@ -14,6 +14,19 @@
     <string name="btn_check_updates">Check Updates</string>
     <string name="btn_open_release">Download</string>
     <string name="btn_configure">Configure</string>
+    <string name="btn_save">Save</string>
+    <string name="btn_clear">Clear</string>
+    <string name="btn_rotate">Rotate</string>
+    <string name="btn_accept">Accept</string>
+    <string name="btn_reject">Reject</string>
+    <string name="btn_revoke">Revoke</string>
+
+    <!-- Theme -->
+    <string name="settings_theme">Theme</string>
+    <string name="theme_system">System</string>
+    <string name="theme_dark">Dark</string>
+    <string name="theme_light">Light</string>
+    <string name="btn_cycle_theme">Switch theme</string>
 
     <!-- Modes -->
     <string name="mode_desktop">Desktop</string>
@@ -39,16 +52,45 @@
     <string name="fps_120">120 FPS</string>
 
     <!-- Connect Screen -->
-    <string name="this_device_title">This Device</string>
-    <string name="this_device_subtitle">Share this ID or fingerprint to trust this Android viewer on a Host PC.</string>
+    <string name="this_device_title">Share This Device</string>
+    <string name="this_device_subtitle">Allow another PC or phone to view and control this Android device.</string>
     <string name="device_id_label">Device ID</string>
     <string name="fingerprint_label">Ed25519 Fingerprint</string>
     <string name="copied_device_id">Device ID copied</string>
     <string name="copied_fingerprint">Fingerprint copied</string>
+    <string name="copied_otp">One-time password copied</string>
+    <string name="copied_ip">IP address copied</string>
     <string name="unavailable">Unavailable</string>
 
-    <string name="remote_pc_title">Remote PC</string>
-    <string name="remote_pc_subtitle">Connect via LAN IP, Tailscale IP, or 9-digit Device ID.</string>
+    <!-- Android Host Card -->
+    <string name="host_status_sharing">Sharing</string>
+    <string name="host_status_connected">Connected: %1$s</string>
+    <string name="host_status_offline">Not sharing</string>
+    <string name="host_lan_ip_label">LAN IP</string>
+    <string name="host_tailscale_ip_label">Tailscale IP</string>
+    <string name="host_otp_label">One-Time Password (OTP)</string>
+    <string name="host_perm_active_badge">Permanent password active</string>
+    <string name="host_plus_perm_badge">+ Permanent</string>
+    <string name="host_start_sharing">Start Sharing</string>
+    <string name="host_stop_sharing">Stop Sharing</string>
+    <string name="host_control_enabled">Remote control enabled</string>
+    <string name="host_control_disabled">Remote control off (view-only works now)</string>
+    <string name="host_enable_control">Enable Control</string>
+    <string name="host_capture_denied">Screen capture permission was denied</string>
+
+    <!-- Host Accept Prompt Dialog -->
+    <string name="host_accept_title">Incoming Connection</string>
+    <string name="host_accept_peer_id">Caller ID: %1$s</string>
+    <string name="host_accept_peer_fp">Caller Fingerprint:</string>
+    <string name="host_accept_permissions">Permissions</string>
+    <string name="host_accept_perm_input">Remote touch &amp; keyboard control</string>
+    <string name="host_accept_perm_clipboard">Clipboard synchronization</string>
+    <string name="host_accept_perm_audio">Audio streaming</string>
+    <string name="host_accept_remember">Remember this device (passwordless reconnect)</string>
+    <string name="host_peer_unknown">Unknown device</string>
+
+    <string name="remote_pc_title">Connect to Remote Device</string>
+    <string name="remote_pc_subtitle">Connect to a PC or Android phone via LAN IP, Tailscale IP, or 9-digit ID.</string>
     <string name="target_placeholder">IP, IP:port, or 9-digit ID</string>
     <string name="session_mode_label">Session Mode</string>
     <string name="rendezvous_missing_hint">Connecting by 9-digit Device ID requires a Rendezvous server address.</string>
@@ -86,6 +128,27 @@
     <string name="settings_show_hud">Show Performance HUD on Connect</string>
     <string name="settings_show_hud_desc">Display real-time FPS, latency, loss, and decoder telemetry.</string>
 
+    <!-- Host Access & Security Settings -->
+    <string name="settings_section_host_security">Host Access &amp; Security</string>
+    <string name="settings_host_pw_mode">Password Mode</string>
+    <string name="host_pw_mode_otp">One-time only</string>
+    <string name="host_pw_mode_permanent">Permanent only</string>
+    <string name="host_pw_mode_both">Both (OTP + Permanent)</string>
+    <string name="host_pw_permanent_fallback_hint">No permanent password set yet — OTP stays active as fallback until you save one.</string>
+    <string name="settings_host_perm_pw_label">Permanent Password</string>
+    <string name="settings_host_perm_status_set">Set</string>
+    <string name="settings_host_perm_status_unset">Not set</string>
+    <string name="settings_host_perm_pw_placeholder">At least 6 characters</string>
+    <string name="settings_host_perm_pw_min_len">Permanent password must be at least 6 characters.</string>
+    <string name="settings_host_perm_pw_saved">Permanent password saved</string>
+    <string name="settings_host_perm_pw_cleared">Permanent password cleared</string>
+    <string name="settings_host_perm_pw_hash_failed">Failed to hash password</string>
+    <string name="settings_host_require_accept">Require Accept Confirmation</string>
+    <string name="settings_host_require_accept_desc">Show an approval dialog for incoming connections. Disable with a permanent password for unattended access.</string>
+    <string name="settings_host_trusted_title">Trusted Devices</string>
+    <string name="settings_host_trusted_empty">No trusted devices yet.</string>
+    <string name="settings_host_trusted_revoked">Trusted device removed</string>
+
     <!-- Session Screen & Status -->
     <string name="status_connecting">Connecting to %1$s…</string>
     <string name="status_waiting_host">Locating host via rendezvous…</string>
@@ -107,6 +170,8 @@
     <string name="auth_password_label">Password / OTP</string>
     <string name="auth_show_password">Show password</string>
     <string name="auth_hide_password">Hide password</string>
+    <string name="auth_caps_chip">CAPS</string>
+    <string name="auth_caps_desc">Auto-uppercase for OTP entry</string>
 
     <!-- Disconnect Confirm -->
     <string name="disconnect_confirm_title">Disconnect session?</string>

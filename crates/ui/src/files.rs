@@ -256,12 +256,11 @@ impl FileManagerWindow {
                         });
                         self.new_name.clear();
                     }
+                    let pal = crate::theme::palette_for(ui);
                     if ui
                         .add_enabled(
                             selected_entry.is_some(),
-                            egui::Button::new(
-                                egui::RichText::new(t.files_delete_btn).color(egui::Color32::from_rgb(255, 120, 120)),
-                            ),
+                            egui::Button::new(egui::RichText::new(t.files_delete_btn).color(pal.danger)),
                         )
                         .clicked()
                         && let Some(e) = &selected_entry
@@ -285,7 +284,8 @@ impl FileManagerWindow {
                     ui.weak(s);
                 }
                 if let Some(e) = &self.error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 110, 110), e);
+                    let pal = crate::theme::palette_for(ui);
+                    ui.colored_label(pal.danger, e);
                 }
             });
         self.open = open;

@@ -20,12 +20,15 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use jni::objects::{GlobalRef, JClass, JMethodID, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JMethodID, JObject, JShortArray, JString, JValue};
 use jni::signature::{Primitive, ReturnType};
 use jni::sys::{jboolean, jint, jlong, jsize, jstring};
 use jni::{JNIEnv, JavaVM};
 use veloxdesk_protocol::control::SessionConfig;
 
+use crate::host::{
+    AndroidHostConfig, HostCallbacks, HostHandleTable, HostPasswordMode, hash_password_phc, is_valid_phc_hash,
+};
 use crate::session::{ConnectConfig, HandleTable, SessionCallbacks, load_or_create_identity};
 use crate::stats::HudMetrics;
 use crate::{BUILD_DISPLAY, SecretString};
@@ -33,6 +36,11 @@ use crate::{BUILD_DISPLAY, SecretString};
 fn handles() -> &'static Arc<HandleTable> {
     static TABLE: OnceLock<Arc<HandleTable>> = OnceLock::new();
     TABLE.get_or_init(|| Arc::new(HandleTable::new()))
+}
+
+fn host_handles() -> &'static Arc<HostHandleTable> {
+    static TABLE: OnceLock<Arc<HostHandleTable>> = OnceLock::new();
+    TABLE.get_or_init(|| Arc::new(HostHandleTable::new()))
 }
 
 /// Wrapper making a cached `JMethodID` `Send + Sync`.
@@ -854,5 +862,675 @@ pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeSendClipboard
         if let Some(h) = handles().get(id) {
             h.send_clipboard_text(s);
         }
+    }));
+}
+
+// ───────────────────────── Android Host JNI Callbacks ─────────────────────────
+
+struct JniHostCallbacks {
+    vm: JavaVM,
+    callback_obj: GlobalRef,
+    m_on_listening: CachedMethodId,
+    m_on_otp_rotated: CachedMethodId,
+    m_on_approval_requested: CachedMethodId,
+    m_on_trusted_peer_added: CachedMethodId,
+    m_on_session_started: CachedMethodId,
+    m_on_session_ended: CachedMethodId,
+    m_on_bitrate_changed: CachedMethodId,
+    m_on_keyframe_requested: CachedMethodId,
+    m_on_input_event: CachedMethodId,
+    m_on_clipboard_text: CachedMethodId,
+    m_on_error: CachedMethodId,
+    m_on_stopped: CachedMethodId,
+}
+
+impl JniHostCallbacks {
+    fn from_env(env: &mut JNIEnv<'_>, callback: &JObject<'_>) -> jni::errors::Result<Self> {
+        let vm = env.get_java_vm()?;
+        let callback_obj = env.new_global_ref(callback)?;
+        let cls = env.get_object_class(callback)?;
+
+        let m_on_listening = CachedMethodId(env.get_method_id(
+            &cls,
+            "onHostListening",
+            "(Ljava/lang/String;Ljava/lang/String;I)V",
+        )?);
+        let m_on_otp_rotated =
+            CachedMethodId(env.get_method_id(&cls, "onHostOtpRotated", "(Ljava/lang/String;)V")?);
+        let m_on_approval_requested = CachedMethodId(env.get_method_id(
+            &cls,
+            "onHostApprovalRequested",
+            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        )?);
+        let m_on_trusted_peer_added =
+            CachedMethodId(env.get_method_id(&cls, "onHostTrustedPeerAdded", "(Ljava/lang/String;)V")?);
+        let m_on_session_started = CachedMethodId(env.get_method_id(
+            &cls,
+            "onHostSessionStarted",
+            "(Ljava/lang/String;Ljava/lang/String;II)V",
+        )?);
+        let m_on_session_ended = CachedMethodId(env.get_method_id(
+            &cls,
+            "onHostSessionEnded",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+        )?);
+        let m_on_bitrate_changed = CachedMethodId(env.get_method_id(&cls, "onHostBitrateChanged", "(I)V")?);
+        let m_on_keyframe_requested = CachedMethodId(env.get_method_id(&cls, "onHostKeyframeRequested", "()V")?);
+        let m_on_input_event = CachedMethodId(env.get_method_id(
+            &cls,
+            "onHostInputEvent",
+            "(IIIIZIIILjava/lang/String;)V",
+        )?);
+        let m_on_clipboard_text =
+            CachedMethodId(env.get_method_id(&cls, "onHostClipboardText", "(Ljava/lang/String;)V")?);
+        let m_on_error = CachedMethodId(env.get_method_id(&cls, "onHostError", "(Ljava/lang/String;)V")?);
+        let m_on_stopped = CachedMethodId(env.get_method_id(&cls, "onHostStopped", "()V")?);
+
+        Ok(Self {
+            vm,
+            callback_obj,
+            m_on_listening,
+            m_on_otp_rotated,
+            m_on_approval_requested,
+            m_on_trusted_peer_added,
+            m_on_session_started,
+            m_on_session_ended,
+            m_on_bitrate_changed,
+            m_on_keyframe_requested,
+            m_on_input_event,
+            m_on_clipboard_text,
+            m_on_error,
+            m_on_stopped,
+        })
+    }
+
+    fn with_env<F>(&self, op: &str, f: F)
+    where
+        F: FnOnce(&mut JNIEnv<'_>) -> jni::errors::Result<()>,
+    {
+        let mut env = match self.vm.attach_current_thread_as_daemon() {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!("JNI attach failed in host callback {op}: {e}");
+                return;
+            }
+        };
+        let res = env.with_local_frame(16, |env| {
+            let call_res = f(env);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+                tracing::warn!("cleared Java exception thrown inside host callback {op}");
+            }
+            call_res
+        });
+        if let Err(e) = res {
+            tracing::debug!("JNI host callback {op} error: {e}");
+        }
+    }
+}
+
+impl HostCallbacks for JniHostCallbacks {
+    fn on_listening(&self, device_id: &str, otp: &str, port: u16) {
+        self.with_env("onHostListening", |env| {
+            let j_id = env.new_string(device_id)?;
+            let j_otp = env.new_string(otp)?;
+            let args = [
+                JValue::Object(&j_id).as_jni(),
+                JValue::Object(&j_otp).as_jni(),
+                JValue::Int(i32::from(port)).as_jni(),
+            ];
+            // SAFETY: method ID and signature `(Ljava/lang/String;Ljava/lang/String;I)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_listening.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_id);
+            let _ = env.delete_local_ref(j_otp);
+            Ok(())
+        });
+    }
+
+    fn on_otp_rotated(&self, otp: &str) {
+        self.with_env("onHostOtpRotated", |env| {
+            let j_otp = env.new_string(otp)?;
+            let args = [JValue::Object(&j_otp).as_jni()];
+            // SAFETY: method ID and signature `(Ljava/lang/String;)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_otp_rotated.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_otp);
+            Ok(())
+        });
+    }
+
+    fn on_approval_requested(
+        &self,
+        request_id: u64,
+        peer_device_id: &str,
+        peer_name: &str,
+        peer_fingerprint: &str,
+        peer_pub_key_hex: &str,
+    ) {
+        self.with_env("onHostApprovalRequested", |env| {
+            let j_id = env.new_string(peer_device_id)?;
+            let j_name = env.new_string(peer_name)?;
+            let j_fp = env.new_string(peer_fingerprint)?;
+            let j_pk = env.new_string(peer_pub_key_hex)?;
+            let args = [
+                JValue::Long(request_id as jlong).as_jni(),
+                JValue::Object(&j_id).as_jni(),
+                JValue::Object(&j_name).as_jni(),
+                JValue::Object(&j_fp).as_jni(),
+                JValue::Object(&j_pk).as_jni(),
+            ];
+            // SAFETY: method ID and signature match `VeloxHostCallback.onHostApprovalRequested`.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_approval_requested.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_id);
+            let _ = env.delete_local_ref(j_name);
+            let _ = env.delete_local_ref(j_fp);
+            let _ = env.delete_local_ref(j_pk);
+            Ok(())
+        });
+    }
+
+    fn on_trusted_peer_added(&self, peer_json: &str) {
+        self.with_env("onHostTrustedPeerAdded", |env| {
+            let j_json = env.new_string(peer_json)?;
+            let args = [JValue::Object(&j_json).as_jni()];
+            // SAFETY: method ID and signature `(Ljava/lang/String;)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_trusted_peer_added.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_json);
+            Ok(())
+        });
+    }
+
+    fn on_session_started(&self, peer_device_id: &str, peer_name: &str, requested_bitrate_kbps: u32, requested_fps: u32) {
+        self.with_env("onHostSessionStarted", |env| {
+            let j_id = env.new_string(peer_device_id)?;
+            let j_name = env.new_string(peer_name)?;
+            let args = [
+                JValue::Object(&j_id).as_jni(),
+                JValue::Object(&j_name).as_jni(),
+                JValue::Int(requested_bitrate_kbps as jint).as_jni(),
+                JValue::Int(requested_fps as jint).as_jni(),
+            ];
+            // SAFETY: method ID and signature `(Ljava/lang/String;Ljava/lang/String;II)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_session_started.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_id);
+            let _ = env.delete_local_ref(j_name);
+            Ok(())
+        });
+    }
+
+    fn on_session_ended(&self, peer_device_id: &str, reason: &str) {
+        self.with_env("onHostSessionEnded", |env| {
+            let j_id = env.new_string(peer_device_id)?;
+            let j_reason = env.new_string(reason)?;
+            let args = [JValue::Object(&j_id).as_jni(), JValue::Object(&j_reason).as_jni()];
+            // SAFETY: method ID and signature `(Ljava/lang/String;Ljava/lang/String;)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_session_ended.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_id);
+            let _ = env.delete_local_ref(j_reason);
+            Ok(())
+        });
+    }
+
+    fn on_bitrate_changed(&self, bitrate_kbps: u32) {
+        self.with_env("onHostBitrateChanged", |env| {
+            let args = [JValue::Int(bitrate_kbps as jint).as_jni()];
+            // SAFETY: method ID and signature `(I)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_bitrate_changed.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            Ok(())
+        });
+    }
+
+    fn on_keyframe_requested(&self) {
+        self.with_env("onHostKeyframeRequested", |env| {
+            // SAFETY: method ID and signature `()V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_keyframe_requested.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &[],
+                )?;
+            }
+            Ok(())
+        });
+    }
+
+    fn on_input_event(
+        &self,
+        kind: i32,
+        x: i32,
+        y: i32,
+        code: i32,
+        down: bool,
+        modifiers: i32,
+        dx: i32,
+        dy: i32,
+        text: &str,
+    ) {
+        self.with_env("onHostInputEvent", |env| {
+            let j_text = env.new_string(text)?;
+            let args = [
+                JValue::Int(kind).as_jni(),
+                JValue::Int(x).as_jni(),
+                JValue::Int(y).as_jni(),
+                JValue::Int(code).as_jni(),
+                JValue::Bool(jboolean::from(down)).as_jni(),
+                JValue::Int(modifiers).as_jni(),
+                JValue::Int(dx).as_jni(),
+                JValue::Int(dy).as_jni(),
+                JValue::Object(&j_text).as_jni(),
+            ];
+            // SAFETY: method ID and signature `(IIIIZIIILjava/lang/String;)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_input_event.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_text);
+            Ok(())
+        });
+    }
+
+    fn on_clipboard_text(&self, text: &str) {
+        self.with_env("onHostClipboardText", |env| {
+            let j_text = env.new_string(text)?;
+            let args = [JValue::Object(&j_text).as_jni()];
+            // SAFETY: method ID and signature `(Ljava/lang/String;)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_clipboard_text.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_text);
+            Ok(())
+        });
+    }
+
+    fn on_error(&self, message: &str) {
+        self.with_env("onHostError", |env| {
+            let j_msg = env.new_string(message)?;
+            let args = [JValue::Object(&j_msg).as_jni()];
+            // SAFETY: method ID and signature `(Ljava/lang/String;)V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_error.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &args,
+                )?;
+            }
+            let _ = env.delete_local_ref(j_msg);
+            Ok(())
+        });
+    }
+
+    fn on_stopped(&self) {
+        self.with_env("onHostStopped", |env| {
+            // SAFETY: method ID and signature `()V` match.
+            unsafe {
+                env.call_method_unchecked(
+                    &self.callback_obj,
+                    self.m_on_stopped.0,
+                    ReturnType::Primitive(Primitive::Void),
+                    &[],
+                )?;
+            }
+            Ok(())
+        });
+    }
+}
+
+// ───────────────────────── Android Host & Password JNI Entrypoints ─────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHashPassword<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    password: JString<'local>,
+) -> jstring {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(pw) = jstring_to_rust(&mut env, &password).map(SecretString::new) else {
+            return rust_to_jstring(&mut env, "");
+        };
+        let phc = match hash_password_phc(pw.as_str()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("nativeHashPassword failed: {e}");
+                String::new()
+            }
+        };
+        drop(pw);
+        rust_to_jstring(&mut env, &phc)
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeIsValidPhcHash<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    phc: JString<'local>,
+) -> jboolean {
+    catch_unwind(AssertUnwindSafe(|| {
+        let valid = jstring_to_rust(&mut env, &phc).is_some_and(|s| is_valid_phc_hash(&s));
+        jboolean::from(valid)
+    }))
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostStart<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    files_dir: JString<'local>,
+    rendezvous_addr: JString<'local>,
+    device_name: JString<'local>,
+    width: jint,
+    height: jint,
+    fps: jint,
+    password_mode: jint,
+    permanent_hash_phc: JString<'local>,
+    require_accept: jboolean,
+    trusted_peers_json: JString<'local>,
+    callback: JObject<'local>,
+) -> jlong {
+    catch_unwind(AssertUnwindSafe(|| {
+        if callback.is_null() {
+            return 0;
+        }
+        let callbacks = match JniHostCallbacks::from_env(&mut env, &callback) {
+            Ok(cb) => Arc::new(cb),
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+                tracing::error!("nativeHostStart: failed to bind VeloxHostCallback: {e}");
+                return 0;
+            }
+        };
+
+        let Some(files_dir_str) = jstring_to_rust(&mut env, &files_dir) else {
+            callbacks.on_error("Missing filesDir");
+            return 0;
+        };
+        let rendezvous_str = jstring_to_rust(&mut env, &rendezvous_addr).unwrap_or_default();
+        let device_name_str = jstring_to_rust(&mut env, &device_name).unwrap_or_default();
+        let perm_hash_str = jstring_to_rust(&mut env, &permanent_hash_phc).unwrap_or_default();
+        let trusted_json_str = jstring_to_rust(&mut env, &trusted_peers_json).unwrap_or_default();
+
+        let cfg = AndroidHostConfig {
+            files_dir: PathBuf::from(files_dir_str),
+            bind_addr: None,
+            rendezvous_addr: rendezvous_str,
+            device_name: device_name_str,
+            width: width.max(16) as u32,
+            height: height.max(16) as u32,
+            fps: fps.clamp(15, 60) as u32,
+            password_mode: HostPasswordMode::from_i32(password_mode),
+            permanent_hash_phc: perm_hash_str,
+            require_accept: require_accept != 0,
+            trusted_peers_json: trusted_json_str,
+        };
+
+        match host_handles().spawn_host(cfg, callbacks.clone()) {
+            Ok(id) => id as jlong,
+            Err(e) => {
+                callbacks.on_error(&format!("Failed to start host: {e:#}"));
+                0
+            }
+        }
+    }))
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostStop<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    let _ = catch_unwind(|| {
+        if let Some(id) = handle_id_from_jlong(handle)
+            && let Some(h) = host_handles().remove(id)
+        {
+            // Non-blocking shutdown signal; host thread emits `onHostStopped()` and releases GlobalRef.
+            h.stop();
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostPushVideoFrame<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    data: JByteArray<'local>,
+    is_keyframe: jboolean,
+    pts_us: jlong,
+    width: jint,
+    height: jint,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if data.is_null() || width <= 0 || height <= 0 {
+            return;
+        }
+        let Some(id) = handle_id_from_jlong(handle) else { return };
+        let Some(h) = host_handles().get(id) else { return };
+        let bytes = match env.convert_byte_array(&data) {
+            Ok(b) => b,
+            Err(_) => {
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+                return;
+            }
+        };
+        if !bytes.is_empty() {
+            h.push_video_frame(bytes, is_keyframe != 0, pts_us, width as u32, height as u32);
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostPushAudioPcm<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    pcm16: JShortArray<'local>,
+    sample_rate: jint,
+    channels: jint,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if pcm16.is_null() || sample_rate <= 0 || (channels != 1 && channels != 2) {
+            return;
+        }
+        let Some(id) = handle_id_from_jlong(handle) else { return };
+        let Some(h) = host_handles().get(id) else { return };
+        let len = match env.get_array_length(&pcm16) {
+            Ok(l) if l > 0 && l <= 1_048_576 => l as usize,
+            Ok(_) => return,
+            Err(_) => {
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+                return;
+            }
+        };
+        let mut buf = vec![0i16; len];
+        if env.get_short_array_region(&pcm16, 0, &mut buf).is_err() {
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            return;
+        }
+        h.push_audio_pcm(&buf, sample_rate as u32, channels as u16);
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostUpdateDisplay<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    width: jint,
+    height: jint,
+    fps: jint,
+) {
+    let _ = catch_unwind(|| {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        if let Some(id) = handle_id_from_jlong(handle)
+            && let Some(h) = host_handles().get(id)
+        {
+            h.update_display(width as u32, height as u32, fps.max(0) as u32);
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostRotateOtp<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    let _ = catch_unwind(|| {
+        if let Some(id) = handle_id_from_jlong(handle)
+            && let Some(h) = host_handles().get(id)
+        {
+            h.rotate_otp();
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostUpdateAuth<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    password_mode: jint,
+    permanent_hash_phc: JString<'local>,
+    require_accept: jboolean,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = handle_id_from_jlong(handle) else { return };
+        let Some(h) = host_handles().get(id) else { return };
+        let phc = jstring_to_rust(&mut env, &permanent_hash_phc).unwrap_or_default();
+        h.update_auth(HostPasswordMode::from_i32(password_mode), &phc, require_accept != 0);
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostRemoveTrustedPeer<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    pub_key_hex: JString<'local>,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = handle_id_from_jlong(handle) else { return };
+        let Some(h) = host_handles().get(id) else { return };
+        let Some(hex) = jstring_to_rust(&mut env, &pub_key_hex) else { return };
+        let _ = h.remove_trusted_peer(&hex);
+    }));
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostRespondApproval<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    request_id: jlong,
+    accepted: jboolean,
+    remember_peer: jboolean,
+    allow_input: jboolean,
+    allow_clipboard: jboolean,
+    allow_audio: jboolean,
+) {
+    let _ = catch_unwind(|| {
+        let Ok(req_id) = u64::try_from(request_id) else { return };
+        if let Some(id) = handle_id_from_jlong(handle)
+            && let Some(h) = host_handles().get(id)
+        {
+            let _ = h.respond_approval(
+                req_id,
+                accepted != 0,
+                remember_peer != 0,
+                allow_input != 0,
+                allow_clipboard != 0,
+                allow_audio != 0,
+            );
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_veloxdesk_bridge_VeloxNative_nativeHostSendClipboardText<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    text: JString<'local>,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(id) = handle_id_from_jlong(handle) else { return };
+        let Some(h) = host_handles().get(id) else { return };
+        let Some(s) = jstring_to_rust(&mut env, &text) else { return };
+        h.send_clipboard_text(s);
     }));
 }

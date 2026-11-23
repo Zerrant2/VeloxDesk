@@ -152,8 +152,10 @@ impl TerminalWindow {
                 });
                 ui.separator();
 
+                let pal = crate::theme::palette_for(ui);
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgb(16, 18, 22))
+                    .stroke(egui::Stroke::new(1.0, pal.terminal_stroke))
                     .inner_margin(egui::Margin::same(6))
                     .corner_radius(4.0)
                     .show(ui, |ui| {
@@ -195,7 +197,8 @@ impl TerminalWindow {
                     ui.weak(t.terminal_exit_code(code));
                 }
                 if let Some(err) = &self.error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 110, 110), err);
+                    let pal = crate::theme::palette_for(ui);
+                    ui.colored_label(pal.danger, err);
                 }
             });
         self.open = open;

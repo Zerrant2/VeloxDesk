@@ -7,12 +7,13 @@ use veloxdesk_protocol::control::DisplayInfo;
 use crate::auth::format_fingerprint;
 use crate::connect::{UpdateUiState, format_device_id};
 use crate::i18n::tr;
-use crate::settings::{FpsCap, Language, Mode, PasswordMode, Present, Quality, Scale, Settings};
+use crate::settings::{FpsCap, Language, Mode, PasswordMode, Present, Quality, Scale, Settings, ThemePreference};
 
 /// What the toolbar / settings window asks the application to do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolbarAction {
     SetLanguage(Language),
+    SetTheme(ThemePreference),
     SetMode(Mode),
     SwitchDisplay(u32),
     SetQuality(Quality),
@@ -30,6 +31,9 @@ pub enum ToolbarAction {
     TogglePointerLock,
     ToggleHud,
     ToggleFullscreen,
+    AndroidBack,
+    AndroidHome,
+    AndroidRecents,
     OpenSettings,
     CheckForUpdates,
     StartUpdate,
@@ -45,6 +49,7 @@ pub enum ToolbarAction {
 #[derive(Debug, Clone, Default)]
 pub struct SessionInfo {
     pub host_name: String,
+    pub host_os: String,
     pub displays: Vec<DisplayInfo>,
     pub active_display: u32,
     pub hud_visible: bool,
@@ -71,29 +76,23 @@ impl SessionToolbar {
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 0.0))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(200))
-                    .corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: 6, se: 6 })
-                    .inner_margin(egui::Margin::symmetric(8, 3))
-                    .show(ui, |ui| {
-                        if !self.expanded {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .small_button((crate::icons::chevron_down_atom(10.0), t.app_title))
-                                    .on_hover_text(t.session_toolbar_tooltip)
-                                    .clicked()
-                                {
-                                    self.expanded = true;
-                                }
-                                if info.pointer_locked {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(130, 235, 150),
-                                        t.pointer_locked_pill,
-                                    );
-                                }
-                            });
-                            return;
-                        }
+                let pal = crate::theme::palette_for(ui);
+                crate::theme::toolbar_frame(ui).show(ui, |ui| {
+                    if !self.expanded {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button((crate::icons::chevron_down_atom(10.0), t.app_title))
+                                .on_hover_text(t.session_toolbar_tooltip)
+                                .clicked()
+                            {
+                                self.expanded = true;
+                            }
+                            if info.pointer_locked {
+                                ui.colored_label(pal.success, t.pointer_locked_pill);
+                            }
+                        });
+                        return;
+                    }
                         ui.set_max_width((ui.ctx().content_rect().width() - 32.0).max(320.0));
                         ui.horizontal_wrapped(|ui| {
                             if crate::icons::icon_small_button(
@@ -252,6 +251,30 @@ impl SessionToolbar {
                             if ui.small_button(t.toolbar_fullscreen).on_hover_text("Ctrl+Shift+F").clicked() {
                                 out.push(ToolbarAction::ToggleFullscreen);
                             }
+                            if info.host_os.eq_ignore_ascii_case("android") {
+                                ui.separator();
+                                if ui
+                                    .small_button((crate::icons::arrow_left_atom(11.0), t.toolbar_android_back))
+                                    .on_hover_text(t.toolbar_android_back_tooltip)
+                                    .clicked()
+                                {
+                                    out.push(ToolbarAction::AndroidBack);
+                                }
+                                if ui
+                                    .small_button((crate::icons::home_atom(11.0), t.toolbar_android_home))
+                                    .on_hover_text(t.toolbar_android_home_tooltip)
+                                    .clicked()
+                                {
+                                    out.push(ToolbarAction::AndroidHome);
+                                }
+                                if ui
+                                    .small_button((crate::icons::recents_atom(11.0), t.toolbar_android_recents))
+                                    .on_hover_text(t.toolbar_android_recents_tooltip)
+                                    .clicked()
+                                {
+                                    out.push(ToolbarAction::AndroidRecents);
+                                }
+                            }
                             if crate::icons::icon_small_button(
                                 ui,
                                 egui::vec2(22.0, 18.0),
@@ -264,8 +287,7 @@ impl SessionToolbar {
                             }
                             if ui
                                 .add(egui::Button::new(
-                                    egui::RichText::new(t.toolbar_disconnect)
-                                        .color(egui::Color32::from_rgb(255, 120, 120)),
+                                    egui::RichText::new(t.toolbar_disconnect).color(pal.danger),
                                 ))
                                 .clicked()
                             {
@@ -353,13 +375,22 @@ pub fn settings_window_with_security(
                 .show(ui, |ui| {
                     egui::Grid::new("veloxdesk-settings")
                         .num_columns(2)
-                        .spacing([16.0, 8.0])
+                        .spacing([16.0, 6.0])
                         .show(ui, |ui| {
                     ui.label(t.settings_language_label).on_hover_text(t.tip_language);
                     ui.horizontal(|ui| {
                         for l in Language::ALL {
                             ui.selectable_value(&mut settings.language, l, l.label())
                                 .on_hover_text(t.tip_language);
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label(t.settings_theme_label).on_hover_text(t.tip_theme);
+                    ui.horizontal(|ui| {
+                        for th in ThemePreference::ALL {
+                            ui.selectable_value(&mut settings.theme, th, th.label_for(lang))
+                                .on_hover_text(t.tip_theme);
                         }
                     });
                     ui.end_row();
@@ -497,6 +528,7 @@ pub fn settings_window_with_security(
 
                     ui.label(t.settings_updates_label).on_hover_text(t.tip_updates);
                     ui.horizontal(|ui| {
+                        let pal = crate::theme::palette_for(ui);
                         let checking = matches!(
                             update_state,
                             Some(UpdateUiState::Checking | UpdateUiState::Downloading { .. })
@@ -516,16 +548,10 @@ pub fn settings_window_with_security(
                                     ui.weak(t.update_checking);
                                 }
                                 UpdateUiState::UpToDate => {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(130, 225, 160),
-                                        t.update_up_to_date,
-                                    );
+                                    ui.colored_label(pal.success, t.update_up_to_date);
                                 }
                                 UpdateUiState::Available { latest, .. } => {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(130, 210, 255),
-                                        t.fmt_update_available_short(latest),
-                                    );
+                                    ui.colored_label(pal.info, t.fmt_update_available_short(latest));
                                     if ui.button(t.update_now_btn).on_hover_text(t.tip_updates).clicked() {
                                         out.push(ToolbarAction::StartUpdate);
                                     }
@@ -535,10 +561,7 @@ pub fn settings_window_with_security(
                                     ui.weak(if status.is_empty() { t.update_downloading } else { status.as_str() });
                                 }
                                 UpdateUiState::Error(e) => {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(255, 120, 120),
-                                        t.fmt_update_error(e),
-                                    );
+                                    ui.colored_label(pal.danger, t.fmt_update_error(e));
                                 }
                             }
                         }
@@ -552,6 +575,7 @@ pub fn settings_window_with_security(
                     ui.label(egui::RichText::new(t.settings_security_heading).strong());
                     ui.add_space(4.0);
 
+                    let pal = crate::theme::palette_for(ui);
                     egui::Grid::new("veloxdesk-settings-security")
                         .num_columns(2)
                         .spacing([16.0, 8.0])
@@ -571,7 +595,7 @@ pub fn settings_window_with_security(
                             if settings.password_mode == PasswordMode::Permanent && !settings.has_permanent_password() {
                                 ui.label("");
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(245, 200, 110),
+                                    pal.warning,
                                     egui::RichText::new(t.pw_mode_permanent_fallback_hint).small(),
                                 );
                                 ui.end_row();
@@ -583,9 +607,9 @@ pub fn settings_window_with_security(
                                 let has_perm = settings.has_permanent_password();
                                 ui.horizontal(|ui| {
                                     let (color, badge) = if has_perm {
-                                        (egui::Color32::from_rgb(130, 225, 160), t.pw_status_set)
+                                        (pal.success, t.pw_status_set)
                                     } else {
-                                        (egui::Color32::from_rgb(160, 160, 170), t.pw_status_not_set)
+                                        (pal.muted, t.pw_status_not_set)
                                     };
                                     ui.colored_label(color, egui::RichText::new(badge).strong())
                                         .on_hover_text(t.tip_permanent_password);
@@ -623,7 +647,7 @@ pub fn settings_window_with_security(
                                     }
                                 });
                                 if pw_too_short {
-                                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), t.pw_too_short_err);
+                                    ui.colored_label(pal.danger, t.pw_too_short_err);
                                 }
                             });
                             ui.end_row();
@@ -693,6 +717,9 @@ pub fn settings_window_with_security(
     if *settings != before {
         if settings.language != before.language {
             out.push(ToolbarAction::SetLanguage(settings.language));
+        }
+        if settings.theme != before.theme {
+            out.push(ToolbarAction::SetTheme(settings.theme));
         }
         if settings.password_mode != before.password_mode {
             out.push(ToolbarAction::SetPasswordMode(settings.password_mode));
@@ -807,6 +834,7 @@ mod tests {
         let mut tb = SessionToolbar { expanded: true };
         let info = SessionInfo {
             host_name: "host".into(),
+            host_os: "windows".into(),
             displays: vec![
                 DisplayInfo { index: 0, name: "A".into(), width: 1920, height: 1080, primary: true, ..Default::default() },
                 DisplayInfo { index: 1, name: "B".into(), width: 2560, height: 1440, ..Default::default() },
@@ -1015,6 +1043,8 @@ mod tests {
 
         let pairs = [
             ("tip_language", en.tip_language, ru.tip_language),
+            ("tip_theme", en.tip_theme, ru.tip_theme),
+            ("tip_caps", en.tip_caps, ru.tip_caps),
             ("tip_default_mode", en.tip_default_mode, ru.tip_default_mode),
             ("tip_editing_profile", en.tip_editing_profile, ru.tip_editing_profile),
             ("tip_quality", en.tip_quality, ru.tip_quality),
@@ -1083,6 +1113,7 @@ mod tests {
                 (t.settings_hdr_10bit, t.tip_hdr_10bit),
                 (t.settings_microphone, t.tip_microphone),
                 (Language::Ru.label(), t.tip_language),
+                (t.settings_theme_label, t.tip_theme),
                 (t.settings_rendezvous_server, t.tip_rendezvous_server),
             ];
             for (needle, expected_tip) in targets {
@@ -1140,6 +1171,127 @@ mod tests {
                     !shapes_contain_text(&leave_out.shapes, expected_tip),
                     "tooltip {expected_tip:?} should hide when pointer leaves"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_window_switching_theme_emits_set_theme_and_persists() {
+        let dir = std::env::temp_dir().join(format!("veloxdesk-settings-theme-{}", std::process::id()));
+        let path = dir.join("veloxdesk-settings.json");
+        let ctx = egui::Context::default();
+        let mut settings = Settings::default();
+        let mut open = true;
+        let make_input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            ..Default::default()
+        };
+
+        let mut out = ctx.run_ui(make_input(), |ui| {
+            let _ = settings_window_at(ui.ctx(), &mut open, &mut settings, Some(&path));
+        });
+        out.textures_delta.clear();
+        out = ctx.run_ui(make_input(), |ui| {
+            let _ = settings_window_at(ui.ctx(), &mut open, &mut settings, Some(&path));
+        });
+        out.textures_delta.clear();
+
+        let light_pos = out
+            .shapes
+            .iter()
+            .find_map(|c| find_text_rect(&c.shape, "Light"))
+            .expect("Light theme button in Settings")
+            .center();
+
+        let mut emitted = Vec::new();
+        click_at(&ctx, light_pos, |c| {
+            let a = settings_window_at(c, &mut open, &mut settings, Some(&path));
+            if !a.is_empty() {
+                emitted = a;
+            }
+        });
+        assert_eq!(emitted, vec![ToolbarAction::SetTheme(ThemePreference::Light)]);
+        assert_eq!(settings.theme, ThemePreference::Light);
+        assert_eq!(Settings::load(&path).unwrap().theme, ThemePreference::Light);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn android_toolbar_nav_buttons_visibility_and_actions() {
+        let make_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            events,
+            ..Default::default()
+        };
+
+        // Non-Android host must NOT display Android nav buttons.
+        {
+            let ctx = egui::Context::default();
+            let mut settings = Settings::default();
+            let mut tb = SessionToolbar { expanded: true };
+            let win_info = SessionInfo { host_name: "win-pc".into(), host_os: "windows".into(), ..Default::default() };
+            let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                let _ = tb.show(ui, &win_info, &mut settings);
+            });
+            out.textures_delta.clear();
+            assert!(!shapes_contain_text(&out.shapes, "Recents"));
+            assert!(!shapes_contain_text(&out.shapes, "Home"));
+        }
+
+        // Android host shows localized Back / Home / Recents and emits the right ToolbarAction.
+        for lang in Language::ALL {
+            let t = tr(lang);
+            let ctx = egui::Context::default();
+            let mut settings = Settings { language: lang, ..Default::default() };
+            let mut tb = SessionToolbar { expanded: true };
+            let android_info = SessionInfo {
+                host_name: "Pixel-9".into(),
+                host_os: "Android".into(),
+                ..Default::default()
+            };
+
+            let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                let _ = tb.show(ui, &android_info, &mut settings);
+            });
+            out.textures_delta.clear();
+            out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                let _ = tb.show(ui, &android_info, &mut settings);
+            });
+            out.textures_delta.clear();
+
+            for (label, expected) in [
+                (t.toolbar_android_back, ToolbarAction::AndroidBack),
+                (t.toolbar_android_home, ToolbarAction::AndroidHome),
+                (t.toolbar_android_recents, ToolbarAction::AndroidRecents),
+            ] {
+                let pos = out
+                    .shapes
+                    .iter()
+                    .find_map(|c| find_text_rect(&c.shape, label))
+                    .unwrap_or_else(|| panic!("missing Android nav button {label:?} ({lang:?})"))
+                    .center();
+                let mut emitted = Vec::new();
+                for pressed in [true, false] {
+                    let mut c = ctx.run_ui(
+                        make_input(vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]),
+                        |ui| {
+                            let a = tb.show(ui, &android_info, &mut settings);
+                            if !a.is_empty() {
+                                emitted = a;
+                            }
+                        },
+                    );
+                    c.textures_delta.clear();
+                }
+                assert_eq!(emitted, vec![expected], "button {label:?} ({lang:?})");
             }
         }
     }

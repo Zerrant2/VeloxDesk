@@ -1,6 +1,8 @@
 package dev.veloxdesk.data
 
 import dev.veloxdesk.bridge.BridgeConstants
+import dev.veloxdesk.bridge.HostPasswordMode
+import dev.veloxdesk.bridge.HostSavedTrustedPeer
 import dev.veloxdesk.bridge.ScaleMode
 import dev.veloxdesk.bridge.TouchMode
 import org.junit.Assert.assertEquals
@@ -104,5 +106,113 @@ class AppPreferencesTest {
         assertEquals(list, restored)
 
         assertTrue(AppPreferences.deserializeRecentConnections("not-json").isEmpty())
+    }
+
+    @Test
+    fun themeMode_fromCodeAndCycleOrder() {
+        assertEquals(AppThemeMode.SYSTEM, AppThemeMode.fromCode(null))
+        assertEquals(AppThemeMode.SYSTEM, AppThemeMode.fromCode("unknown"))
+        assertEquals(AppThemeMode.SYSTEM, AppThemeMode.fromCode("system"))
+        assertEquals(AppThemeMode.DARK, AppThemeMode.fromCode("DARK"))
+        assertEquals(AppThemeMode.LIGHT, AppThemeMode.fromCode("Light"))
+
+        assertEquals(AppThemeMode.DARK, AppThemeMode.SYSTEM.next())
+        assertEquals(AppThemeMode.LIGHT, AppThemeMode.DARK.next())
+        assertEquals(AppThemeMode.SYSTEM, AppThemeMode.LIGHT.next())
+    }
+
+    @Test
+    fun hostSecuritySettings_enforcePasswordModeInvariants() {
+        val samplePhc = "\$argon2id\$v=19\$m=19456,t=2,p=1\$c2FsdA\$aGFzaA"
+
+        // Default: ONE_TIME with no hash -> OTP enabled, effective hash empty
+        val defaults = AppSettings()
+        assertFalse(defaults.hasHostPermanentPassword)
+        assertTrue(defaults.effectiveHostOtpEnabled)
+        assertEquals("", defaults.effectiveHostPermanentHash)
+
+        // ONE_TIME with saved PHC -> PHC preserved on disk, but NOT exposed to live host
+        val oneTimeWithHash = defaults.copy(
+            hostPasswordMode = HostPasswordMode.ONE_TIME.id,
+            hostPermanentPasswordHash = samplePhc,
+        )
+        assertTrue(oneTimeWithHash.hasHostPermanentPassword)
+        assertTrue(oneTimeWithHash.effectiveHostOtpEnabled)
+        assertEquals("", oneTimeWithHash.effectiveHostPermanentHash)
+
+        // PERMANENT without valid PHC -> falls back to OTP enabled, empty hash
+        val permWithoutHash = defaults.copy(
+            hostPasswordMode = HostPasswordMode.PERMANENT.id,
+            hostPermanentPasswordHash = "not-a-valid-phc",
+        )
+        assertFalse(permWithoutHash.hasHostPermanentPassword)
+        assertTrue(permWithoutHash.effectiveHostOtpEnabled)
+        assertEquals("", permWithoutHash.effectiveHostPermanentHash)
+
+        // PERMANENT with valid PHC -> OTP disabled, PHC exposed
+        val permWithHash = defaults.copy(
+            hostPasswordMode = HostPasswordMode.PERMANENT.id,
+            hostPermanentPasswordHash = " $samplePhc ",
+        )
+        assertTrue(permWithHash.hasHostPermanentPassword)
+        assertFalse(permWithHash.effectiveHostOtpEnabled)
+        assertEquals(samplePhc, permWithHash.effectiveHostPermanentHash)
+
+        // BOTH with valid PHC -> both OTP and permanent hash active
+        val bothWithHash = defaults.copy(
+            hostPasswordMode = HostPasswordMode.BOTH.id,
+            hostPermanentPasswordHash = samplePhc,
+        )
+        assertTrue(bothWithHash.hasHostPermanentPassword)
+        assertTrue(bothWithHash.effectiveHostOtpEnabled)
+        assertEquals(samplePhc, bothWithHash.effectiveHostPermanentHash)
+    }
+
+    @Test
+    fun hostTrustedPeers_upsertRemoveAndJsonRoundTrip() {
+        val peerA = HostSavedTrustedPeer(
+            publicKeyHex = "AA11BB22",
+            deviceId = "123456789",
+            name = "Work Laptop",
+            fingerprint = "AB:CD:EF:01",
+            allowInput = true,
+            allowClipboard = true,
+            allowAudio = false,
+        )
+        val peerB = HostSavedTrustedPeer(
+            publicKeyHex = "cc33dd44",
+            deviceId = "987654321",
+            name = "Home PC",
+            fingerprint = "11:22:33:44",
+            allowInput = true,
+            allowClipboard = false,
+            allowAudio = true,
+        )
+
+        var list = AppPreferences.upsertTrustedPeer(emptyList(), peerA)
+        list = AppPreferences.upsertTrustedPeer(list, peerB)
+        assertEquals(2, list.size)
+        assertEquals("cc33dd44", list[0].publicKeyHex)
+        assertEquals("aa11bb22", list[1].publicKeyHex)
+
+        // Case-insensitive upsert updates existing entry and moves it to front
+        list = AppPreferences.upsertTrustedPeer(list, peerA.copy(name = "Workstation"))
+        assertEquals(2, list.size)
+        assertEquals("aa11bb22", list[0].publicKeyHex)
+        assertEquals("Workstation", list[0].name)
+
+        // Blank publicKeyHex is ignored
+        val unchanged = AppPreferences.upsertTrustedPeer(list, peerA.copy(publicKeyHex = "   "))
+        assertEquals(list, unchanged)
+
+        // JSON round-trip preserves all peer fields
+        val json = HostSavedTrustedPeer.listToJson(list)
+        val restored = HostSavedTrustedPeer.listFromJson(json)
+        assertEquals(list, restored)
+
+        // Case-insensitive removal
+        val afterRemove = AppPreferences.removeTrustedPeer(list, "AA11BB22")
+        assertEquals(1, afterRemove.size)
+        assertEquals("cc33dd44", afterRemove[0].publicKeyHex)
     }
 }

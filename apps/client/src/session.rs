@@ -9,7 +9,7 @@ use veloxdesk_core_traits::Timestamp;
 use veloxdesk_core_traits::time::ClockSync;
 use veloxdesk_core_traits::transport::PathKind;
 use veloxdesk_core_traits::video::{CursorImage, Frame};
-use veloxdesk_protocol::control::{DisplayInfo, FileEntry, InputEvent, SessionConfig, SessionMode};
+use veloxdesk_protocol::control::{DisplayInfo, FileEntry, InputEvent, SessionConfig, SessionMode, VideoConfig};
 use veloxdesk_ui::{
     ActiveTunnel, ConnectTarget, FileAction, TerminalAction, TransferProgress, TunnelAction, TunnelSpec,
 };
@@ -35,9 +35,12 @@ pub enum SessionEvent {
         host_device_id: String,
         host_fingerprint: String,
         methods_hint: String,
+        allow_otp: bool,
+        allow_perm: bool,
         error: Option<String>,
     },
     Config(Box<SessionConfig>),
+    VideoConfig(Box<VideoConfig>),
     DisplayList(Vec<DisplayInfo>),
     PrivacyMode { enabled: bool, error: Option<String> },
     FileListing { path: String, entries: Vec<FileEntry> },

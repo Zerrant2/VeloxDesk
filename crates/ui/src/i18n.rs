@@ -331,6 +331,22 @@ define_strings!(
     trusted_remove_tooltip,
     connect_permanent_active,
     connect_plus_permanent_badge,
+
+    // v0.4.0 Themes, OTP Auto-CAPS, Android Host Navigation
+    theme_system,
+    theme_dark,
+    theme_light,
+    settings_theme_label,
+    tip_theme,
+    theme_switch_tooltip,
+    caps_btn,
+    tip_caps,
+    toolbar_android_back,
+    toolbar_android_back_tooltip,
+    toolbar_android_home,
+    toolbar_android_home_tooltip,
+    toolbar_android_recents,
+    toolbar_android_recents_tooltip,
 );
 
 pub const EN: Strings = Strings {
@@ -640,6 +656,22 @@ pub const EN: Strings = Strings {
     trusted_remove_tooltip: "Revoke trust for this device immediately",
     connect_permanent_active: "Permanent password active",
     connect_plus_permanent_badge: "+ Permanent",
+
+    // v0.4.0 Themes, OTP Auto-CAPS, Android Host Navigation
+    theme_system: "System",
+    theme_dark: "Dark",
+    theme_light: "Light",
+    settings_theme_label: "Theme",
+    tip_theme: "Choose the desktop interface color theme: follow the operating system (System), always Dark, or always Light.",
+    theme_switch_tooltip: "Switch interface color theme (System / Dark / Light)",
+    caps_btn: "CAPS",
+    tip_caps: "Automatically convert letters to UPPERCASE and strip spaces for one-time password (OTP) entry. Click to toggle for mixed-case permanent passwords.",
+    toolbar_android_back: "Back",
+    toolbar_android_back_tooltip: "Send Android Back navigation key (Escape)",
+    toolbar_android_home: "Home",
+    toolbar_android_home_tooltip: "Send Android Home navigation key (Meta/Super)",
+    toolbar_android_recents: "Recents",
+    toolbar_android_recents_tooltip: "Open Android Recent Apps switcher (Alt+Tab)",
 };
 
 pub const RU: Strings = Strings {
@@ -949,6 +981,22 @@ pub const RU: Strings = Strings {
     trusted_remove_tooltip: "Немедленно отозвать доверие для этого устройства",
     connect_permanent_active: "Активен постоянный пароль",
     connect_plus_permanent_badge: "+ Постоянный",
+
+    // v0.4.0 Themes, OTP Auto-CAPS, Android Host Navigation
+    theme_system: "Системная",
+    theme_dark: "Тёмная",
+    theme_light: "Светлая",
+    settings_theme_label: "Тема",
+    tip_theme: "Выберите цветовую тему интерфейса: как в операционной системе (Системная), всегда Тёмная или всегда Светлая.",
+    theme_switch_tooltip: "Переключить цветовую тему интерфейса (Системная / Тёмная / Светлая)",
+    caps_btn: "CAPS",
+    tip_caps: "Автоматически переводить буквы в ВЕРХНИЙ РЕГИСТР и удалять пробелы для ввода одноразового пароля (OTP). Нажмите, чтобы переключить для обычного пароля.",
+    toolbar_android_back: "Назад",
+    toolbar_android_back_tooltip: "Отправить кнопку «Назад» для Android (Escape)",
+    toolbar_android_home: "Домой",
+    toolbar_android_home_tooltip: "Отправить кнопку «Домой» для Android (Meta/Super)",
+    toolbar_android_recents: "Недавние",
+    toolbar_android_recents_tooltip: "Открыть список недавних приложений Android (Alt+Tab)",
 };
 
 /// Return the static localization table for `lang`.
@@ -1589,6 +1637,9 @@ mod tests {
             for f in FpsCap::ALL {
                 assert!(!f.label_for(lang).is_empty());
             }
+            for th in crate::settings::ThemePreference::ALL {
+                assert!(!th.label_for(lang).is_empty());
+            }
         }
     }
 
@@ -1625,6 +1676,7 @@ mod tests {
 
         let info = SessionInfo {
             host_name: "host".into(),
+            host_os: "android".into(),
             displays: vec![
                 DisplayInfo { index: 0, name: "A".into(), width: 1920, height: 1080, primary: true, ..Default::default() },
                 DisplayInfo { index: 1, name: "B".into(), width: 2560, height: 1440, ..Default::default() },

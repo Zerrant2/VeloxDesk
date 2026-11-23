@@ -14,6 +14,19 @@
     <string name="btn_check_updates">Обновления</string>
     <string name="btn_open_release">Скачать</string>
     <string name="btn_configure">Настроить</string>
+    <string name="btn_save">Сохранить</string>
+    <string name="btn_clear">Удалить</string>
+    <string name="btn_rotate">Обновить</string>
+    <string name="btn_accept">Принять</string>
+    <string name="btn_reject">Отклонить</string>
+    <string name="btn_revoke">Отозвать</string>
+
+    <!-- Theme -->
+    <string name="settings_theme">Тема</string>
+    <string name="theme_system">Как в системе</string>
+    <string name="theme_dark">Тёмная</string>
+    <string name="theme_light">Светлая</string>
+    <string name="btn_cycle_theme">Сменить тему</string>
 
     <!-- Modes -->
     <string name="mode_desktop">Рабочий стол</string>
@@ -39,16 +52,45 @@
     <string name="fps_120">120 FPS</string>
 
     <!-- Connect Screen -->
-    <string name="this_device_title">Это устройство</string>
-    <string name="this_device_subtitle">Передайте этот ID или отпечаток, чтобы добавить Android в доверенные устройства хоста.</string>
+    <string name="this_device_title">Доступ к телефону</string>
+    <string name="this_device_subtitle">Разрешите другому ПК или телефону просмотр и управление этим устройством.</string>
     <string name="device_id_label">ID устройства</string>
     <string name="fingerprint_label">Отпечаток Ed25519</string>
     <string name="copied_device_id">ID устройства скопирован</string>
     <string name="copied_fingerprint">Отпечаток скопирован</string>
+    <string name="copied_otp">Одноразовый пароль скопирован</string>
+    <string name="copied_ip">IP-адрес скопирован</string>
     <string name="unavailable">Недоступно</string>
 
-    <string name="remote_pc_title">Удалённый ПК</string>
-    <string name="remote_pc_subtitle">Подключение по LAN IP, Tailscale IP или 9-значному ID устройства.</string>
+    <!-- Android Host Card -->
+    <string name="host_status_sharing">Трансляция</string>
+    <string name="host_status_connected">Подключён: %1$s</string>
+    <string name="host_status_offline">Доступ выключен</string>
+    <string name="host_lan_ip_label">LAN IP</string>
+    <string name="host_tailscale_ip_label">Tailscale IP</string>
+    <string name="host_otp_label">Одноразовый пароль (OTP)</string>
+    <string name="host_perm_active_badge">Активен постоянный пароль</string>
+    <string name="host_plus_perm_badge">+ Постоянный</string>
+    <string name="host_start_sharing">Включить доступ</string>
+    <string name="host_stop_sharing">Остановить доступ</string>
+    <string name="host_control_enabled">Удалённое управление включено</string>
+    <string name="host_control_disabled">Управление выключено (просмотр уже работает)</string>
+    <string name="host_enable_control">Включить управление</string>
+    <string name="host_capture_denied">Разрешение на захват экрана отклонено</string>
+
+    <!-- Host Accept Prompt Dialog -->
+    <string name="host_accept_title">Входящее подключение</string>
+    <string name="host_accept_peer_id">ID клиента: %1$s</string>
+    <string name="host_accept_peer_fp">Отпечаток клиента:</string>
+    <string name="host_accept_permissions">Разрешения</string>
+    <string name="host_accept_perm_input">Удалённое управление касаниями и клавиатурой</string>
+    <string name="host_accept_perm_clipboard">Синхронизация буфера обмена</string>
+    <string name="host_accept_perm_audio">Передача звука</string>
+    <string name="host_accept_remember">Запомнить это устройство (вход без пароля)</string>
+    <string name="host_peer_unknown">Неизвестное устройство</string>
+
+    <string name="remote_pc_title">Удалённое устройство</string>
+    <string name="remote_pc_subtitle">Подключение к ПК или телефону по LAN IP, Tailscale IP или 9-значному ID.</string>
     <string name="target_placeholder">IP, IP:порт или 9-значный ID</string>
     <string name="session_mode_label">Режим сессии</string>
     <string name="rendezvous_missing_hint">Для подключения по 9-значному ID укажите сервер Rendezvous в настройках.</string>
@@ -86,6 +128,27 @@
     <string name="settings_show_hud">Показывать HUD при подключении</string>
     <string name="settings_show_hud_desc">Отображать FPS, задержку, потери пакетов и статус декодера.</string>
 
+    <!-- Host Access & Security Settings -->
+    <string name="settings_section_host_security">Доступ к этому устройству</string>
+    <string name="settings_host_pw_mode">Режим пароля</string>
+    <string name="host_pw_mode_otp">Только одноразовый</string>
+    <string name="host_pw_mode_permanent">Только постоянный</string>
+    <string name="host_pw_mode_both">Оба (OTP + постоянный)</string>
+    <string name="host_pw_permanent_fallback_hint">Постоянный пароль ещё не задан — пока он не сохранён, продолжает действовать OTP.</string>
+    <string name="settings_host_perm_pw_label">Постоянный пароль</string>
+    <string name="settings_host_perm_status_set">Задан</string>
+    <string name="settings_host_perm_status_unset">Не задан</string>
+    <string name="settings_host_perm_pw_placeholder">Минимум 6 символов</string>
+    <string name="settings_host_perm_pw_min_len">Постоянный пароль должен содержать минимум 6 символов.</string>
+    <string name="settings_host_perm_pw_saved">Постоянный пароль сохранён</string>
+    <string name="settings_host_perm_pw_cleared">Постоянный пароль удалён</string>
+    <string name="settings_host_perm_pw_hash_failed">Не удалось захешировать пароль</string>
+    <string name="settings_host_require_accept">Запрашивать подтверждение</string>
+    <string name="settings_host_require_accept_desc">Показывать окно подтверждения при подключении. Отключите вместе с постоянным паролем для автономного доступа.</string>
+    <string name="settings_host_trusted_title">Доверенные устройства</string>
+    <string name="settings_host_trusted_empty">Доверенных устройств пока нет.</string>
+    <string name="settings_host_trusted_revoked">Доверенное устройство удалено</string>
+
     <!-- Session Screen & Status -->
     <string name="status_connecting">Подключение к %1$s…</string>
     <string name="status_waiting_host">Поиск хоста через rendezvous…</string>
@@ -107,6 +170,8 @@
     <string name="auth_password_label">Пароль / OTP</string>
     <string name="auth_show_password">Показать пароль</string>
     <string name="auth_hide_password">Скрыть пароль</string>
+    <string name="auth_caps_chip">CAPS</string>
+    <string name="auth_caps_desc">Автозаглавные для ввода OTP</string>
 
     <!-- Disconnect Confirm -->
     <string name="disconnect_confirm_title">Завершить сессию?</string>

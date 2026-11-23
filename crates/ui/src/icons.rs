@@ -73,6 +73,45 @@ pub fn arrow_right(painter: &egui::Painter, rect: egui::Rect, color: egui::Color
     painter.line_segment([egui::pos2(right - h, c.y + h), egui::pos2(right, c.y)], stroke);
 }
 
+/// Draw a left-pointing arrow inside `rect` (e.g. Android Back navigation).
+pub fn arrow_left(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let h = rect.height() * 0.32;
+    let left = rect.left() + rect.width() * 0.14;
+    let right = rect.right() - rect.width() * 0.14;
+    let stroke = egui::Stroke::new((rect.width().min(rect.height()) * 0.13).max(1.5), color);
+    painter.line_segment([egui::pos2(right, c.y), egui::pos2(left + 1.0, c.y)], stroke);
+    painter.line_segment([egui::pos2(left + h, c.y - h), egui::pos2(left, c.y)], stroke);
+    painter.line_segment([egui::pos2(left + h, c.y + h), egui::pos2(left, c.y)], stroke);
+}
+
+/// Draw a house silhouette inside `rect` (e.g. Android Home navigation).
+pub fn home(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let r = rect.shrink(rect.width().min(rect.height()) * 0.10);
+    let stroke = egui::Stroke::new((r.width().min(r.height()) * 0.14).max(1.4), color);
+    let apex = egui::pos2(r.center().x, r.top());
+    let eaves_y = r.top() + r.height() * 0.44;
+    // Roof chevron
+    painter.line_segment([egui::pos2(r.left(), eaves_y), apex], stroke);
+    painter.line_segment([apex, egui::pos2(r.right(), eaves_y)], stroke);
+    // House walls & base
+    let inset = r.width() * 0.16;
+    let bl = egui::pos2(r.left() + inset, r.bottom());
+    let br = egui::pos2(r.right() - inset, r.bottom());
+    let tl = egui::pos2(r.left() + inset, eaves_y);
+    let tr = egui::pos2(r.right() - inset, eaves_y);
+    painter.line_segment([tl, bl], stroke);
+    painter.line_segment([tr, br], stroke);
+    painter.line_segment([bl, br], stroke);
+}
+
+/// Draw a rounded square outline inside `rect` (e.g. Android Recents / Overview navigation).
+pub fn recents(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let r = rect.shrink(rect.width().min(rect.height()) * 0.16);
+    let stroke = egui::Stroke::new((r.width().min(r.height()) * 0.15).max(1.4), color);
+    painter.rect_stroke(r, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+}
+
 /// Draw a folder silhouette inside `rect`.
 pub fn folder(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let r = rect.shrink(rect.width().min(rect.height()) * 0.10);
@@ -169,6 +208,27 @@ pub fn arrow_right_atom(size: f32) -> egui::Atom<'static> {
     })
 }
 
+/// Paint-based [`egui::Atom`] for [`arrow_left`].
+pub fn arrow_left_atom(size: f32) -> egui::Atom<'static> {
+    egui::Atom::paint(egui::vec2(size, size), |ui, args| {
+        arrow_left(ui.painter(), args.rect, args.fallback_text_color);
+    })
+}
+
+/// Paint-based [`egui::Atom`] for [`home`].
+pub fn home_atom(size: f32) -> egui::Atom<'static> {
+    egui::Atom::paint(egui::vec2(size, size), |ui, args| {
+        home(ui.painter(), args.rect, args.fallback_text_color);
+    })
+}
+
+/// Paint-based [`egui::Atom`] for [`recents`].
+pub fn recents_atom(size: f32) -> egui::Atom<'static> {
+    egui::Atom::paint(egui::vec2(size, size), |ui, args| {
+        recents(ui.painter(), args.rect, args.fallback_text_color);
+    })
+}
+
 /// Standalone colored status dot widget.
 pub fn status_dot_widget(ui: &mut egui::Ui, diameter: f32, color: egui::Color32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
@@ -239,7 +299,8 @@ mod tests {
                 for section in &ts.galley.job.sections {
                     let range = section.byte_range.start.0..section.byte_range.end.0;
                     let slice = &ts.galley.job.text[range];
-                    let ok = ctx.fonts_mut(|f| f.has_glyphs(&section.format.font_id, slice));
+                    let printable: String = slice.chars().filter(|c| !c.is_control()).collect();
+                    let ok = ctx.fonts_mut(|f| f.has_glyphs(&section.format.font_id, &printable));
                     assert!(ok, "missing glyph in rendered text section: {slice:?} (font {:?})", section.format.font_id);
                 }
             }
@@ -294,6 +355,9 @@ mod tests {
             gear(ui.painter(), rect, c);
             arrow_up(ui.painter(), rect, c);
             arrow_right(ui.painter(), rect, c);
+            arrow_left(ui.painter(), rect, c);
+            home(ui.painter(), rect, c);
+            recents(ui.painter(), rect, c);
             folder(ui.painter(), rect, c);
 
             status_dot_widget(ui, 10.0, egui::Color32::GREEN);
@@ -305,6 +369,9 @@ mod tests {
             let _ = ui.button((arrow_up_atom(12.0), "Up"));
             let _ = ui.button((folder_atom(13.0), "Folder"));
             let _ = ui.button((arrow_right_atom(12.0), "Right"));
+            let _ = ui.small_button((arrow_left_atom(12.0), "Back"));
+            let _ = ui.small_button((home_atom(12.0), "Home"));
+            let _ = ui.small_button((recents_atom(12.0), "Recents"));
         });
         out.textures_delta.clear();
 
@@ -358,6 +425,7 @@ mod tests {
 
         let info = SessionInfo {
             host_name: "host".into(),
+            host_os: "android".into(),
             displays: vec![
                 DisplayInfo { index: 0, name: "A".into(), width: 1920, height: 1080, primary: true, ..Default::default() },
                 DisplayInfo { index: 1, name: "B".into(), width: 2560, height: 1440, ..Default::default() },
@@ -393,10 +461,12 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut pw = PasswordPrompt::new(
+        let mut pw = PasswordPrompt::new_with_methods(
             "123456789".into(),
             "0123456789abcdef0123456789abcdef".into(),
             "Permanent or one-time password".into(),
+            true,
+            true,
         );
         let mut accept = AcceptPrompt::new(
             IncomingSessionInfo {
@@ -410,31 +480,35 @@ mod tests {
         let mut term = TerminalWindow { open: true, connected: true, ..Default::default() };
         term.append_output(b"VELOXDESK_OK\r\n");
 
-        // Pass 1: ConnectScreen (fullscreen = true) + collapsed toolbar (2 passes so anchored Areas complete sizing)
-        for _ in 0..2 {
-            let mut out1 = ctx.run_ui(make_input(), |ui| {
-                let _ = connect.show(ui, &mut settings, true);
-                let _ = toolbar_collapsed.show(ui, &info, &mut settings);
+        // Render all screens in both Dark and Light themes to verify zero missing glyphs or panics.
+        for pref in [egui::ThemePreference::Dark, egui::ThemePreference::Light] {
+            ctx.set_theme(pref);
+            // Pass 1: ConnectScreen (fullscreen = true) + collapsed toolbar (2 passes so anchored Areas complete sizing)
+            for _ in 0..2 {
+                let mut out1 = ctx.run_ui(make_input(), |ui| {
+                    let _ = connect.show(ui, &mut settings, true);
+                    let _ = toolbar_collapsed.show(ui, &info, &mut settings);
+                });
+                out1.textures_delta.clear();
+                for clipped in &out1.shapes {
+                    verify_text_shapes_have_glyphs(&ctx, &clipped.shape);
+                }
+            }
+
+            // Pass 2: Expanded toolbar + all modal/auxiliary windows
+            let mut out2 = ctx.run_ui(make_input(), |ui| {
+                let _ = toolbar_expanded.show(ui, &info, &mut settings);
+                let _ = settings_window(ui.ctx(), &mut settings_open, &mut settings);
+                let _ = files.show(ui.ctx());
+                let _ = tunnels.show(ui.ctx());
+                let _ = pw.show(ui.ctx());
+                let _ = accept.show(ui.ctx());
+                let _ = term.show(ui.ctx());
             });
-            out1.textures_delta.clear();
-            for clipped in &out1.shapes {
+            out2.textures_delta.clear();
+            for clipped in &out2.shapes {
                 verify_text_shapes_have_glyphs(&ctx, &clipped.shape);
             }
-        }
-
-        // Pass 2: Expanded toolbar + all modal/auxiliary windows
-        let mut out2 = ctx.run_ui(make_input(), |ui| {
-            let _ = toolbar_expanded.show(ui, &info, &mut settings);
-            let _ = settings_window(ui.ctx(), &mut settings_open, &mut settings);
-            let _ = files.show(ui.ctx());
-            let _ = tunnels.show(ui.ctx());
-            let _ = pw.show(ui.ctx());
-            let _ = accept.show(ui.ctx());
-            let _ = term.show(ui.ctx());
-        });
-        out2.textures_delta.clear();
-        for clipped in &out2.shapes {
-            verify_text_shapes_have_glyphs(&ctx, &clipped.shape);
         }
 
         // Verify default_fonts retains full Cyrillic + punctuation coverage (for R3)

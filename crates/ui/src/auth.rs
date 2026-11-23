@@ -22,6 +22,14 @@ pub struct PasswordPrompt {
     pub host_fingerprint: String,
     /// Human-readable description of accepted password methods (e.g. "One-time or permanent password").
     pub methods_hint: String,
+    /// Whether the host accepts a one-time password (OTP).
+    pub allow_otp: bool,
+    /// Whether the host accepts a permanent password.
+    pub allow_perm: bool,
+    /// When `true`, typed/pasted ASCII letters are converted to UPPERCASE and whitespace is stripped.
+    /// Defaults to `allow_otp && !allow_perm` so OTP-only hosts auto-uppercase while mixed-case
+    /// permanent passwords are never broken.
+    pub uppercase_mode: bool,
     /// Error from a prior attempt, if any.
     pub error: Option<String>,
     pub password: String,
@@ -29,14 +37,42 @@ pub struct PasswordPrompt {
 }
 
 impl PasswordPrompt {
+    /// Create a password prompt (backwards-compatible default: permanent password mode, `CAPS` off).
     pub fn new(host_device_id: String, host_fingerprint: String, methods_hint: String) -> Self {
+        Self::new_with_methods(host_device_id, host_fingerprint, methods_hint, false, true)
+    }
+
+    /// Create a password prompt knowing which password methods the host allows.
+    ///
+    /// - OTP-only (`allow_otp && !allow_perm`): `uppercase_mode` defaults to `true`, `CAPS` pill shown.
+    /// - Both (`allow_otp && allow_perm`): `uppercase_mode` defaults to `false`, `CAPS` pill toggleable.
+    /// - Permanent-only (`!allow_otp`): `uppercase_mode` is `false`, `CAPS` pill hidden.
+    pub fn new_with_methods(
+        host_device_id: String,
+        host_fingerprint: String,
+        methods_hint: String,
+        allow_otp: bool,
+        allow_perm: bool,
+    ) -> Self {
         Self {
             host_device_id,
             host_fingerprint,
             methods_hint,
+            allow_otp,
+            allow_perm,
+            uppercase_mode: allow_otp && !allow_perm,
             error: None,
             password: String::new(),
             show_password: false,
+        }
+    }
+
+    /// Normalize a password buffer for OTP entry: strip ASCII whitespace and convert ASCII letters
+    /// to UPPERCASE without altering non-ASCII characters.
+    pub fn normalize_otp_password(s: &mut String) {
+        if s.bytes().any(|b| b.is_ascii_lowercase() || b.is_ascii_whitespace()) {
+            s.retain(|c| !c.is_ascii_whitespace());
+            s.make_ascii_uppercase();
         }
     }
 
@@ -55,7 +91,8 @@ impl PasswordPrompt {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.set_min_width(340.0);
+                let pal = crate::theme::palette_for(ui);
+                ui.set_min_width(360.0);
                 if !self.host_device_id.is_empty() {
                     ui.label(t.host_id_line(&format_device_id(&self.host_device_id)));
                 }
@@ -74,16 +111,35 @@ impl PasswordPrompt {
                         .hint_text(t.enter_password_hint)
                         .desired_width(240.0);
                     let resp = ui.add(edit);
+                    if self.uppercase_mode {
+                        Self::normalize_otp_password(&mut self.password);
+                    }
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         enter = true;
                     }
                     if ui.button(if self.show_password { t.hide_btn } else { t.show_btn }).clicked() {
                         self.show_password = !self.show_password;
                     }
+                    if self.allow_otp {
+                        let caps_btn = if self.uppercase_mode {
+                            egui::Button::new(
+                                egui::RichText::new(t.caps_btn).strong().color(pal.badge_active_text),
+                            )
+                            .fill(pal.badge_active_bg)
+                        } else {
+                            egui::Button::new(t.caps_btn)
+                        };
+                        if ui.add(caps_btn).on_hover_text(t.tip_caps).clicked() {
+                            self.uppercase_mode = !self.uppercase_mode;
+                            if self.uppercase_mode {
+                                Self::normalize_otp_password(&mut self.password);
+                            }
+                        }
+                    }
                 });
                 if let Some(err) = &self.error {
                     ui.add_space(4.0);
-                    ui.colored_label(egui::Color32::from_rgb(255, 110, 110), err);
+                    ui.colored_label(pal.danger, err);
                 }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -182,8 +238,9 @@ impl AcceptPrompt {
                 ui.checkbox(&mut self.trust_peer, t.trust_device_checkbox);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
+                    let pal = crate::theme::palette_for(ui);
                     let accept_btn = egui::Button::new(
-                        egui::RichText::new(t.accept_btn).color(egui::Color32::from_rgb(130, 235, 150)),
+                        egui::RichText::new(t.accept_btn).color(pal.success),
                     );
                     if ui.add(accept_btn).clicked() {
                         decision = Some(AcceptDecision {
@@ -193,7 +250,7 @@ impl AcceptPrompt {
                         });
                     }
                     let reject_btn = egui::Button::new(
-                        egui::RichText::new(t.reject_btn).color(egui::Color32::from_rgb(255, 120, 120)),
+                        egui::RichText::new(t.reject_btn).color(pal.danger),
                     );
                     if ui.add(reject_btn).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         decision = Some(AcceptDecision {
@@ -245,5 +302,123 @@ mod tests {
             assert!(accept.show(ui.ctx()).is_none());
         });
         out.textures_delta.clear();
+    }
+
+    fn find_text_rect(shape: &egui::epaint::Shape, needle: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::epaint::Shape::Vec(v) => v.iter().find_map(|s| find_text_rect(s, needle)),
+            egui::epaint::Shape::Text(ts) if ts.galley.text().contains(needle) => {
+                Some(ts.galley.rect.translate(ts.pos.to_vec2()))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn otp_uppercase_defaults_normalization_and_caps_toggle() {
+        // 1. OTP-only: uppercase_mode defaults to ON; lowercases and spaces normalize in real time.
+        let mut otp_only = PasswordPrompt::new_with_methods(
+            "123456789".into(),
+            "abcd".into(),
+            "Enter one-time password".into(),
+            true,
+            false,
+        );
+        assert!(otp_only.allow_otp);
+        assert!(!otp_only.allow_perm);
+        assert!(otp_only.uppercase_mode);
+        otp_only.password = "ab12 cd34\t".into();
+
+        let ctx = egui::Context::default();
+        let make_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+            let _ = otp_only.show_for(ui.ctx(), Language::En);
+        });
+        out.textures_delta.clear();
+        // Second frame completes anchored Window layout pass so shapes are emitted.
+        out = ctx.run_ui(make_input(Vec::new()), |ui| {
+            let _ = otp_only.show_for(ui.ctx(), Language::En);
+        });
+        out.textures_delta.clear();
+        assert_eq!(otp_only.password, "AB12CD34");
+        // CAPS pill must be visible when allow_otp is true.
+        assert!(
+            out.shapes.iter().any(|c| find_text_rect(&c.shape, "CAPS").is_some()),
+            "CAPS toggle pill must render for OTP-only host"
+        );
+
+        // 2. Permanent-only: uppercase_mode is OFF, mixed case preserved, CAPS pill hidden.
+        let mut perm_only = PasswordPrompt::new_with_methods(
+            "123456789".into(),
+            "abcd".into(),
+            "Enter permanent password".into(),
+            false,
+            true,
+        );
+        assert!(!perm_only.allow_otp);
+        assert!(perm_only.allow_perm);
+        assert!(!perm_only.uppercase_mode);
+        perm_only.password = "MySecret Pass123".into();
+        let ctx_perm = egui::Context::default();
+        let mut out_perm = ctx_perm.run_ui(make_input(Vec::new()), |ui| {
+            let _ = perm_only.show_for(ui.ctx(), Language::En);
+        });
+        out_perm.textures_delta.clear();
+        out_perm = ctx_perm.run_ui(make_input(Vec::new()), |ui| {
+            let _ = perm_only.show_for(ui.ctx(), Language::En);
+        });
+        out_perm.textures_delta.clear();
+        assert_eq!(perm_only.password, "MySecret Pass123");
+        assert!(
+            !out_perm.shapes.iter().any(|c| find_text_rect(&c.shape, "CAPS").is_some()),
+            "CAPS toggle pill must be hidden for permanent-only host"
+        );
+
+        // 3. Both mode: uppercase_mode defaults OFF (preserves mixed-case permanent password),
+        //    CAPS pill is visible and clicking it turns uppercase_mode ON & normalizes buffer.
+        let mut both = PasswordPrompt::new_with_methods(
+            "123456789".into(),
+            "abcd".into(),
+            "Enter permanent or one-time password".into(),
+            true,
+            true,
+        );
+        assert!(both.allow_otp && both.allow_perm && !both.uppercase_mode);
+        both.password = "ab 99".into();
+        let ctx_both = egui::Context::default();
+        for _ in 0..2 {
+            let mut o = ctx_both.run_ui(make_input(Vec::new()), |ui| {
+                let _ = both.show_for(ui.ctx(), Language::En);
+            });
+            o.textures_delta.clear();
+            if let Some(rect) = o.shapes.iter().find_map(|c| find_text_rect(&c.shape, "CAPS")) {
+                let pos = rect.center();
+                assert_eq!(both.password, "ab 99");
+                for pressed in [true, false] {
+                    let mut c = ctx_both.run_ui(
+                        make_input(vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]),
+                        |ui| {
+                            let _ = both.show_for(ui.ctx(), Language::En);
+                        },
+                    );
+                    c.textures_delta.clear();
+                }
+                break;
+            }
+        }
+        assert!(both.uppercase_mode, "clicking CAPS must enable uppercase_mode");
+        assert_eq!(both.password, "AB99");
     }
 }

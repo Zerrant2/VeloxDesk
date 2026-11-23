@@ -945,7 +945,8 @@ mod net {
                             }
                             Some(Msg::VideoConfig(v)) => {
                                 receiver.set_dimensions(v.width, v.height);
-                                decoder.configure(v);
+                                decoder.configure(v.clone());
+                                let _ = proxy.send_event(UserEvent::Session(SessionEvent::VideoConfig(Box::new(v))));
                             }
                             Some(Msg::CursorShape(cs)) => {
                                 let img = CursorImage {
@@ -1235,6 +1236,8 @@ mod net {
                         host_device_id: host_id,
                         host_fingerprint: veloxdesk_crypto::fingerprint(&host_pk),
                         methods_hint,
+                        allow_otp,
+                        allow_perm,
                         error: None,
                     }));
                     let Some(pw) = wait_for_password(cmd_rx).await else {

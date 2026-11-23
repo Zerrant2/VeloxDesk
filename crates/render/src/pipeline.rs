@@ -656,4 +656,19 @@ mod tests {
         assert_eq!(u32::from_le_bytes(b[80..84].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(b[84..88].try_into().unwrap()), 1);
     }
+
+    #[test]
+    fn portrait_to_landscape_nv12_upload_plan() {
+        let portrait = nv12_test_frame(720, 1280, 0);
+        let up_p = plan_uploads(&portrait, &lens(&portrait)).unwrap();
+        assert_eq!(up_p.len(), 2);
+        assert_eq!((up_p[0].width, up_p[0].height), (720, 1280));
+        assert_eq!((up_p[1].width, up_p[1].height), (360, 640));
+
+        let landscape = nv12_test_frame(1280, 720, 1);
+        let up_l = plan_uploads(&landscape, &lens(&landscape)).unwrap();
+        assert_eq!(up_l.len(), 2);
+        assert_eq!((up_l[0].width, up_l[0].height), (1280, 720));
+        assert_eq!((up_l[1].width, up_l[1].height), (640, 360));
+    }
 }

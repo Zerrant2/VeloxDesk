@@ -2,12 +2,15 @@ param(
     [ValidateSet("debug", "release")]
     [string]$Profile = "release",
     [string[]]$Targets = @("aarch64-linux-android", "x86_64-linux-android"),
-    [string]$TargetDir = "e:\RemoteDesktop-android\target\android-so"
+    [string]$TargetDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+if (-not $TargetDir) {
+    $TargetDir = Join-Path $repoRoot "target\android-so"
+}
 $ndkRoot = "C:\Users\kao24\AppData\Local\Android\Sdk\ndk\28.2.13676358"
 $ndkBin = Join-Path $ndkRoot "toolchains\llvm\prebuilt\windows-x86_64\bin"
 

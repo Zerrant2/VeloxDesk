@@ -125,7 +125,8 @@ impl TunnelsWindow {
                     }
                 });
                 if let Some(err) = &self.error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 110, 110), err);
+                    let pal = crate::theme::palette_for(ui);
+                    ui.colored_label(pal.danger, err);
                 }
                 ui.separator();
                 if self.active.is_empty() {

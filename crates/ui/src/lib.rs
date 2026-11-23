@@ -12,6 +12,7 @@ pub mod icons;
 pub mod session;
 pub mod settings;
 pub mod terminal;
+pub mod theme;
 pub mod tunnels;
 
 pub use auth::{
@@ -33,6 +34,7 @@ pub use session::{
 };
 pub use settings::{
     FpsCap, Language, Mode, PasswordMode, Present, Quality, SavedTrustedPeer, Scale, Settings, StreamSettings,
+    ThemePreference,
 };
 pub use terminal::{TerminalAction, TerminalWindow, strip_ansi};
 pub use tunnels::{ActiveTunnel, TunnelAction, TunnelSpec, TunnelsWindow, parse_tunnel_spec, parse_tunnel_spec_i18n};

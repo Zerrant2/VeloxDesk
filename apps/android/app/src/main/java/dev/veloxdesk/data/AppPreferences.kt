@@ -3,6 +3,8 @@ package dev.veloxdesk.data
 import android.content.Context
 import android.content.SharedPreferences
 import dev.veloxdesk.bridge.BridgeConstants
+import dev.veloxdesk.bridge.HostPasswordMode
+import dev.veloxdesk.bridge.HostSavedTrustedPeer
 import dev.veloxdesk.bridge.ScaleMode
 import dev.veloxdesk.bridge.TouchMode
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -22,6 +24,23 @@ enum class AppLanguage(val code: String, val shortLabel: String, val nativeName:
 
         fun defaultForDevice(locale: Locale = Locale.getDefault()): AppLanguage =
             if (locale.language.equals("ru", ignoreCase = true)) RU else EN
+    }
+}
+
+enum class AppThemeMode(val code: String) {
+    SYSTEM("system"),
+    DARK("dark"),
+    LIGHT("light");
+
+    fun next(): AppThemeMode = when (this) {
+        SYSTEM -> DARK
+        DARK -> LIGHT
+        LIGHT -> SYSTEM
+    }
+
+    companion object {
+        fun fromCode(code: String?): AppThemeMode =
+            entries.firstOrNull { it.code.equals(code, ignoreCase = true) } ?: SYSTEM
     }
 }
 
@@ -78,19 +97,37 @@ data class RecentConnection(
 
 data class AppSettings(
     val language: AppLanguage = AppLanguage.EN,
+    val themeMode: AppThemeMode = AppThemeMode.SYSTEM,
     val rendezvousServer: String = "",
     val relayOnly: Boolean = false,
     val lastMode: Int = BridgeConstants.MODE_DESKTOP,
     val desktopProfile: StreamProfile = StreamProfile.defaultDesktop(),
     val gamingProfile: StreamProfile = StreamProfile.defaultGaming(),
     val recentConnections: List<RecentConnection> = emptyList(),
+    val hostPasswordMode: Int = HostPasswordMode.ONE_TIME.id,
+    val hostPermanentPasswordHash: String = "",
+    val hostRequireAccept: Boolean = true,
+    val hostTrustedPeers: List<HostSavedTrustedPeer> = emptyList(),
 ) {
     fun profileForMode(mode: Int): StreamProfile =
         if (mode == BridgeConstants.MODE_GAMING) gamingProfile else desktopProfile
+
+    val hasHostPermanentPassword: Boolean
+        get() = hostPermanentPasswordHash.trim().startsWith("\$argon2id\$")
+
+    val effectiveHostOtpEnabled: Boolean
+        get() = hostPasswordMode != HostPasswordMode.PERMANENT.id || !hasHostPermanentPassword
+
+    val effectiveHostPermanentHash: String
+        get() = if (hostPasswordMode == HostPasswordMode.ONE_TIME.id || !hasHostPermanentPassword) {
+            ""
+        } else {
+            hostPermanentPasswordHash.trim()
+        }
 }
 
 /**
- * SharedPreferences-backed persistence for VeloxDesk Android settings, profiles, and recent hosts.
+ * SharedPreferences-backed persistence for VeloxDesk Android settings, profiles, host security, and recent hosts.
  */
 class AppPreferences(context: Context) {
     private val prefs: SharedPreferences =
@@ -103,6 +140,7 @@ class AppPreferences(context: Context) {
         val defaultLang = AppLanguage.defaultForDevice()
         val langCode = prefs.getString(KEY_LANGUAGE, null)
         val language = if (langCode != null) AppLanguage.fromCode(langCode) else defaultLang
+        val themeMode = AppThemeMode.fromCode(prefs.getString(KEY_THEME_MODE, null))
 
         val rendezvous = prefs.getString(KEY_RENDEZVOUS_SERVER, "")?.trim().orEmpty()
         val relayOnly = prefs.getBoolean(KEY_RELAY_ONLY, false)
@@ -114,14 +152,25 @@ class AppPreferences(context: Context) {
         val recentJson = prefs.getString(KEY_RECENT_CONNECTIONS, "[]").orEmpty()
         val recent = deserializeRecentConnections(recentJson)
 
+        val hostPwMode = HostPasswordMode.fromId(prefs.getInt(KEY_HOST_PASSWORD_MODE, HostPasswordMode.ONE_TIME.id)).id
+        val hostPermHash = prefs.getString(KEY_HOST_PERM_HASH, "").orEmpty().trim()
+        val hostRequireAccept = prefs.getBoolean(KEY_HOST_REQUIRE_ACCEPT, true)
+        val hostTrustedJson = prefs.getString(KEY_HOST_TRUSTED_PEERS, "[]").orEmpty()
+        val hostTrusted = HostSavedTrustedPeer.listFromJson(hostTrustedJson)
+
         return AppSettings(
             language = language,
+            themeMode = themeMode,
             rendezvousServer = rendezvous,
             relayOnly = relayOnly,
             lastMode = lastMode,
             desktopProfile = desktop,
             gamingProfile = gaming,
             recentConnections = recent,
+            hostPasswordMode = hostPwMode,
+            hostPermanentPasswordHash = hostPermHash,
+            hostRequireAccept = hostRequireAccept,
+            hostTrustedPeers = hostTrusted,
         )
     }
 
@@ -153,6 +202,11 @@ class AppPreferences(context: Context) {
     fun setLanguage(language: AppLanguage) {
         prefs.edit().putString(KEY_LANGUAGE, language.code).apply()
         _settings.value = _settings.value.copy(language = language)
+    }
+
+    fun setThemeMode(themeMode: AppThemeMode) {
+        prefs.edit().putString(KEY_THEME_MODE, themeMode.code).apply()
+        _settings.value = _settings.value.copy(themeMode = themeMode)
     }
 
     fun setRendezvousServer(server: String) {
@@ -189,6 +243,50 @@ class AppPreferences(context: Context) {
         }
     }
 
+    fun setHostPasswordMode(mode: Int) {
+        val normalized = HostPasswordMode.fromId(mode).id
+        prefs.edit().putInt(KEY_HOST_PASSWORD_MODE, normalized).apply()
+        _settings.value = _settings.value.copy(hostPasswordMode = normalized)
+    }
+
+    fun setHostPermanentPasswordHash(phcHash: String) {
+        val cleaned = phcHash.trim()
+        prefs.edit().putString(KEY_HOST_PERM_HASH, cleaned).apply()
+        _settings.value = _settings.value.copy(hostPermanentPasswordHash = cleaned)
+    }
+
+    fun clearHostPermanentPasswordHash() {
+        prefs.edit().remove(KEY_HOST_PERM_HASH).apply()
+        _settings.value = _settings.value.copy(hostPermanentPasswordHash = "")
+    }
+
+    fun setHostRequireAccept(requireAccept: Boolean) {
+        prefs.edit().putBoolean(KEY_HOST_REQUIRE_ACCEPT, requireAccept).apply()
+        _settings.value = _settings.value.copy(hostRequireAccept = requireAccept)
+    }
+
+    @Synchronized
+    fun reload() {
+        _settings.value = loadSettings()
+    }
+
+    @Synchronized
+    fun upsertHostTrustedPeer(peer: HostSavedTrustedPeer) {
+        val updated = upsertTrustedPeer(_settings.value.hostTrustedPeers, peer)
+        prefs.edit().putString(KEY_HOST_TRUSTED_PEERS, HostSavedTrustedPeer.listToJson(updated)).apply()
+        _settings.value = _settings.value.copy(hostTrustedPeers = updated)
+    }
+
+    @Synchronized
+    fun removeHostTrustedPeer(publicKeyHex: String): Boolean {
+        val before = _settings.value.hostTrustedPeers
+        val updated = removeTrustedPeer(before, publicKeyHex)
+        if (updated.size == before.size) return false
+        prefs.edit().putString(KEY_HOST_TRUSTED_PEERS, HostSavedTrustedPeer.listToJson(updated)).apply()
+        _settings.value = _settings.value.copy(hostTrustedPeers = updated)
+        return true
+    }
+
     fun recordRecentConnection(target: String, label: String, mode: Int, nowEpochMs: Long = System.currentTimeMillis()) {
         val normalizedTarget = normalizeTarget(target)
         if (normalizedTarget.isEmpty()) return
@@ -215,13 +313,37 @@ class AppPreferences(context: Context) {
     companion object {
         private const val PREFS_NAME = "veloxdesk_prefs"
         private const val KEY_LANGUAGE = "language"
+        private const val KEY_THEME_MODE = "theme_mode"
         private const val KEY_RENDEZVOUS_SERVER = "rendezvous_server"
         private const val KEY_RELAY_ONLY = "relay_only"
         private const val KEY_LAST_MODE = "last_mode"
         private const val KEY_RECENT_CONNECTIONS = "recent_connections_json"
+        private const val KEY_HOST_PASSWORD_MODE = "host_password_mode"
+        private const val KEY_HOST_PERM_HASH = "host_permanent_password_hash"
+        private const val KEY_HOST_REQUIRE_ACCEPT = "host_require_accept"
+        private const val KEY_HOST_TRUSTED_PEERS = "host_trusted_peers_json"
         private const val PREFIX_DESKTOP = "profile_desktop_"
         private const val PREFIX_GAMING = "profile_gaming_"
         const val MAX_RECENT = 12
+
+        fun upsertTrustedPeer(
+            existing: List<HostSavedTrustedPeer>,
+            peer: HostSavedTrustedPeer,
+        ): List<HostSavedTrustedPeer> {
+            val pkNorm = peer.publicKeyHex.trim().lowercase(Locale.US)
+            if (pkNorm.isEmpty()) return existing
+            val cleaned = peer.copy(publicKeyHex = pkNorm)
+            val filtered = existing.filterNot { it.publicKeyHex.equals(pkNorm, ignoreCase = true) }
+            return listOf(cleaned) + filtered
+        }
+
+        fun removeTrustedPeer(
+            existing: List<HostSavedTrustedPeer>,
+            publicKeyHex: String,
+        ): List<HostSavedTrustedPeer> {
+            val pkNorm = publicKeyHex.trim()
+            return existing.filterNot { it.publicKeyHex.equals(pkNorm, ignoreCase = true) }
+        }
 
         /**
          * Formats a 9-digit VeloxDesk Device ID as `XXX XXX XXX`.

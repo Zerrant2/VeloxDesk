@@ -3,6 +3,7 @@
 //! 100% protocol-compatible with VeloxDesk desktop host v0.3.0+.
 
 pub mod clipboard;
+pub mod host;
 pub mod jni_bridge;
 pub mod session;
 pub mod stats;

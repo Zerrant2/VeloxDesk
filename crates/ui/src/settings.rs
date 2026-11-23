@@ -47,6 +47,54 @@ impl Language {
     }
 }
 
+/// Desktop UI color theme preference (`System` follows the OS dark/light mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemePreference {
+    pub const ALL: [ThemePreference; 3] = [
+        ThemePreference::System,
+        ThemePreference::Dark,
+        ThemePreference::Light,
+    ];
+
+    pub fn label_for(self, lang: Language) -> &'static str {
+        let t = crate::i18n::tr(lang);
+        match self {
+            ThemePreference::System => t.theme_system,
+            ThemePreference::Dark => t.theme_dark,
+            ThemePreference::Light => t.theme_light,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.label_for(Language::En)
+    }
+
+    /// Cycle through `System -> Dark -> Light -> System`.
+    pub const fn next(self) -> Self {
+        match self {
+            ThemePreference::System => ThemePreference::Dark,
+            ThemePreference::Dark => ThemePreference::Light,
+            ThemePreference::Light => ThemePreference::System,
+        }
+    }
+
+    /// Convert to [`egui::ThemePreference`].
+    pub const fn to_egui(self) -> egui::ThemePreference {
+        match self {
+            ThemePreference::System => egui::ThemePreference::System,
+            ThemePreference::Dark => egui::ThemePreference::Dark,
+            ThemePreference::Light => egui::ThemePreference::Light,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Mode {
     #[default]
@@ -319,6 +367,7 @@ impl Default for StreamSettings {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settings {
     pub language: Language,
+    pub theme: ThemePreference,
     pub recent: Vec<String>,
     /// Rendezvous server `host[:port]` (default port 21116) for connecting by 9-digit Device ID.
     pub rendezvous_server: String,
@@ -339,6 +388,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             language: Language::default(),
+            theme: ThemePreference::default(),
             recent: Vec::new(),
             rendezvous_server: String::new(),
             mode: Mode::Desktop,
@@ -414,6 +464,7 @@ impl RawStreamSettings {
 #[serde(default)]
 struct RawSettings {
     language: Option<Language>,
+    theme: Option<ThemePreference>,
     recent: Option<Vec<String>>,
     rendezvous_server: Option<String>,
     mode: Option<Mode>,
@@ -455,6 +506,7 @@ impl<'de> Deserialize<'de> for Settings {
 
         Ok(Self {
             language: raw.language.unwrap_or_default(),
+            theme: raw.theme.unwrap_or_default(),
             recent: raw.recent.unwrap_or_default(),
             rendezvous_server: raw.rendezvous_server.unwrap_or_default(),
             mode,
@@ -795,5 +847,30 @@ mod tests {
         // Permanent mode with no hash falls back to OTP enabled
         s.permanent_password_hash = None;
         assert!(s.effective_otp_enabled());
+    }
+
+    #[test]
+    fn theme_preference_roundtrip_and_v030_compat() {
+        assert_eq!(Settings::default().theme, ThemePreference::System);
+        assert_eq!(ThemePreference::System.next(), ThemePreference::Dark);
+        assert_eq!(ThemePreference::Dark.next(), ThemePreference::Light);
+        assert_eq!(ThemePreference::Light.next(), ThemePreference::System);
+        assert_eq!(ThemePreference::System.to_egui(), egui::ThemePreference::System);
+        assert_eq!(ThemePreference::Dark.to_egui(), egui::ThemePreference::Dark);
+        assert_eq!(ThemePreference::Light.to_egui(), egui::ThemePreference::Light);
+
+        // Legacy JSON without `theme` field defaults to `ThemePreference::System`.
+        let legacy: Settings = serde_json::from_str(r#"{"language":"En","mode":"Desktop"}"#).unwrap();
+        assert_eq!(legacy.theme, ThemePreference::System);
+
+        let dir = std::env::temp_dir().join(format!("veloxdesk-ui-theme-{}", std::process::id()));
+        for th in ThemePreference::ALL {
+            let path = dir.join(format!("theme-{th:?}.json"));
+            let s = Settings { theme: th, ..Default::default() };
+            s.save(&path).unwrap();
+            let reloaded = Settings::load(&path).unwrap();
+            assert_eq!(reloaded.theme, th);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

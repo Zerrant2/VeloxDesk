@@ -256,6 +256,10 @@ impl VideoSurface {
     pub fn set_hud_labels(&mut self, labels: hud::HudLabels) {
         self.hud_labels = labels;
     }
+    /// Apply the user's desktop color theme preference (`System` / `Dark` / `Light`) to egui.
+    pub fn set_theme_preference(&self, pref: egui::ThemePreference) {
+        self.egui_ctx.set_theme(pref);
+    }
     /// Adapter LUID on Windows when zero-copy DX12 import is active.
     pub fn adapter_luid(&self) -> Option<u64> {
         self.importer.adapter_luid()

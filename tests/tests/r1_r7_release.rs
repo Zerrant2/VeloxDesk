@@ -444,6 +444,7 @@ fn r2_headless_render_all_ui_components_en_and_ru_with_glyph_check() {
         // PasswordPrompt, FileManagerWindow, TerminalWindow, and TunnelsWindow.
         let info = SessionInfo {
             host_name: "remote-host".into(),
+            host_os: "windows".into(),
             displays: vec![
                 DisplayInfo { index: 0, name: "Main".into(), width: 2560, height: 1440, primary: true, ..Default::default() },
                 DisplayInfo { index: 1, name: "Side".into(), width: 1920, height: 1080, ..Default::default() },

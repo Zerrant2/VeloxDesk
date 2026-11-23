@@ -56,6 +56,18 @@ object BridgeConstants {
     const val DEFAULT_RENDEZVOUS_PORT = 21116
     const val DEFAULT_RELAY_PORT = 21117
     const val DEFAULT_DIRECT_PORT = 21118
+
+    // Host input event kinds emitted by Rust -> VeloxHostCallback.onHostInputEvent
+    const val HOST_INPUT_MOUSE_MOVE = 0
+    const val HOST_INPUT_MOUSE_BUTTON = 1
+    const val HOST_INPUT_MOUSE_WHEEL = 2
+    const val HOST_INPUT_KEY = 3
+    const val HOST_INPUT_TEXT = 4
+
+    // Mouse button codes in onHostInputEvent(kind = HOST_INPUT_MOUSE_BUTTON)
+    const val HOST_MOUSE_BTN_LEFT = 1
+    const val HOST_MOUSE_BTN_RIGHT = 2
+    const val HOST_MOUSE_BTN_MIDDLE = 3
 }
 
 enum class ScaleMode(val id: Int) {
@@ -124,4 +136,115 @@ data class AuthPromptData(
     val hostFingerprint: String,
     val allowPerm: Boolean,
     val allowOtp: Boolean,
+)
+
+enum class HostPasswordMode(val id: Int) {
+    ONE_TIME(0),
+    PERMANENT(1),
+    BOTH(2);
+
+    companion object {
+        fun fromId(id: Int): HostPasswordMode =
+            entries.firstOrNull { it.id == id } ?: ONE_TIME
+    }
+}
+
+data class HostSavedTrustedPeer(
+    val publicKeyHex: String,
+    val deviceId: String,
+    val name: String,
+    val fingerprint: String,
+    val allowInput: Boolean = true,
+    val allowClipboard: Boolean = true,
+    val allowFileTransfer: Boolean = false,
+    val allowAudio: Boolean = true,
+    val allowTerminal: Boolean = false,
+    val allowTunnel: Boolean = false,
+    val allowPrivacyMode: Boolean = false,
+) {
+    fun toJsonObject(): org.json.JSONObject = org.json.JSONObject().apply {
+        put("publicKeyHex", publicKeyHex)
+        put("deviceId", deviceId)
+        put("name", name)
+        put("fingerprint", fingerprint)
+        put("allowInput", allowInput)
+        put("allowClipboard", allowClipboard)
+        put("allowFileTransfer", allowFileTransfer)
+        put("allowAudio", allowAudio)
+        put("allowTerminal", allowTerminal)
+        put("allowTunnel", allowTunnel)
+        put("allowPrivacyMode", allowPrivacyMode)
+    }
+
+    companion object {
+        fun fromJsonObject(obj: org.json.JSONObject): HostSavedTrustedPeer? {
+            val pk = obj.optString("publicKeyHex", "").trim()
+            if (pk.isEmpty()) return null
+            return HostSavedTrustedPeer(
+                publicKeyHex = pk,
+                deviceId = obj.optString("deviceId", ""),
+                name = obj.optString("name", ""),
+                fingerprint = obj.optString("fingerprint", ""),
+                allowInput = obj.optBoolean("allowInput", true),
+                allowClipboard = obj.optBoolean("allowClipboard", true),
+                allowFileTransfer = obj.optBoolean("allowFileTransfer", false),
+                allowAudio = obj.optBoolean("allowAudio", true),
+                allowTerminal = obj.optBoolean("allowTerminal", false),
+                allowTunnel = obj.optBoolean("allowTunnel", false),
+                allowPrivacyMode = obj.optBoolean("allowPrivacyMode", false),
+            )
+        }
+
+        fun fromJson(json: String): HostSavedTrustedPeer? = try {
+            fromJsonObject(org.json.JSONObject(json))
+        } catch (_: Throwable) {
+            null
+        }
+
+        fun listToJson(peers: List<HostSavedTrustedPeer>): String {
+            val arr = org.json.JSONArray()
+            peers.forEach { arr.put(it.toJsonObject()) }
+            return arr.toString()
+        }
+
+        fun listFromJson(json: String?): List<HostSavedTrustedPeer> {
+            if (json.isNullOrBlank()) return emptyList()
+            return try {
+                val arr = org.json.JSONArray(json)
+                buildList(arr.length()) {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        fromJsonObject(obj)?.let(::add)
+                    }
+                }
+            } catch (_: Throwable) {
+                emptyList()
+            }
+        }
+    }
+}
+
+data class HostApprovalRequest(
+    val requestId: Long,
+    val peerDeviceId: String,
+    val peerName: String,
+    val peerFingerprint: String,
+    val peerPubKeyHex: String,
+)
+
+data class HostUiState(
+    val isRunning: Boolean = false,
+    val isStarting: Boolean = false,
+    val deviceId: String = "",
+    val otp: String = "",
+    val port: Int = BridgeConstants.DEFAULT_DIRECT_PORT,
+    val lanIps: List<String> = emptyList(),
+    val tailscaleIp: String? = null,
+    val activePeerDeviceId: String? = null,
+    val activePeerName: String? = null,
+    val captureWidth: Int = 0,
+    val captureHeight: Int = 0,
+    val captureFps: Int = 30,
+    val accessibilityEnabled: Boolean = false,
+    val error: String? = null,
 )

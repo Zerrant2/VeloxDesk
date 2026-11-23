@@ -173,6 +173,41 @@ pub fn key_event(k: KeyCode, down: bool, mods: ModifiersState) -> Option<InputEv
     Some(ev(Event::Key(KeyEvent { hid_usage: hid, down, modifiers: modifiers_mask(mods) })))
 }
 
+/// Synthesize press + release events for Android Back navigation (`Escape`, HID `0x29`).
+pub fn android_back_events() -> Vec<InputEvent> {
+    [
+        key_event(KeyCode::Escape, true, ModifiersState::empty()),
+        key_event(KeyCode::Escape, false, ModifiersState::empty()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Synthesize press + release events for Android Home navigation (`SuperLeft` / MetaLeft, HID `0xE3`).
+pub fn android_home_events() -> Vec<InputEvent> {
+    [
+        key_event(KeyCode::SuperLeft, true, ModifiersState::empty()),
+        key_event(KeyCode::SuperLeft, false, ModifiersState::empty()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Synthesize press + release events for Android Recents switcher (`Alt+Tab`, HID `0xE2` + `0x2B`).
+pub fn android_recents_events() -> Vec<InputEvent> {
+    [
+        key_event(KeyCode::AltLeft, true, ModifiersState::ALT),
+        key_event(KeyCode::Tab, true, ModifiersState::ALT),
+        key_event(KeyCode::Tab, false, ModifiersState::ALT),
+        key_event(KeyCode::AltLeft, false, ModifiersState::empty()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 pub fn mouse_button(b: WButton, down: bool) -> Option<InputEvent> {
     let button = match b {
         WButton::Left => MouseButton::Left,
@@ -301,5 +336,23 @@ mod tests {
         r.push(0.7, -0.6);
         let e = r.take().unwrap();
         assert!(matches!(e.event, Some(Event::MouseRelative(MouseRelative { dx: 1, dy: -1 }))));
+    }
+
+    #[test]
+    fn android_nav_key_sequences_have_exact_hid_codes() {
+        let unpack = |evs: Vec<InputEvent>| -> Vec<(u32, bool, u32)> {
+            evs.into_iter()
+                .map(|e| match e.event {
+                    Some(Event::Key(k)) => (k.hid_usage, k.down, k.modifiers),
+                    other => panic!("expected Key event, got {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(unpack(android_back_events()), vec![(0x29, true, 0), (0x29, false, 0)]);
+        assert_eq!(unpack(android_home_events()), vec![(0xE3, true, 0), (0xE3, false, 0)]);
+        assert_eq!(
+            unpack(android_recents_events()),
+            vec![(0xE2, true, 4), (0x2B, true, 4), (0x2B, false, 4), (0xE2, false, 0)]
+        );
     }
 }

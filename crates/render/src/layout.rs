@@ -106,4 +106,31 @@ mod tests {
         let r = compute_video_rect(ScaleMode::Stretch, (640, 480), (800, 600));
         assert_eq!(r.to_ndc((800, 600)), [-1.0, 1.0, 1.0, -1.0]);
     }
+
+    #[test]
+    fn fit_portrait_and_landscape_android_rotation() {
+        let win = (1920, 1080);
+
+        // Portrait phone (1080x2400) inside 16:9 desktop window: centered pillarbox, zero stretching.
+        let portrait = (1080, 2400);
+        let rp = compute_video_rect(ScaleMode::Fit, portrait, win);
+        assert_eq!(rp.h, 1080.0);
+        assert_eq!(rp.w, 486.0);
+        assert_eq!(rp.x, 717.0);
+        assert_eq!(rp.y, 0.0);
+        assert_eq!(window_to_video(&rp, portrait, (100.0, 540.0)), None);
+        let (px, py) = window_to_video(&rp, portrait, (960.0, 540.0)).unwrap();
+        assert!((px - 540).abs() <= 2 && (py - 1200).abs() <= 2, "{px},{py}");
+
+        // Rotate same device to landscape (2400x1080): centered letterbox, full width.
+        let landscape = (2400, 1080);
+        let rl = compute_video_rect(ScaleMode::Fit, landscape, win);
+        assert_eq!(rl.w, 1920.0);
+        assert_eq!(rl.h, 864.0);
+        assert_eq!(rl.x, 0.0);
+        assert_eq!(rl.y, 108.0);
+        assert_eq!(window_to_video(&rl, landscape, (960.0, 20.0)), None);
+        let (lx, ly) = window_to_video(&rl, landscape, (960.0, 540.0)).unwrap();
+        assert!((lx - 1200).abs() <= 2 && (ly - 540).abs() <= 2, "{lx},{ly}");
+    }
 }
