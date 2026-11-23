@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VeloxDesk</string>
+
+    <!-- Common -->
+    <string name="btn_connect">Connect</string>
+    <string name="btn_cancel">Cancel</string>
+    <string name="btn_copy">Copy</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_settings">Settings</string>
+    <string name="btn_back">Back</string>
+    <string name="btn_close">Close</string>
+    <string name="btn_remove">Remove</string>
+    <string name="btn_check_updates">Check Updates</string>
+    <string name="btn_open_release">Download</string>
+    <string name="btn_configure">Configure</string>
+
+    <!-- Modes -->
+    <string name="mode_desktop">Desktop</string>
+    <string name="mode_gaming">Gaming</string>
+
+    <!-- Quality / Bitrate -->
+    <string name="quality_low">Low (5 Mbps)</string>
+    <string name="quality_balanced">Balanced (20 Mbps)</string>
+    <string name="quality_high">High (50 Mbps)</string>
+    <string name="quality_ultra">Ultra (100 Mbps)</string>
+    <string name="bitrate_5">5 Mbps</string>
+    <string name="bitrate_20">20 Mbps</string>
+    <string name="bitrate_50">50 Mbps</string>
+    <string name="bitrate_100">100 Mbps</string>
+
+    <!-- Scale / Touch -->
+    <string name="scale_fit">Fit</string>
+    <string name="scale_stretch">Stretch</string>
+    <string name="scale_original">Original</string>
+    <string name="touch_trackpad">Trackpad</string>
+    <string name="touch_direct">Direct Touch</string>
+    <string name="fps_60">60 FPS</string>
+    <string name="fps_120">120 FPS</string>
+
+    <!-- Connect Screen -->
+    <string name="this_device_title">This Device</string>
+    <string name="this_device_subtitle">Share this ID or fingerprint to trust this Android viewer on a Host PC.</string>
+    <string name="device_id_label">Device ID</string>
+    <string name="fingerprint_label">Ed25519 Fingerprint</string>
+    <string name="copied_device_id">Device ID copied</string>
+    <string name="copied_fingerprint">Fingerprint copied</string>
+    <string name="unavailable">Unavailable</string>
+
+    <string name="remote_pc_title">Remote PC</string>
+    <string name="remote_pc_subtitle">Connect via LAN IP, Tailscale IP, or 9-digit Device ID.</string>
+    <string name="target_placeholder">IP, IP:port, or 9-digit ID</string>
+    <string name="session_mode_label">Session Mode</string>
+    <string name="rendezvous_missing_hint">Connecting by 9-digit Device ID requires a Rendezvous server address.</string>
+    <string name="err_invalid_target">Enter a valid IP address, IP:port, or 9-digit Device ID.</string>
+    <string name="err_native_unavailable">Native engine unavailable: %1$s</string>
+
+    <string name="recent_connections_title">Recent Connections</string>
+    <string name="recent_connections_empty">No recent connections yet.</string>
+
+    <!-- Updates -->
+    <string name="update_available_title">Update available: %1$s</string>
+    <string name="update_checking">Checking for updates…</string>
+    <string name="update_up_to_date">VeloxDesk is up to date (%1$s)</string>
+    <string name="update_check_failed">Update check failed: %1$s</string>
+
+    <!-- Settings Screen -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_section_general">General</string>
+    <string name="settings_language">Language</string>
+    <string name="settings_section_network">Network &amp; P2P</string>
+    <string name="settings_rendezvous_label">Rendezvous Server</string>
+    <string name="settings_rendezvous_placeholder">host:21116</string>
+    <string name="settings_rendezvous_hint">Required for 9-digit Device ID connections over P2P / Relay.</string>
+    <string name="settings_relay_only">Force Relay Only</string>
+    <string name="settings_relay_only_desc">Route traffic through relay server instead of direct NAT hole-punching.</string>
+    <string name="settings_section_profile">Stream Profile</string>
+    <string name="settings_quality">Quality / Max Bitrate</string>
+    <string name="settings_fps_cap">Target FPS Cap</string>
+    <string name="settings_scaling">Display Scaling</string>
+    <string name="settings_touch_mode">Default Touch Mode</string>
+    <string name="settings_audio">Remote Audio</string>
+    <string name="settings_audio_desc">Stream host audio to this device via Opus.</string>
+    <string name="settings_clipboard">Clipboard Sync</string>
+    <string name="settings_clipboard_desc">Bidirectional text clipboard synchronization.</string>
+    <string name="settings_show_hud">Show Performance HUD on Connect</string>
+    <string name="settings_show_hud_desc">Display real-time FPS, latency, loss, and decoder telemetry.</string>
+
+    <!-- Session Screen & Status -->
+    <string name="status_connecting">Connecting to %1$s…</string>
+    <string name="status_waiting_host">Locating host via rendezvous…</string>
+    <string name="status_authenticating">Authenticating…</string>
+    <string name="status_waiting_accept">Waiting for host user to accept…</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_reconnecting">Reconnecting…</string>
+    <string name="status_waiting_video">Waiting for first video frame…</string>
+    <string name="session_closed_error">Connection ended: %1$s</string>
+    <string name="session_closed_clean">Disconnected from host</string>
+
+    <!-- Auth Dialog -->
+    <string name="auth_title">Authentication Required</string>
+    <string name="auth_host_id">Host ID: %1$s</string>
+    <string name="auth_fingerprint">Host Fingerprint (verify to prevent MITM):</string>
+    <string name="auth_hint_both">Enter the host permanent password or current one-time password (OTP).</string>
+    <string name="auth_hint_perm">Enter the host permanent password.</string>
+    <string name="auth_hint_otp">Enter the current one-time password (OTP) shown on the host.</string>
+    <string name="auth_password_label">Password / OTP</string>
+    <string name="auth_show_password">Show password</string>
+    <string name="auth_hide_password">Hide password</string>
+
+    <!-- Disconnect Confirm -->
+    <string name="disconnect_confirm_title">Disconnect session?</string>
+    <string name="disconnect_confirm_body">You are currently connected to %1$s.</string>
+
+    <!-- Session Toolbar & Special Keys -->
+    <string name="toolbar_toggle">Controls</string>
+    <string name="toolbar_touch_mode">Touch</string>
+    <string name="toolbar_keyboard">Keyboard</string>
+    <string name="toolbar_special_keys">Keys</string>
+    <string name="toolbar_display">Display %1$d</string>
+    <string name="toolbar_scale">Scale</string>
+    <string name="toolbar_reset_zoom">Reset Zoom</string>
+    <string name="toolbar_audio">Audio</string>
+    <string name="toolbar_clipboard">Clipboard</string>
+    <string name="toolbar_hud">HUD</string>
+    <string name="toolbar_bitrate">Bitrate</string>
+    <string name="special_key_cad">Ctrl+Alt+Del</string>
+    <string name="special_keys_fn_toggle">F1–F12</string>
+
+    <!-- HUD -->
+    <string name="hud_path_direct">Direct</string>
+    <string name="hud_path_p2p">P2P</string>
+    <string name="hud_path_relay">Relay</string>
+    <string name="hud_path_unknown">Link</string>
+    <string name="hud_hw">HW</string>
+    <string name="hud_sw">SW</string>
+</resources>

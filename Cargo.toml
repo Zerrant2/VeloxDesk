@@ -19,6 +19,7 @@ members = [
     "crates/terminal",
     "crates/virtual-display",
     "crates/service",
+    "crates/android-bridge",
     "apps/client",
     "apps/server",
     "tests",

@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VeloxDesk</string>
+
+    <!-- Common -->
+    <string name="btn_connect">Подключиться</string>
+    <string name="btn_cancel">Отмена</string>
+    <string name="btn_copy">Копировать</string>
+    <string name="btn_disconnect">Отключиться</string>
+    <string name="btn_settings">Настройки</string>
+    <string name="btn_back">Назад</string>
+    <string name="btn_close">Закрыть</string>
+    <string name="btn_remove">Удалить</string>
+    <string name="btn_check_updates">Обновления</string>
+    <string name="btn_open_release">Скачать</string>
+    <string name="btn_configure">Настроить</string>
+
+    <!-- Modes -->
+    <string name="mode_desktop">Рабочий стол</string>
+    <string name="mode_gaming">Игровой</string>
+
+    <!-- Quality / Bitrate -->
+    <string name="quality_low">Низкое (5 Мбит/с)</string>
+    <string name="quality_balanced">Сбаланс. (20 Мбит/с)</string>
+    <string name="quality_high">Высокое (50 Мбит/с)</string>
+    <string name="quality_ultra">Ультра (100 Мбит/с)</string>
+    <string name="bitrate_5">5 Мбит/с</string>
+    <string name="bitrate_20">20 Мбит/с</string>
+    <string name="bitrate_50">50 Мбит/с</string>
+    <string name="bitrate_100">100 Мбит/с</string>
+
+    <!-- Scale / Touch -->
+    <string name="scale_fit">Вписать</string>
+    <string name="scale_stretch">Растянуть</string>
+    <string name="scale_original">Оригинал</string>
+    <string name="touch_trackpad">Тачпад</string>
+    <string name="touch_direct">Прямой ввод</string>
+    <string name="fps_60">60 FPS</string>
+    <string name="fps_120">120 FPS</string>
+
+    <!-- Connect Screen -->
+    <string name="this_device_title">Это устройство</string>
+    <string name="this_device_subtitle">Передайте этот ID или отпечаток, чтобы добавить Android в доверенные устройства хоста.</string>
+    <string name="device_id_label">ID устройства</string>
+    <string name="fingerprint_label">Отпечаток Ed25519</string>
+    <string name="copied_device_id">ID устройства скопирован</string>
+    <string name="copied_fingerprint">Отпечаток скопирован</string>
+    <string name="unavailable">Недоступно</string>
+
+    <string name="remote_pc_title">Удалённый ПК</string>
+    <string name="remote_pc_subtitle">Подключение по LAN IP, Tailscale IP или 9-значному ID устройства.</string>
+    <string name="target_placeholder">IP, IP:порт или 9-значный ID</string>
+    <string name="session_mode_label">Режим сессии</string>
+    <string name="rendezvous_missing_hint">Для подключения по 9-значному ID укажите сервер Rendezvous в настройках.</string>
+    <string name="err_invalid_target">Введите корректный IP, IP:порт или 9-значный ID устройства.</string>
+    <string name="err_native_unavailable">Нативное ядро недоступно: %1$s</string>
+
+    <string name="recent_connections_title">Недавние подключения</string>
+    <string name="recent_connections_empty">Недавних подключений пока нет.</string>
+
+    <!-- Updates -->
+    <string name="update_available_title">Доступно обновление: %1$s</string>
+    <string name="update_checking">Проверка обновлений…</string>
+    <string name="update_up_to_date">Установлена актуальная версия (%1$s)</string>
+    <string name="update_check_failed">Ошибка проверки обновлений: %1$s</string>
+
+    <!-- Settings Screen -->
+    <string name="settings_title">Настройки</string>
+    <string name="settings_section_general">Общие</string>
+    <string name="settings_language">Язык интерфейса</string>
+    <string name="settings_section_network">Сеть и P2P</string>
+    <string name="settings_rendezvous_label">Сервер Rendezvous</string>
+    <string name="settings_rendezvous_placeholder">host:21116</string>
+    <string name="settings_rendezvous_hint">Нужен для подключения по 9-значному ID через P2P / Relay.</string>
+    <string name="settings_relay_only">Только через Relay</string>
+    <string name="settings_relay_only_desc">Направлять трафик через ретранслятор вместо прямого пробития NAT.</string>
+    <string name="settings_section_profile">Профиль потока</string>
+    <string name="settings_quality">Качество / макс. битрейт</string>
+    <string name="settings_fps_cap">Ограничение FPS</string>
+    <string name="settings_scaling">Масштабирование</string>
+    <string name="settings_touch_mode">Режим касания по умолчанию</string>
+    <string name="settings_audio">Удалённый звук</string>
+    <string name="settings_audio_desc">Передавать звук с хоста на это устройство через Opus.</string>
+    <string name="settings_clipboard">Синхронизация буфера</string>
+    <string name="settings_clipboard_desc">Двусторонняя синхронизация текстового буфера обмена.</string>
+    <string name="settings_show_hud">Показывать HUD при подключении</string>
+    <string name="settings_show_hud_desc">Отображать FPS, задержку, потери пакетов и статус декодера.</string>
+
+    <!-- Session Screen & Status -->
+    <string name="status_connecting">Подключение к %1$s…</string>
+    <string name="status_waiting_host">Поиск хоста через rendezvous…</string>
+    <string name="status_authenticating">Аутентификация…</string>
+    <string name="status_waiting_accept">Ожидание подтверждения на хосте…</string>
+    <string name="status_connected">Подключено</string>
+    <string name="status_reconnecting">Переподключение…</string>
+    <string name="status_waiting_video">Ожидание первого видеокадра…</string>
+    <string name="session_closed_error">Соединение завершено: %1$s</string>
+    <string name="session_closed_clean">Отключено от хоста</string>
+
+    <!-- Auth Dialog -->
+    <string name="auth_title">Требуется аутентификация</string>
+    <string name="auth_host_id">ID хоста: %1$s</string>
+    <string name="auth_fingerprint">Отпечаток хоста (проверьте для защиты от MITM):</string>
+    <string name="auth_hint_both">Введите постоянный пароль хоста или текущий одноразовый пароль (OTP).</string>
+    <string name="auth_hint_perm">Введите постоянный пароль хоста.</string>
+    <string name="auth_hint_otp">Введите текущий одноразовый пароль (OTP), показанный на хосте.</string>
+    <string name="auth_password_label">Пароль / OTP</string>
+    <string name="auth_show_password">Показать пароль</string>
+    <string name="auth_hide_password">Скрыть пароль</string>
+
+    <!-- Disconnect Confirm -->
+    <string name="disconnect_confirm_title">Завершить сессию?</string>
+    <string name="disconnect_confirm_body">Вы подключены к %1$s.</string>
+
+    <!-- Session Toolbar & Special Keys -->
+    <string name="toolbar_toggle">Панель</string>
+    <string name="toolbar_touch_mode">Касание</string>
+    <string name="toolbar_keyboard">Клавиатура</string>
+    <string name="toolbar_special_keys">Клавиши</string>
+    <string name="toolbar_display">Экран %1$d</string>
+    <string name="toolbar_scale">Масштаб</string>
+    <string name="toolbar_reset_zoom">Сброс зума</string>
+    <string name="toolbar_audio">Звук</string>
+    <string name="toolbar_clipboard">Буфер</string>
+    <string name="toolbar_hud">HUD</string>
+    <string name="toolbar_bitrate">Битрейт</string>
+    <string name="special_key_cad">Ctrl+Alt+Del</string>
+    <string name="special_keys_fn_toggle">F1–F12</string>
+
+    <!-- HUD -->
+    <string name="hud_path_direct">Прямое</string>
+    <string name="hud_path_p2p">P2P</string>
+    <string name="hud_path_relay">Relay</string>
+    <string name="hud_path_unknown">Канал</string>
+    <string name="hud_hw">HW</string>
+    <string name="hud_sw">SW</string>
+</resources>

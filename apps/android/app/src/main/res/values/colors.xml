@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="velox_bg">#0F172A</color>
+    <color name="velox_surface">#1E293B</color>
+    <color name="velox_primary">#38BDF8</color>
+    <color name="velox_emerald">#10B981</color>
+</resources>
