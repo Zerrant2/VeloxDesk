@@ -80,6 +80,7 @@ pub mod input_kind {
     pub const MOUSE_WHEEL: i32 = 2;
     pub const KEY: i32 = 3;
     pub const TEXT: i32 = 4;
+    pub const MOUSE_RELATIVE: i32 = 6;
 }
 
 /// Host password authentication mode matching the frozen JNI contract (`0=OneTime, 1=Permanent, 2=Both`).
@@ -1892,6 +1893,44 @@ async fn run_session(
     Ok(())
 }
 
+const MAX_FAST_STREAM_ACCEPT_ERRORS: u32 = 32;
+const FAST_STREAM_ERROR_WINDOW: Duration = Duration::from_millis(20);
+
+async fn should_stop_accept_loop(
+    err: &CoreError,
+    call_elapsed: Duration,
+    stop: &watch::Receiver<bool>,
+    fast_error_streak: &mut u32,
+) -> bool {
+    if *stop.borrow() {
+        return true;
+    }
+    match err {
+        CoreError::Protocol(e) => {
+            tracing::debug!("AndroidHost: ignoring stream with invalid preamble: {e}");
+            false
+        }
+        CoreError::Unsupported(_) | CoreError::Timeout => true,
+        CoreError::Closed | CoreError::Other(_) | CoreError::Io(_) => {
+            if call_elapsed >= FAST_STREAM_ERROR_WINDOW {
+                *fast_error_streak = 0;
+            }
+            *fast_error_streak += 1;
+            if *fast_error_streak >= MAX_FAST_STREAM_ACCEPT_ERRORS {
+                return true;
+            }
+            tracing::debug!(
+                error = %err,
+                streak = *fast_error_streak,
+                "AndroidHost: skipping broken incoming stream before preamble"
+            );
+            tokio::task::yield_now().await;
+            false
+        }
+        _ => true,
+    }
+}
+
 async fn accept_extra_streams(
     ch: Arc<dyn TransportChannel>,
     perms: Permissions,
@@ -1899,16 +1938,78 @@ async fn accept_extra_streams(
     callbacks: Arc<dyn HostCallbacks>,
     stop: watch::Receiver<bool>,
 ) {
+    use veloxdesk_core_traits::transport::{RecvStream, SendStream};
+
+    let mut acceptors = JoinSet::new();
     let mut readers = JoinSet::new();
+    let (incoming_tx, mut incoming_rx) =
+        mpsc::unbounded_channel::<(StreamKind, Option<SendStream>, RecvStream)>();
+
+    {
+        let ch_bi = ch.clone();
+        let tx_bi = incoming_tx.clone();
+        let mut stop_bi = stop.clone();
+        acceptors.spawn(async move {
+            let mut fast_error_streak = 0u32;
+            loop {
+                let started = Instant::now();
+                let res = tokio::select! {
+                    () = wait_watch_true(&mut stop_bi) => break,
+                    r = ch_bi.accept_bi() => r,
+                };
+                match res {
+                    Ok((kind, send, recv)) => {
+                        fast_error_streak = 0;
+                        if tx_bi.send((kind, Some(send), recv)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if should_stop_accept_loop(&e, started.elapsed(), &stop_bi, &mut fast_error_streak).await {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    {
+        let ch_uni = ch;
+        let tx_uni = incoming_tx;
+        let mut stop_uni = stop.clone();
+        acceptors.spawn(async move {
+            let mut fast_error_streak = 0u32;
+            loop {
+                let started = Instant::now();
+                let res = tokio::select! {
+                    () = wait_watch_true(&mut stop_uni) => break,
+                    r = ch_uni.accept_uni() => r,
+                };
+                match res {
+                    Ok((kind, recv)) => {
+                        fast_error_streak = 0;
+                        if tx_uni.send((kind, None, recv)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if should_stop_accept_loop(&e, started.elapsed(), &stop_uni, &mut fast_error_streak).await {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let mut stop_main = stop.clone();
     loop {
         let incoming = tokio::select! {
-            r = ch.accept_bi() => match r {
-                Ok((kind, send, recv)) => (kind, Some(send), recv),
-                Err(_) => break,
-            },
-            r = ch.accept_uni() => match r {
-                Ok((kind, recv)) => (kind, None, recv),
-                Err(_) => break,
+            () = wait_watch_true(&mut stop_main) => break,
+            maybe = incoming_rx.recv() => match maybe {
+                Some(v) => v,
+                None => break,
             },
         };
         let (kind, send_opt, recv) = incoming;
@@ -1968,6 +2069,7 @@ async fn accept_extra_streams(
             _ => {}
         }
     }
+    acceptors.abort_all();
     readers.abort_all();
 }
 
@@ -2045,7 +2147,10 @@ fn dispatch_input_event(ev: &InputEvent, callbacks: &Arc<dyn HostCallbacks>) {
         InputEventKind::Text(t) => {
             callbacks.on_input_event(input_kind::TEXT, 0, 0, 0, false, 0, 0, 0, &t.text);
         }
-        InputEventKind::MouseRelative(_) | InputEventKind::Gamepad(_) | InputEventKind::Touch(_) => {}
+        InputEventKind::MouseRelative(r) => {
+            callbacks.on_input_event(input_kind::MOUSE_RELATIVE, 0, 0, 0, false, 0, r.dx, r.dy, "");
+        }
+        InputEventKind::Gamepad(_) | InputEventKind::Touch(_) => {}
     }
 }
 
@@ -2120,6 +2225,91 @@ mod tests {
         assert_eq!(map_mouse_button_code(MouseButton::Left as i32), 1);
         assert_eq!(map_mouse_button_code(MouseButton::Right as i32), 2);
         assert_eq!(map_mouse_button_code(MouseButton::Middle as i32), 3);
+    }
+
+    #[test]
+    fn mouse_relative_dispatch_forwards_kind_6_and_deltas() {
+        use veloxdesk_protocol::control::MouseRelative;
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct RecordedEv {
+            kind: i32,
+            x: i32,
+            y: i32,
+            code: i32,
+            down: bool,
+            modifiers: i32,
+            dx: i32,
+            dy: i32,
+            text: String,
+        }
+
+        #[derive(Default)]
+        struct InputRec {
+            events: Mutex<Vec<RecordedEv>>,
+        }
+        impl HostCallbacks for InputRec {
+            fn on_listening(&self, _: &str, _: &str, _: u16) {}
+            fn on_otp_rotated(&self, _: &str) {}
+            fn on_approval_requested(&self, _: u64, _: &str, _: &str, _: &str, _: &str) {}
+            fn on_trusted_peer_added(&self, _: &str) {}
+            fn on_session_started(&self, _: &str, _: &str, _: u32, _: u32) {}
+            fn on_session_ended(&self, _: &str, _: &str) {}
+            fn on_bitrate_changed(&self, _: u32) {}
+            fn on_keyframe_requested(&self) {}
+            fn on_input_event(
+                &self,
+                kind: i32,
+                x: i32,
+                y: i32,
+                code: i32,
+                down: bool,
+                modifiers: i32,
+                dx: i32,
+                dy: i32,
+                text: &str,
+            ) {
+                self.events.lock().push(RecordedEv {
+                    kind,
+                    x,
+                    y,
+                    code,
+                    down,
+                    modifiers,
+                    dx,
+                    dy,
+                    text: text.to_string(),
+                });
+            }
+            fn on_clipboard_text(&self, _: &str) {}
+            fn on_error(&self, _: &str) {}
+            fn on_stopped(&self) {}
+        }
+
+        assert_eq!(input_kind::MOUSE_RELATIVE, 6);
+        let rec = Arc::new(InputRec::default());
+        let cb: Arc<dyn HostCallbacks> = rec.clone();
+        dispatch_input_event(
+            &InputEvent {
+                ts_us: 42,
+                event: Some(InputEventKind::MouseRelative(MouseRelative { dx: -18, dy: 37 })),
+            },
+            &cb,
+        );
+        assert_eq!(
+            rec.events.lock().as_slice(),
+            &[RecordedEv {
+                kind: input_kind::MOUSE_RELATIVE,
+                x: 0,
+                y: 0,
+                code: 0,
+                down: false,
+                modifiers: 0,
+                dx: -18,
+                dy: 37,
+                text: String::new(),
+            }]
+        );
     }
 
     #[test]

@@ -76,6 +76,10 @@
     <string name="host_control_enabled">Remote control enabled</string>
     <string name="host_control_disabled">Remote control off (view-only works now)</string>
     <string name="host_enable_control">Enable Control</string>
+    <string name="host_control_unbound_title">Accessibility service paused by Android</string>
+    <string name="host_control_unbound_desc">Remote control is selected in Settings, but Android paused the service (e.g. after an APK update). Open Accessibility Settings and turn VeloxDesk OFF and ON again. On Android 13+, allow \"Restricted settings\" in App Info if greyed out.</string>
+    <string name="host_rebind_control">Fix in Accessibility</string>
+    <string name="host_open_app_info">App Info</string>
     <string name="host_capture_denied">Screen capture permission was denied</string>
 
     <!-- Host Accept Prompt Dialog -->

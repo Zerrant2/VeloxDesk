@@ -76,6 +76,10 @@
     <string name="host_control_enabled">Удалённое управление включено</string>
     <string name="host_control_disabled">Управление выключено (просмотр уже работает)</string>
     <string name="host_enable_control">Включить управление</string>
+    <string name="host_control_unbound_title">Служба управления приостановлена Android</string>
+    <string name="host_control_unbound_desc">Управление включено в настройках, но Android приостановил службу (например, после обновления APK). Откройте настройки спецвозможностей, выключите и снова включите VeloxDesk. На Android 13+, если пункт неактивен, разрешите «Ограниченные настройки» в «О приложении».</string>
+    <string name="host_rebind_control">Открыть спецвозможности</string>
+    <string name="host_open_app_info">О приложении</string>
     <string name="host_capture_denied">Разрешение на захват экрана отклонено</string>
 
     <!-- Host Accept Prompt Dialog -->

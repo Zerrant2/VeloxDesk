@@ -3,6 +3,7 @@ package dev.veloxdesk.host
 import dev.veloxdesk.bridge.BridgeConstants
 import dev.veloxdesk.bridge.HostPasswordMode
 import dev.veloxdesk.bridge.HostSavedTrustedPeer
+import dev.veloxdesk.bridge.HostUiState
 import dev.veloxdesk.input.KeyMapper
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -221,6 +222,111 @@ class HostInputMapperTest {
         assertEquals(
             Pair(HostPasswordMode.PERMANENT, "\$argon2id\$v=19\$valid"),
             HostController.sanitizeAuthParams(HostPasswordMode.PERMANENT, " \$argon2id\$v=19\$valid "),
+        )
+    }
+
+    @Test
+    fun mouseRelativeMovesClampsAndBuildsDragGestures() {
+        assertEquals(6, BridgeConstants.HOST_INPUT_MOUSE_RELATIVE)
+        val mapper = HostInputMapper()
+
+        // First relative move starts from screen center (540, 960 on 1080x1920) -> (640, 860).
+        assertTrue(
+            mapper.onEvent(
+                BridgeConstants.HOST_INPUT_MOUSE_RELATIVE, 0, 0, 0, false, 0, 100, -100, "",
+                1080, 1920, 1080, 1920, 10L,
+            ).isEmpty(),
+        )
+        mapper.onEvent(
+            BridgeConstants.HOST_INPUT_MOUSE_BUTTON, 0, 0, BridgeConstants.HOST_MOUSE_BTN_LEFT, true, 0, 0, 0, "",
+            1080, 1920, 1080, 1920, 20L,
+        )
+        val tap = mapper.onEvent(
+            BridgeConstants.HOST_INPUT_MOUSE_BUTTON, 0, 0, BridgeConstants.HOST_MOUSE_BTN_LEFT, false, 0, 0, 0, "",
+            1080, 1920, 1080, 1920, 50L,
+        ).single() as HostAccessibilityAction.Tap
+        assertEquals(640f, tap.x, 0.5f)
+        assertEquals(860f, tap.y, 0.5f)
+
+        // Relative drag while left button is held down, plus upper/lower screen clamping.
+        mapper.onEvent(
+            BridgeConstants.HOST_INPUT_MOUSE_BUTTON, 0, 0, BridgeConstants.HOST_MOUSE_BTN_LEFT, true, 0, 0, 0, "",
+            1080, 1920, 1080, 1920, 100L,
+        )
+        mapper.onEvent(
+            BridgeConstants.HOST_INPUT_MOUSE_RELATIVE, 0, 0, 0, false, 0, 120, 150, "",
+            1080, 1920, 1080, 1920, 150L,
+        )
+        mapper.onEvent(
+            BridgeConstants.HOST_INPUT_MOUSE_RELATIVE, 0, 0, 0, false, 0, 5000, -5000, "",
+            1080, 1920, 1080, 1920, 220L,
+        )
+        val drag = mapper.onEvent(
+            BridgeConstants.HOST_INPUT_MOUSE_BUTTON, 0, 0, BridgeConstants.HOST_MOUSE_BTN_LEFT, false, 0, 0, 0, "",
+            1080, 1920, 1080, 1920, 300L,
+        ).single() as HostAccessibilityAction.Drag
+        assertEquals(3, drag.points.size)
+        assertEquals(ScreenPoint(640f, 860f), drag.points[0])
+        assertEquals(ScreenPoint(760f, 1010f), drag.points[1])
+        assertEquals(ScreenPoint(1079f, 0f), drag.points[2])
+        assertEquals(200L, drag.durationMs)
+    }
+
+    @Test
+    fun accessibilityBoundVsConfiguredUnboundHonestUiState() {
+        val base = HostUiState()
+        assertFalse(base.accessibilityEnabled)
+        assertFalse(base.accessibilityConfiguredUnbound)
+
+        // 1. Neither bound nor in Settings -> disabled, not configured-unbound.
+        val off = base.withAccessibility(bound = false, configuredInSettings = false)
+        assertFalse(off.accessibilityEnabled)
+        assertFalse(off.accessibilityConfiguredUnbound)
+
+        // 2. Listed in Settings.Secure, but instance == null (paused after APK upgrade / OEM kill)
+        //    -> MUST NOT report green accessibilityEnabled, MUST set accessibilityConfiguredUnbound!
+        val paused = base.withAccessibility(bound = false, configuredInSettings = true)
+        assertFalse(paused.accessibilityEnabled)
+        assertTrue(paused.accessibilityConfiguredUnbound)
+
+        // 3. Bound and in Settings -> green enabled, not configured-unbound.
+        val active = base.withAccessibility(bound = true, configuredInSettings = true)
+        assertTrue(active.accessibilityEnabled)
+        assertFalse(active.accessibilityConfiguredUnbound)
+
+        // 4. Bound (even before Settings string refreshes) -> green enabled, not configured-unbound.
+        val boundOnly = base.withAccessibility(bound = true, configuredInSettings = false)
+        assertTrue(boundOnly.accessibilityEnabled)
+        assertFalse(boundOnly.accessibilityConfiguredUnbound)
+
+        // Verify pure Settings.Secure component parser (full & shorthand class names).
+        val svcClass = VeloxAccessibilityService::class.java.name
+        assertTrue(
+            VeloxAccessibilityService.matchesEnabledAccessibilitySetting(
+                "com.other/com.other.A11y:dev.veloxdesk.viewer/$svcClass",
+                "dev.veloxdesk.viewer",
+                svcClass,
+            ),
+        )
+        assertTrue(
+            VeloxAccessibilityService.matchesEnabledAccessibilitySetting(
+                "dev.veloxdesk/.host.VeloxAccessibilityService",
+                "dev.veloxdesk",
+                svcClass,
+            ),
+        )
+        assertFalse(
+            VeloxAccessibilityService.matchesEnabledAccessibilitySetting(
+                "com.other.app/$svcClass",
+                "dev.veloxdesk.viewer",
+                svcClass,
+            ),
+        )
+        assertFalse(VeloxAccessibilityService.matchesEnabledAccessibilitySetting(null, "dev.veloxdesk.viewer", svcClass))
+        assertFalse(VeloxAccessibilityService.isBound())
+        // Rate-limited drop when unbound must never throw.
+        VeloxAccessibilityService.dispatchRemoteInput(
+            BridgeConstants.HOST_INPUT_MOUSE_RELATIVE, 0, 0, 0, false, 0, 5, 5, "", 1080, 1920,
         )
     }
 }

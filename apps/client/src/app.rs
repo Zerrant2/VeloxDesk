@@ -16,7 +16,7 @@ use veloxdesk_protocol::control::{SessionConfig, SessionModeUpdate, SystemPowerA
 use veloxdesk_render::hud::{HudLabels, hud_line, is_toggle_shortcut};
 use veloxdesk_render::pattern::nv12_test_frame;
 use veloxdesk_render::winit::application::ApplicationHandler;
-use veloxdesk_render::winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
+use veloxdesk_render::winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use veloxdesk_render::winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use veloxdesk_render::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
@@ -213,6 +213,88 @@ impl WindowChromeState {
 
 fn is_fullscreen_shortcut(code: KeyCode, mods: ModifiersState) -> bool {
     code == KeyCode::KeyF && mods.control_key() && mods.shift_key() && !mods.alt_key()
+}
+
+/// Top safe zone height in logical points where the session toolbar pill / bar lives.
+const TOP_TOOLBAR_SAFE_ZONE_LOGICAL_Y: f64 = 72.0;
+
+fn is_android_host(host_os: &str) -> bool {
+    host_os.eq_ignore_ascii_case("android")
+}
+
+fn is_in_top_toolbar_safe_zone(physical_y: f64, scale_factor: f64) -> bool {
+    let sf = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    (physical_y / sf) <= TOP_TOOLBAR_SAFE_ZONE_LOGICAL_Y
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutoLockClickParams<'a> {
+    down: bool,
+    button: MouseButton,
+    in_gaming_relative_mode: bool,
+    host_os: &'a str,
+    pointer_locked: bool,
+    session_ui_active: bool,
+    egui_wants_pointer: bool,
+    response_consumed: bool,
+    cursor_pos: Option<(f64, f64)>,
+    scale_factor: f64,
+    inside_video_canvas: bool,
+}
+
+/// Decide whether a mouse button event should automatically re-lock the pointer in Gaming mode.
+fn should_auto_lock_on_click(p: AutoLockClickParams<'_>) -> bool {
+    if !p.down || p.button != MouseButton::Left {
+        return false;
+    }
+    if !p.in_gaming_relative_mode || is_android_host(p.host_os) || p.pointer_locked {
+        return false;
+    }
+    if p.session_ui_active || p.egui_wants_pointer || p.response_consumed {
+        return false;
+    }
+    let Some((_x, y)) = p.cursor_pos else {
+        return false;
+    };
+    if is_in_top_toolbar_safe_zone(y, p.scale_factor) {
+        return false;
+    }
+    p.inside_video_canvas
+}
+
+/// Decide whether `egui_winit`'s `repaint` flag on an input event should be suppressed
+/// during an active session to avoid 1000 Hz Present() storms while keeping toolbar hover
+/// and unlocked clicks responsive even on static 0 FPS frames.
+fn should_skip_session_repaint(
+    event: &WindowEvent,
+    pointer_locked: bool,
+    ui_active: bool,
+    egui_wants_pointer: bool,
+    response_consumed: bool,
+    cursor_pos: Option<(f64, f64)>,
+    scale_factor: f64,
+) -> bool {
+    let cursor_near_toolbar = !pointer_locked
+        && cursor_pos.is_some_and(|(_, y)| is_in_top_toolbar_safe_zone(y, scale_factor));
+    match event {
+        WindowEvent::CursorMoved { position, .. } => {
+            let near_toolbar = !pointer_locked && is_in_top_toolbar_safe_zone(position.y, scale_factor);
+            !ui_active && !egui_wants_pointer && !near_toolbar
+        }
+        WindowEvent::MouseInput { .. } => {
+            pointer_locked && !ui_active && !egui_wants_pointer && !response_consumed
+        }
+        WindowEvent::KeyboardInput { .. }
+        | WindowEvent::ModifiersChanged(_)
+        | WindowEvent::MouseWheel { .. } => {
+            !ui_active && !egui_wants_pointer && !response_consumed && !cursor_near_toolbar
+        }
+        _ => false,
+    }
 }
 
 /// Viewer-side CLI overrides for M2/M4 P2P, E2EE, tunnels, and portable mode.
@@ -418,6 +500,7 @@ pub struct App {
     wheel: WheelAccum,
     rel: RelativeAccum,
     pending_abs_move: Option<(i32, i32, u32)>,
+    last_cursor_pos: Option<(f64, f64)>,
     last_abs_send: Instant,
     last_rel_send: Instant,
     redraw_requested: bool,
@@ -486,6 +569,7 @@ impl App {
             wheel: WheelAccum::default(),
             rel: RelativeAccum::default(),
             pending_abs_move: None,
+            last_cursor_pos: None,
             last_abs_send: past,
             last_rel_send: past,
             redraw_requested: false,
@@ -855,6 +939,7 @@ impl App {
         self.release_pointer();
         self.pressed.clear();
         self.pending_abs_move = None;
+        self.last_cursor_pos = None;
         self.chrome.end_session();
         self.toolbar.expanded = self.chrome.toolbar_expanded;
         self.toolbar.power_confirm = None;
@@ -954,9 +1039,14 @@ impl App {
         self.pointer_locked = false;
         self.chrome.pointer_locked = false;
         self.session_info.pointer_locked = false;
+        self.release_all_keys();
+        self.request_redraw();
     }
 
     fn lock_pointer(&mut self) {
+        if self.is_android_host() {
+            return;
+        }
         let Some(s) = &self.surface else { return };
         let w = s.window();
         let ok = w
@@ -975,8 +1065,16 @@ impl App {
     fn toggle_pointer_lock(&mut self) {
         if self.pointer_locked {
             self.release_pointer();
-        } else if matches!(self.state, State::Session { .. }) {
+            if matches!(self.state, State::Session { .. }) {
+                self.toolbar.expanded = true;
+                self.chrome.toolbar_expanded = true;
+                self.request_redraw();
+            }
+        } else if matches!(self.state, State::Session { .. }) && !self.is_android_host() {
+            self.toolbar.expanded = false;
+            self.chrome.toolbar_expanded = false;
             self.lock_pointer();
+            self.request_redraw();
         }
     }
 
@@ -986,8 +1084,14 @@ impl App {
         }
     }
 
+    fn is_android_host(&self) -> bool {
+        is_android_host(&self.session_info.host_os)
+    }
+
     fn relative_mode(&self) -> bool {
-        self.settings.mode == Mode::Gaming && self.settings.active().relative_mouse_in_gaming
+        self.settings.mode == Mode::Gaming
+            && self.settings.active().relative_mouse_in_gaming
+            && !self.is_android_host()
     }
 
     /// Host display pixel for a video pixel (the host may stream a scaled image).
@@ -1804,6 +1908,9 @@ impl App {
                 if !cfg.host_os.is_empty() {
                     self.session_info.host_os = cfg.host_os.clone();
                 }
+                if is_android_host(&cfg.host_os) || self.is_android_host() {
+                    self.release_pointer();
+                }
                 if let Some(s) = &self.surface {
                     s.window()
                         .set_title(&tr(self.settings.language).fmt_window_title_host(&cfg.host_name));
@@ -2183,6 +2290,10 @@ impl App {
     fn on_keyboard(&mut self, event: &veloxdesk_render::winit::event::KeyEvent, consumed: bool) {
         let PhysicalKey::Code(code) = event.physical_key else { return };
         let down = event.state == ElementState::Pressed;
+        self.on_physical_key(code, down, consumed);
+    }
+
+    fn on_physical_key(&mut self, code: KeyCode, down: bool, consumed: bool) {
         // Local hotkeys (never forwarded).
         if down && self.modifiers.control_key() && self.modifiers.alt_key() && code == KeyCode::KeyG {
             self.toggle_pointer_lock();
@@ -2453,10 +2564,26 @@ impl ApplicationHandler<UserEvent> for App {
             (consumed, repaint, wants_ptr)
         };
 
+        match &event {
+            WindowEvent::CursorMoved { position, .. } => {
+                self.last_cursor_pos = Some((position.x, position.y));
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.last_cursor_pos = None;
+            }
+            _ => {}
+        }
+
         // Moving/occluding/closing the window does not invalidate pixels; requesting a GPU
         // redraw on `Moved` stalls Windows' modal drag loop (`26e488f`).
         // During an active session with no open UI overlays, also suppress mouse/keyboard-driven
-        // repaints so 1000 Hz gaming mice never trigger fullscreen DXGI Present() storms (BUG #1).
+        // repaints so 1000 Hz gaming mice never trigger fullscreen DXGI Present() storms (BUG #1),
+        // while keeping HiDPI top-toolbar hover and unlocked mouse clicks responsive at 0 FPS.
+        let scale_factor = self
+            .surface
+            .as_ref()
+            .map(|s| s.window().scale_factor())
+            .unwrap_or(1.0);
         let ui_active = self.session_ui_active();
         let skip_repaint = matches!(
             event,
@@ -2464,17 +2591,16 @@ impl ApplicationHandler<UserEvent> for App {
                 | WindowEvent::Occluded(_)
                 | WindowEvent::CloseRequested
                 | WindowEvent::Destroyed
-        ) || (in_session && match &event {
-            WindowEvent::CursorMoved { position, .. } => {
-                let cursor_near_toolbar = position.y <= 52.0;
-                !ui_active && !egui_wants_pointer && !cursor_near_toolbar
-            }
-            WindowEvent::KeyboardInput { .. }
-            | WindowEvent::ModifiersChanged(_)
-            | WindowEvent::MouseWheel { .. }
-            | WindowEvent::MouseInput { .. } => !ui_active && !egui_wants_pointer && !response_consumed,
-            _ => false,
-        });
+        ) || (in_session
+            && should_skip_session_repaint(
+                &event,
+                self.pointer_locked,
+                ui_active,
+                egui_wants_pointer,
+                response_consumed,
+                self.last_cursor_pos,
+                scale_factor,
+            ));
         if response_repaint && !skip_repaint {
             self.request_redraw();
         }
@@ -2511,13 +2637,29 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if !in_session || (egui_wants_pointer && !self.pointer_locked) {
+                if !in_session || ((egui_wants_pointer || response_consumed) && !self.pointer_locked) {
                     return;
                 }
                 self.flush_pending_abs();
                 self.flush_pending_rel();
                 let down = state == ElementState::Pressed;
-                if down && self.relative_mode() && !self.pointer_locked {
+                let inside_video_canvas = match (self.surface.as_ref(), self.last_cursor_pos) {
+                    (Some(surface), Some(pos)) => surface.window_to_video(pos).is_some(),
+                    _ => false,
+                };
+                if should_auto_lock_on_click(AutoLockClickParams {
+                    down,
+                    button,
+                    in_gaming_relative_mode: self.relative_mode(),
+                    host_os: &self.session_info.host_os,
+                    pointer_locked: self.pointer_locked,
+                    session_ui_active: self.session_ui_active(),
+                    egui_wants_pointer,
+                    response_consumed,
+                    cursor_pos: self.last_cursor_pos,
+                    scale_factor,
+                    inside_video_canvas,
+                }) {
                     self.lock_pointer();
                 }
                 if let Some(ev) = input::mouse_button(button, down) {
@@ -2832,5 +2974,222 @@ mod tests {
         s.auto_reconnect = false;
         assert!(!should_arm_auto_reconnect(&s, Some(SystemPowerAction::Reboot)));
         assert!(!should_arm_auto_reconnect(&s, Some(SystemPowerAction::RebootSafeMode)));
+    }
+
+    #[test]
+    fn should_auto_lock_on_click_enforces_ui_hidpi_canvas_button_and_android_guards() {
+        let valid = AutoLockClickParams {
+            down: true,
+            button: MouseButton::Left,
+            in_gaming_relative_mode: true,
+            host_os: "windows",
+            pointer_locked: false,
+            session_ui_active: false,
+            egui_wants_pointer: false,
+            response_consumed: false,
+            cursor_pos: Some((640.0, 200.0)),
+            scale_factor: 1.0,
+            inside_video_canvas: true,
+        };
+        assert!(should_auto_lock_on_click(valid));
+
+        // Reject mouse release & non-left buttons.
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { down: false, ..valid }));
+        for btn in [MouseButton::Right, MouseButton::Middle, MouseButton::Back, MouseButton::Forward] {
+            assert!(!should_auto_lock_on_click(AutoLockClickParams { button: btn, ..valid }));
+        }
+
+        // Reject when toolbar is expanded or any modal/panel (Settings, Chat, Files, etc.) is open.
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { session_ui_active: true, ..valid }));
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { egui_wants_pointer: true, ..valid }));
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { response_consumed: true, ..valid }));
+
+        // Reject Desktop mode or already locked.
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { in_gaming_relative_mode: false, ..valid }));
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { pointer_locked: true, ..valid }));
+
+        // Reject Android host (case-insensitive) even in Gaming mode.
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { host_os: "android", ..valid }));
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { host_os: "Android", ..valid }));
+
+        // Reject top toolbar safe zone (`logical_y <= 72.0`) across 100%, 150%, and 200% HiDPI scales.
+        assert!(!should_auto_lock_on_click(AutoLockClickParams {
+            cursor_pos: Some((640.0, 72.0)),
+            scale_factor: 1.0,
+            ..valid
+        }));
+        assert!(should_auto_lock_on_click(AutoLockClickParams {
+            cursor_pos: Some((640.0, 72.5)),
+            scale_factor: 1.0,
+            ..valid
+        }));
+        assert!(!should_auto_lock_on_click(AutoLockClickParams {
+            cursor_pos: Some((960.0, 108.0)),
+            scale_factor: 1.5,
+            ..valid
+        }));
+        assert!(should_auto_lock_on_click(AutoLockClickParams {
+            cursor_pos: Some((960.0, 109.0)),
+            scale_factor: 1.5,
+            ..valid
+        }));
+        assert!(!should_auto_lock_on_click(AutoLockClickParams {
+            cursor_pos: Some((1280.0, 144.0)),
+            scale_factor: 2.0,
+            ..valid
+        }));
+        assert!(should_auto_lock_on_click(AutoLockClickParams {
+            cursor_pos: Some((1280.0, 145.0)),
+            scale_factor: 2.0,
+            ..valid
+        }));
+
+        // Reject clicks outside active video canvas (letterbox bars) or before first CursorMoved.
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { inside_video_canvas: false, ..valid }));
+        assert!(!should_auto_lock_on_click(AutoLockClickParams { cursor_pos: None, ..valid }));
+    }
+
+    #[test]
+    fn hidpi_safe_zone_and_cursor_moved_repaint_gate() {
+        assert!(is_in_top_toolbar_safe_zone(72.0, 1.0));
+        assert!(!is_in_top_toolbar_safe_zone(72.1, 1.0));
+        assert!(is_in_top_toolbar_safe_zone(140.0, 2.0));
+        assert!(!is_in_top_toolbar_safe_zone(145.0, 2.0));
+
+        let move_near_200dpi = WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: veloxdesk_render::winit::dpi::PhysicalPosition::new(1280.0, 130.0),
+        };
+        // At 200% DPI, physical y = 130 -> logical y = 65 <= 72: MUST NOT skip repaint when unlocked!
+        assert!(!should_skip_session_repaint(
+            &move_near_200dpi,
+            false,
+            false,
+            false,
+            false,
+            Some((1280.0, 130.0)),
+            2.0,
+        ));
+
+        let move_canvas_200dpi = WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: veloxdesk_render::winit::dpi::PhysicalPosition::new(1280.0, 400.0),
+        };
+        // Below safe zone with no active UI: skips repaint to prevent 1000 Hz Present() storms.
+        assert!(should_skip_session_repaint(
+            &move_canvas_200dpi,
+            false,
+            false,
+            false,
+            false,
+            Some((1280.0, 400.0)),
+            2.0,
+        ));
+        // When session UI is active (e.g. toolbar expanded after Ctrl+Alt+G): NEVER skips repaint!
+        assert!(!should_skip_session_repaint(
+            &move_canvas_200dpi,
+            false,
+            true,
+            false,
+            false,
+            Some((1280.0, 400.0)),
+            2.0,
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_alt_g_unlock_expands_toolbar_releases_pressed_keys_and_android_disables_lock() {
+        use veloxdesk_protocol::control::input_event;
+        use veloxdesk_render::winit::event_loop::EventLoop;
+        use veloxdesk_render::winit::platform::windows::EventLoopBuilderExtWindows;
+        use crate::session::SessionShared;
+
+        let el = EventLoop::<UserEvent>::with_user_event()
+            .with_any_thread(true)
+            .build()
+            .expect("headless test event loop");
+        let proxy = el.create_proxy();
+
+        let mut settings = Settings { mode: Mode::Gaming, ..Default::default() };
+        settings.gaming.relative_mouse_in_gaming = true;
+        let mut app = App::new(Launch::Gui, proxy, settings, None, ViewerCliOpts::default());
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SessionHandle {
+            shared: Arc::new(SessionShared::default()),
+            cmd: cmd_tx,
+            done: None,
+        };
+        let cfg = SessionConfig {
+            host_name: "GamingRig".into(),
+            host_os: "windows".into(),
+            ..Default::default()
+        };
+        app.session_info.host_os = "windows".into();
+        app.state = State::Session {
+            handle,
+            config: Box::new(cfg),
+            got_frame: true,
+        };
+        assert!(app.relative_mode());
+        assert!(!app.session_ui_active());
+
+        // Simulate active gameplay with pointer locked and Ctrl + Alt + W currently held down.
+        app.pointer_locked = true;
+        app.chrome.pointer_locked = true;
+        app.session_info.pointer_locked = true;
+        app.toolbar.expanded = false;
+        app.chrome.toolbar_expanded = false;
+
+        app.on_physical_key(KeyCode::KeyW, true, false);
+        app.modifiers = ModifiersState::CONTROL;
+        app.on_physical_key(KeyCode::ControlLeft, true, false);
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::ALT;
+        app.on_physical_key(KeyCode::AltLeft, true, false);
+        assert_eq!(app.pressed.len(), 3);
+        // Drain initial key-down events.
+        while cmd_rx.try_recv().is_ok() {}
+
+        // Press Ctrl+Alt+G -> unlocks pointer, expands toolbar, and sends key-up for all held keys!
+        app.on_physical_key(KeyCode::KeyG, true, false);
+
+        assert!(!app.pointer_locked);
+        assert!(!app.chrome.pointer_locked);
+        assert!(!app.session_info.pointer_locked);
+        assert!(app.toolbar.expanded, "Ctrl+Alt+G unlock must expand session toolbar");
+        assert!(app.chrome.toolbar_expanded);
+        assert!(app.session_ui_active(), "expanded toolbar must mark session_ui_active() true");
+        assert!(app.pressed.is_empty(), "Ctrl+Alt+G unlock must drain pressed keys");
+
+        let mut released_hids = Vec::new();
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let SessionCommand::Input(ev) = cmd
+                && let Some(input_event::Event::Key(k)) = ev.event
+            {
+                assert!(!k.down, "expected only key-up events on unlock, got {k:?}");
+                released_hids.push(k.hid_usage);
+            }
+        }
+        assert_eq!(
+            released_hids.len(),
+            3,
+            "must send key-up for W, ControlLeft, and AltLeft (and never forward KeyG)"
+        );
+        assert!(!released_hids.contains(&input::keycode_to_hid(KeyCode::KeyG).unwrap()));
+
+        // Switching to an Android host via SessionEvent::Config disables relative_mode and releases pointer.
+        app.pointer_locked = true;
+        app.chrome.pointer_locked = true;
+        app.session_info.pointer_locked = true;
+        app.handle_session_event(SessionEvent::Config(Box::new(SessionConfig {
+            host_name: "Pixel-9".into(),
+            host_os: "Android".into(),
+            ..Default::default()
+        })));
+        assert!(!app.relative_mode(), "Android host must never enable relative_mode");
+        assert!(!app.pointer_locked, "Android SessionConfig must release pointer lock");
+        app.toggle_pointer_lock();
+        assert!(!app.pointer_locked, "toggle_pointer_lock must be a no-op on Android hosts");
     }
 }

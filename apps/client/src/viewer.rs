@@ -895,21 +895,9 @@ mod net {
             let _ = ctrl_tx.finish().await;
         });
 
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<InputEvent>();
         let input_ch = ch.clone();
-        let input_writer = tokio::spawn(async move {
-            let Ok(stream) = input_ch.open_uni(StreamKind::Input).await else {
-                tracing::warn!("could not open Input stream");
-                return;
-            };
-            let mut sender = ControlSender::new(stream);
-            while let Some(ev) = input_rx.recv().await {
-                if sender.send(&Msg::Input(ev).into()).await.is_err() {
-                    break;
-                }
-            }
-            let _ = sender.finish().await;
-        });
+        let input_writer = tokio::spawn(run_input_writer(input_ch, input_rx));
 
         // 5. Dedicated decoder thread (ADR-006).
         let decoder = match DecoderHandle::spawn(
@@ -1666,6 +1654,59 @@ mod net {
         }
     }
 
+    async fn run_input_writer(
+        input_ch: Arc<dyn TransportChannel>,
+        input_rx: mpsc::UnboundedReceiver<InputEvent>,
+    ) {
+        run_input_writer_with(|| input_ch.open_uni(StreamKind::Input), input_rx).await;
+    }
+
+    async fn run_input_writer_with<O, F>(
+        mut open_stream: O,
+        mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
+    ) where
+        O: FnMut() -> F,
+        F: std::future::Future<Output = veloxdesk_core_traits::Result<veloxdesk_core_traits::transport::SendStream>>,
+    {
+        let mut sender: Option<ControlSender> = match open_stream().await {
+            Ok(stream) => Some(ControlSender::new(stream)),
+            Err(e) => {
+                tracing::warn!("initial Input stream open failed (will retry on input): {e}");
+                None
+            }
+        };
+
+        while let Some(ev) = input_rx.recv().await {
+            let env: Envelope = Msg::Input(ev).into();
+            if let Some(s) = sender.as_mut() {
+                if s.send(&env).await.is_ok() {
+                    continue;
+                }
+                tracing::warn!("Input stream send failed; reopening StreamKind::Input");
+                sender = None;
+            }
+
+            match open_stream().await {
+                Ok(stream) => {
+                    let mut new_sender = ControlSender::new(stream);
+                    if let Err(e) = new_sender.send(&env).await {
+                        tracing::warn!("Input stream resend failed after reopen: {e}");
+                        break;
+                    }
+                    sender = Some(new_sender);
+                }
+                Err(e) => {
+                    tracing::warn!("could not reopen Input stream: {e}");
+                    break;
+                }
+            }
+        }
+
+        if let Some(mut s) = sender {
+            let _ = s.finish().await;
+        }
+    }
+
     fn send_feedback(
         envelopes: Vec<Envelope>,
         ctrl_out: &mpsc::UnboundedSender<Envelope>,
@@ -1997,6 +2038,70 @@ mod net {
             );
             assert!(!was_ns && !was_aec);
             assert_eq!(bypass[0], 0.3);
+        }
+
+        #[tokio::test]
+        async fn input_writer_reopens_stream_and_resends_after_transient_drop() {
+            use std::collections::VecDeque;
+            use std::pin::Pin;
+            use std::sync::atomic::AtomicUsize;
+            use parking_lot::Mutex;
+            use veloxdesk_core_traits::transport::SendStream;
+            use veloxdesk_protocol::control::{MouseMove, input_event};
+            use veloxdesk_transport::ControlReceiver;
+
+            let (w1, r1) = tokio::io::duplex(4096);
+            let (w2, r2) = tokio::io::duplex(4096);
+            let mut streams: VecDeque<veloxdesk_core_traits::Result<SendStream>> = VecDeque::new();
+            // 1st open_uni fails transiently at session start.
+            streams.push_back(Err(CoreError::platform("transient open error")));
+            // 2nd open_uni succeeds for event #1, then peer drops r1 before event #2.
+            streams.push_back(Ok(Box::pin(w1) as Pin<Box<_>>));
+            // 3rd open_uni reopens cleanly and carries retried event #2 + event #3.
+            streams.push_back(Ok(Box::pin(w2) as Pin<Box<_>>));
+
+            let streams = Arc::new(Mutex::new(streams));
+            let open_calls = Arc::new(AtomicUsize::new(0));
+            let streams_bg = streams.clone();
+            let calls_bg = open_calls.clone();
+
+            let (tx, rx) = mpsc::unbounded_channel();
+            let writer_task = tokio::spawn(run_input_writer_with(
+                move || {
+                    calls_bg.fetch_add(1, Ordering::Relaxed);
+                    let next = streams_bg.lock().pop_front().unwrap_or(Err(CoreError::Closed));
+                    std::future::ready(next)
+                },
+                rx,
+            ));
+
+            let make_ev = |x: i32| InputEvent {
+                ts_us: x as u64,
+                event: Some(input_event::Event::MouseMove(MouseMove { x, y: 10, display: 0 })),
+            };
+
+            // Event #1 triggers reopen after initial open_uni failed.
+            tx.send(make_ev(101)).unwrap();
+            let mut ctrl_r1 = ControlReceiver::new(Box::pin(r1));
+            let env1 = ctrl_r1.recv().await.expect("recv event #1");
+            assert!(matches!(env1.msg, Some(Msg::Input(ref ev)) if ev.ts_us == 101));
+
+            // Drop ctrl_r1 to simulate host resetting/closing the first uni stream!
+            drop(ctrl_r1);
+
+            // Event #2 hits broken stream w1, reopens onto w2, and resends event #2 + event #3!
+            tx.send(make_ev(202)).unwrap();
+            tx.send(make_ev(303)).unwrap();
+            drop(tx);
+
+            let mut ctrl_r2 = ControlReceiver::new(Box::pin(r2));
+            let env2 = ctrl_r2.recv().await.expect("recv retried event #2");
+            let env3 = ctrl_r2.recv().await.expect("recv event #3");
+            assert!(matches!(env2.msg, Some(Msg::Input(ref ev)) if ev.ts_us == 202));
+            assert!(matches!(env3.msg, Some(Msg::Input(ref ev)) if ev.ts_us == 303));
+
+            writer_task.await.expect("writer task");
+            assert_eq!(open_calls.load(Ordering::Relaxed), 3);
         }
     }
 }

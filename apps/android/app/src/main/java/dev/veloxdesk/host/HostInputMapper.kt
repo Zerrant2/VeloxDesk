@@ -80,14 +80,16 @@ class HostInputMapper {
                 cursorX = mapped.x
                 cursorY = mapped.y
                 if (leftDown) {
-                    val last = dragPoints.lastOrNull()
-                    if (last == null || hypot((mapped.x - last.x).toDouble(), (mapped.y - last.y).toDouble()) >= 2.0) {
-                        if (dragPoints.size < MAX_DRAG_POINTS) {
-                            dragPoints.add(mapped)
-                        } else {
-                            dragPoints[dragPoints.lastIndex] = mapped
-                        }
-                    }
+                    appendDragPoint(mapped)
+                }
+                emptyList()
+            }
+
+            BridgeConstants.HOST_INPUT_MOUSE_RELATIVE -> {
+                cursorX = (cursorX + dx).coerceIn(0f, (sw - 1).coerceAtLeast(0).toFloat())
+                cursorY = (cursorY + dy).coerceIn(0f, (sh - 1).coerceAtLeast(0).toFloat())
+                if (leftDown) {
+                    appendDragPoint(ScreenPoint(cursorX, cursorY))
                 }
                 emptyList()
             }
@@ -113,6 +115,17 @@ class HostInputMapper {
             }
 
             else -> emptyList()
+        }
+    }
+
+    private fun appendDragPoint(point: ScreenPoint) {
+        val last = dragPoints.lastOrNull()
+        if (last == null || hypot((point.x - last.x).toDouble(), (point.y - last.y).toDouble()) >= 2.0) {
+            if (dragPoints.size < MAX_DRAG_POINTS) {
+                dragPoints.add(point)
+            } else {
+                dragPoints[dragPoints.lastIndex] = point
+            }
         }
     }
 

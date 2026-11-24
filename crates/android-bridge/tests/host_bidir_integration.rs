@@ -1044,3 +1044,160 @@ async fn host_gates_chat_when_allow_chat_is_false() {
     host.stop_and_join();
     let _ = std::fs::remove_dir_all(&host_dir);
 }
+
+// ───────────────────────── Test 6: 20x Concurrent Clipboard (bi) + Input (uni) Stress ─────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_clipboard_bi_and_input_uni_stress_20_iterations() {
+    use veloxdesk_protocol::control::MouseRelative;
+
+    let host_dir = temp_dir("bi-uni-race-stress");
+    let perm_pw = "RaceFix#061";
+    let perm_phc = hash_password_phc(perm_pw).expect("hash perm");
+    let rec = Arc::new(HostRecorder::default());
+    let viewer_id = DeviceIdentity::generate();
+
+    let trusted = vec![SavedTrustedPeerJson {
+        public_key_hex: encode_hex_pubkey_32(&viewer_id.public_key()),
+        device_id: viewer_id.device_id(),
+        name: "Stress-PC".into(),
+        fingerprint: viewer_id.fingerprint(),
+        allow_input: true,
+        allow_clipboard: true,
+        allow_file_transfer: false,
+        allow_audio: false,
+        allow_terminal: false,
+        allow_tunnel: false,
+        allow_privacy_mode: false,
+        allow_chat: true,
+    }];
+    let trusted_json = serde_json::to_string(&trusted).unwrap();
+
+    let host = AndroidHostEngine::start(
+        AndroidHostConfig {
+            files_dir: host_dir.clone(),
+            bind_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            rendezvous_addr: String::new(),
+            device_name: "Pixel-RaceFix".into(),
+            width: 1080,
+            height: 2400,
+            fps: 60,
+            password_mode: HostPasswordMode::Permanent,
+            permanent_hash_phc: perm_phc,
+            require_accept: false,
+            trusted_peers_json: trusted_json,
+            default_permissions: HostDefaultPermissions::default(),
+        },
+        rec.clone(),
+    )
+    .expect("start host");
+
+    assert!(wait_until(Duration::from_secs(5), || rec.listening.lock().unwrap().is_some()));
+    let (_, _, port) = rec.listening.lock().unwrap().clone().unwrap();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+
+    const ITERATIONS: usize = 20;
+    const EVENTS_PER_ITER: usize = 3;
+
+    for iter in 0..ITERATIONS {
+        rec.inputs.lock().unwrap().clear();
+        rec.clipboard.lock().unwrap().clear();
+        let ended_before = rec.sessions_ended.lock().unwrap().len();
+
+        let quic = connect(addr, &viewer_id, None).await.expect("connect quic");
+        let ch: Arc<dyn TransportChannel> = Arc::new(quic.clone());
+        let (ctrl_s, ctrl_r) = ch.open_bi(StreamKind::Control).await.expect("open control");
+        let (mut ctrl_tx, mut ctrl_rx) = framed(ctrl_s, ctrl_r);
+        ctrl_tx.send(&Msg::Hello(make_hello(&viewer_id, "Stress-PC")).into()).await.unwrap();
+
+        let challenge = match ctrl_rx.recv().await.unwrap().msg {
+            Some(Msg::AuthChallenge(c)) => c,
+            other => panic!("iter {iter}: expected AuthChallenge, got {other:?}"),
+        };
+        let host_pk: [u8; 32] = challenge.host_public_key.as_slice().try_into().unwrap();
+        let sig = sign_pubkey_challenge(&viewer_id, &challenge.nonce, &host_pk);
+        ctrl_tx
+            .send(&Msg::AuthResponse(AuthResponse { method: AuthMethod::PublicKey as i32, proof: sig.to_vec() }).into())
+            .await
+            .unwrap();
+        match ctrl_rx.recv().await.unwrap().msg {
+            Some(Msg::AuthResult(r)) if r.ok => {}
+            other => panic!("iter {iter}: expected AuthResult(ok), got {other:?}"),
+        }
+        match ctrl_rx.recv().await.unwrap().msg {
+            Some(Msg::SessionConfig(_)) => {}
+            other => panic!("iter {iter}: expected SessionConfig, got {other:?}"),
+        }
+
+        // Inject broken raw QUIC streams (invalid preamble byte 0xFE + early 0-byte FIN) to prove
+        // per-stream preamble errors never kill either accept loop!
+        if iter % 2 == 0 {
+            let mut bad_uni = quic.connection().open_uni().await.unwrap();
+            bad_uni.write_all(&[0xFE]).await.unwrap();
+            let _ = bad_uni.finish();
+        } else {
+            let mut empty_uni = quic.connection().open_uni().await.unwrap();
+            let _ = empty_uni.finish();
+        }
+
+        // Open Clipboard (bi) and Input (uni) simultaneously on separate tasks!
+        let ch_clip = ch.clone();
+        let ch_inp = ch.clone();
+        let clip_fut = tokio::spawn(async move { ch_clip.open_bi(StreamKind::Clipboard).await });
+        let inp_fut = tokio::spawn(async move { ch_inp.open_uni(StreamKind::Input).await });
+        let (clip_res, inp_res) = tokio::join!(clip_fut, inp_fut);
+        let (clip_s, _clip_r) = clip_res.unwrap().expect("open Clipboard bi");
+        let inp_s = inp_res.unwrap().expect("open Input uni");
+
+        let mut clip_tx = ControlSender::new(clip_s);
+        let clip_payload = format!("clip-iter-{iter}");
+        clip_tx
+            .send(&Msg::Clipboard(veloxdesk_android::clipboard::encode_clipboard_text(&clip_payload).unwrap()).into())
+            .await
+            .expect("send clipboard");
+
+        let mut inp_tx = ControlSender::new(inp_s);
+        let evs = [
+            InputEvent {
+                ts_us: 1,
+                event: Some(InputEventKind::MouseMove(MouseMove { x: 100 + iter as i32, y: 200, display: 0 })),
+            },
+            InputEvent {
+                ts_us: 2,
+                event: Some(InputEventKind::MouseRelative(MouseRelative { dx: 15, dy: -(iter as i32 + 1) })),
+            },
+            InputEvent {
+                ts_us: 3,
+                event: Some(InputEventKind::Text(TextInput { text: format!("iter-{iter}") })),
+            },
+        ];
+        for ev in evs {
+            inp_tx.send(&Msg::Input(ev).into()).await.expect("send input event");
+        }
+        let _ = inp_tx.finish().await;
+
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                rec.inputs.lock().unwrap().len() == EVENTS_PER_ITER
+                    && rec.clipboard.lock().unwrap().iter().any(|c| c == &clip_payload)
+            }),
+            "iter {iter}: lost Input or Clipboard due to stream accept race! inputs={:?}, clip={:?}",
+            rec.inputs.lock().unwrap(),
+            rec.clipboard.lock().unwrap()
+        );
+
+        let got = rec.inputs.lock().unwrap().clone();
+        assert_eq!(got[1].kind, input_kind::MOUSE_RELATIVE);
+        assert_eq!((got[1].dx, got[1].dy), (15, -(iter as i32 + 1)));
+        assert_eq!(got[2].text, format!("iter-{iter}"));
+
+        let _ = ctrl_tx
+            .send(&Msg::Close(veloxdesk_protocol::control::Close { code: 0, reason: "iter done".into() }).into())
+            .await;
+        ch.close(0, "iter done");
+        assert!(wait_until(Duration::from_secs(3), || rec.sessions_ended.lock().unwrap().len() > ended_before));
+    }
+
+    host.stop_and_join();
+    let _ = std::fs::remove_dir_all(&host_dir);
+}

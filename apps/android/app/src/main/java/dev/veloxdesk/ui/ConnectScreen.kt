@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.Settings
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -879,55 +880,130 @@ private fun ShareThisDeviceCard(
 
             // Accessibility Remote Control status bar
             Spacer(modifier = Modifier.height(10.dp))
-            Surface(
-                color = if (hostState.accessibilityEnabled) colors.successContainer else colors.warningContainer,
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(
-                    1.dp,
-                    if (hostState.accessibilityEnabled) {
-                        colors.success.copy(alpha = 0.4f)
-                    } else {
-                        colors.warning.copy(alpha = 0.45f)
-                    },
-                ),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+            if (hostState.accessibilityConfiguredUnbound) {
+                val context = LocalContext.current
+                Surface(
+                    color = colors.warningContainer,
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, colors.warning.copy(alpha = 0.65f)),
+                    modifier = Modifier.fillMaxWidth(),
                 ) {
-                    Icon(
-                        imageVector = if (hostState.accessibilityEnabled) {
-                            Icons.Rounded.CheckCircle
-                        } else {
-                            Icons.Rounded.TouchApp
-                        },
-                        contentDescription = null,
-                        tint = if (hostState.accessibilityEnabled) colors.success else colors.warning,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = if (hostState.accessibilityEnabled) {
-                            str(R.string.host_control_enabled)
-                        } else {
-                            str(R.string.host_control_disabled)
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = colors.textPrimary,
-                        modifier = Modifier.weight(1f),
-                    )
-                    if (!hostState.accessibilityEnabled) {
-                        TextButton(
-                            onClick = onEnableAccessibility,
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                        ) {
-                            Text(
-                                text = str(R.string.host_enable_control),
-                                color = colors.primary,
-                                fontWeight = FontWeight.Bold,
-                                style = MaterialTheme.typography.labelMedium,
+                    Column(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Rounded.WarningAmber,
+                                contentDescription = null,
+                                tint = colors.warning,
+                                modifier = Modifier.size(18.dp),
                             )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = str(R.string.host_control_unbound_title),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = colors.warning,
+                            )
+                        }
+                        Text(
+                            text = str(R.string.host_control_unbound_desc),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = colors.textPrimary,
+                        )
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            OutlinedButton(
+                                onClick = onEnableAccessibility,
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, colors.primary),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                            ) {
+                                Text(
+                                    text = str(R.string.host_rebind_control),
+                                    color = colors.primary,
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                            }
+                            TextButton(
+                                onClick = {
+                                    runCatching {
+                                        val intent = Intent(
+                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            Uri.fromParts("package", context.packageName, null),
+                                        ).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                        context.startActivity(intent)
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            ) {
+                                Text(
+                                    text = str(R.string.host_open_app_info),
+                                    color = colors.textSecondary,
+                                    fontWeight = FontWeight.SemiBold,
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                            }
+                        }
+                    }
+                }
+            } else {
+                Surface(
+                    color = if (hostState.accessibilityEnabled) colors.successContainer else colors.warningContainer,
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        if (hostState.accessibilityEnabled) {
+                            colors.success.copy(alpha = 0.4f)
+                        } else {
+                            colors.warning.copy(alpha = 0.45f)
+                        },
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (hostState.accessibilityEnabled) {
+                                Icons.Rounded.CheckCircle
+                            } else {
+                                Icons.Rounded.TouchApp
+                            },
+                            contentDescription = null,
+                            tint = if (hostState.accessibilityEnabled) colors.success else colors.warning,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (hostState.accessibilityEnabled) {
+                                str(R.string.host_control_enabled)
+                            } else {
+                                str(R.string.host_control_disabled)
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = colors.textPrimary,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (!hostState.accessibilityEnabled) {
+                            TextButton(
+                                onClick = onEnableAccessibility,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            ) {
+                                Text(
+                                    text = str(R.string.host_enable_control),
+                                    color = colors.primary,
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.labelMedium,
+                                )
+                            }
                         }
                     }
                 }

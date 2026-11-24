@@ -2,7 +2,6 @@ package dev.veloxdesk.host
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Path
@@ -32,6 +31,8 @@ class VeloxAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        droppedUnboundInputCount.set(0L)
+        lastUnboundWarnNs.set(0L)
         HostController.onAccessibilityStateChanged(true)
         Log.i(TAG, "VeloxAccessibilityService connected")
     }
@@ -217,26 +218,58 @@ class VeloxAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "VeloxAccessibility"
+        private const val UNBOUND_WARN_INTERVAL_NS = 5_000_000_000L
 
         @Volatile
         private var instance: VeloxAccessibilityService? = null
 
-        fun isEnabled(context: Context): Boolean {
-            if (instance != null) return true
+        private val lastUnboundWarnNs = java.util.concurrent.atomic.AtomicLong(0L)
+        private val droppedUnboundInputCount = java.util.concurrent.atomic.AtomicLong(0L)
+
+        /** True ONLY when Android currently has a live bound [VeloxAccessibilityService] instance. */
+        fun isBound(): Boolean = instance != null
+
+        /**
+         * True when `Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES` lists [VeloxAccessibilityService],
+         * regardless of whether Android has actually bound the service process right now.
+         */
+        fun isConfiguredInSettings(context: Context): Boolean {
             return try {
-                val expected = ComponentName(context, VeloxAccessibilityService::class.java)
                 val enabled = Settings.Secure.getString(
                     context.contentResolver,
                     Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-                ) ?: return false
-                enabled.split(':').any { raw ->
-                    val comp = ComponentName.unflattenFromString(raw.trim())
-                    comp == expected
-                }
+                )
+                matchesEnabledAccessibilitySetting(
+                    rawSetting = enabled,
+                    packageName = context.packageName,
+                    serviceClassName = VeloxAccessibilityService::class.java.name,
+                )
             } catch (_: Throwable) {
                 false
             }
         }
+
+        internal fun matchesEnabledAccessibilitySetting(
+            rawSetting: String?,
+            packageName: String,
+            serviceClassName: String,
+        ): Boolean {
+            if (rawSetting.isNullOrBlank() || packageName.isBlank() || serviceClassName.isBlank()) {
+                return false
+            }
+            return rawSetting.split(':').any { token ->
+                val trimmed = token.trim()
+                val slash = trimmed.indexOf('/')
+                if (slash <= 0 || slash >= trimmed.lastIndex) return@any false
+                val pkg = trimmed.substring(0, slash)
+                val clsPart = trimmed.substring(slash + 1)
+                val resolvedCls = if (clsPart.startsWith('.')) pkg + clsPart else clsPart
+                pkg == packageName && resolvedCls == serviceClassName
+            }
+        }
+
+        /** True ONLY when [instance] is live and bound (`dispatchRemoteInput` can actually inject). */
+        fun isEnabled(@Suppress("UNUSED_PARAMETER") context: Context): Boolean = isBound()
 
         fun openSettings(context: Context) {
             try {
@@ -267,7 +300,23 @@ class VeloxAccessibilityService : AccessibilityService() {
             srcWidth: Int,
             srcHeight: Int,
         ) {
-            val svc = instance ?: return
+            val svc = instance
+            if (svc == null) {
+                val dropped = droppedUnboundInputCount.incrementAndGet()
+                val nowNs = System.nanoTime()
+                val prevNs = lastUnboundWarnNs.get()
+                if (prevNs == 0L || nowNs - prevNs >= UNBOUND_WARN_INTERVAL_NS) {
+                    if (lastUnboundWarnNs.compareAndSet(prevNs, nowNs)) {
+                        Log.w(
+                            TAG,
+                            "Dropping remote input (kind=$kind, totalDropped=$dropped): " +
+                                "VeloxAccessibilityService is not bound (instance == null). " +
+                                "Toggle VeloxDesk OFF and ON in Android Accessibility Settings.",
+                        )
+                    }
+                }
+                return
+            }
             svc.mainHandler.post {
                 svc.handleRemoteInput(kind, x, y, code, down, modifiers, dx, dy, text, srcWidth, srcHeight)
             }

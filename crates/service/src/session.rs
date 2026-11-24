@@ -866,8 +866,51 @@ fn handle_privacy_mode(
     }
 }
 
+const MAX_FAST_STREAM_ACCEPT_ERRORS: u32 = 32;
+const FAST_STREAM_ERROR_WINDOW: Duration = Duration::from_millis(20);
+
+/// Returns `true` when an error from `accept_bi` / `accept_uni` should terminate that accept loop,
+/// or `false` when it is a per-stream preamble / early-close error on a still-live connection.
+async fn should_stop_accept_loop(
+    err: &CoreError,
+    call_elapsed: Duration,
+    stop: &watch::Receiver<bool>,
+    fast_error_streak: &mut u32,
+) -> bool {
+    if *stop.borrow() {
+        return true;
+    }
+    match err {
+        CoreError::Protocol(e) => {
+            tracing::debug!("ignoring stream with invalid preamble: {e}");
+            false
+        }
+        CoreError::Unsupported(_) | CoreError::Timeout => true,
+        // Note: `QuicChannel::accept_*` maps per-stream `FinishedEarly` (0-byte stream closed
+        // before preamble) to `CoreError::Closed` and per-stream `Reset` to `CoreError::Other`.
+        // When the QUIC connection itself is closed, `accept_*` returns immediately on every poll.
+        CoreError::Closed | CoreError::Other(_) | CoreError::Io(_) => {
+            if call_elapsed >= FAST_STREAM_ERROR_WINDOW {
+                *fast_error_streak = 0;
+            }
+            *fast_error_streak += 1;
+            if *fast_error_streak >= MAX_FAST_STREAM_ACCEPT_ERRORS {
+                return true;
+            }
+            tracing::debug!(error = %err, streak = *fast_error_streak, "skipping broken incoming stream before preamble");
+            tokio::task::yield_now().await;
+            false
+        }
+        _ => true,
+    }
+}
+
 /// Accept viewer-opened streams (`Input`, `Clipboard`, `FileTransfer`, `Tunnel`, `Terminal`),
 /// strictly gated by the granted session [`Permissions`].
+///
+/// Uses two independent concurrent accept tasks (`accept_bi` and `accept_uni`) rather than racing
+/// them in `tokio::select!`, because `QuicChannel::accept_*` awaits `conn.accept_*()` followed by
+/// `read_preamble()` and is therefore not cancellation-safe.
 async fn accept_streams(
     ch: Arc<dyn TransportChannel>,
     input: Option<InputHandle>,
@@ -875,19 +918,79 @@ async fn accept_streams(
     backends: HostBackends,
     stop: watch::Receiver<bool>,
 ) {
+    let mut acceptors = JoinSet::new();
     let mut readers = JoinSet::new();
     let file_cfg = backends.file_transfer.clone().unwrap_or_default();
     let tunnel_policy = backends.tunnel_policy.clone().unwrap_or_default();
 
+    let (incoming_tx, mut incoming_rx) =
+        mpsc::unbounded_channel::<(StreamKind, Option<SendStream>, RecvStream)>();
+
+    {
+        let ch_bi = ch.clone();
+        let tx_bi = incoming_tx.clone();
+        let mut stop_bi = stop.clone();
+        acceptors.spawn(async move {
+            let mut fast_error_streak = 0u32;
+            loop {
+                let started = std::time::Instant::now();
+                let res = tokio::select! {
+                    () = wait_stop(&mut stop_bi) => break,
+                    r = ch_bi.accept_bi() => r,
+                };
+                match res {
+                    Ok((kind, send, recv)) => {
+                        fast_error_streak = 0;
+                        if tx_bi.send((kind, Some(send), recv)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if should_stop_accept_loop(&e, started.elapsed(), &stop_bi, &mut fast_error_streak).await {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    {
+        let ch_uni = ch;
+        let tx_uni = incoming_tx;
+        let mut stop_uni = stop.clone();
+        acceptors.spawn(async move {
+            let mut fast_error_streak = 0u32;
+            loop {
+                let started = std::time::Instant::now();
+                let res = tokio::select! {
+                    () = wait_stop(&mut stop_uni) => break,
+                    r = ch_uni.accept_uni() => r,
+                };
+                match res {
+                    Ok((kind, recv)) => {
+                        fast_error_streak = 0;
+                        if tx_uni.send((kind, None, recv)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if should_stop_accept_loop(&e, started.elapsed(), &stop_uni, &mut fast_error_streak).await {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let mut stop_main = stop.clone();
     loop {
-        let incoming: (StreamKind, Option<SendStream>, RecvStream) = tokio::select! {
-            r = ch.accept_bi() => match r {
-                Ok((kind, send, recv)) => (kind, Some(send), recv),
-                Err(_) => break,
-            },
-            r = ch.accept_uni() => match r {
-                Ok((kind, recv)) => (kind, None, recv),
-                Err(_) => break,
+        let incoming = tokio::select! {
+            () = wait_stop(&mut stop_main) => break,
+            maybe = incoming_rx.recv() => match maybe {
+                Some(v) => v,
+                None => break,
             },
         };
         let (kind, send_opt, recv) = incoming;
@@ -987,6 +1090,7 @@ async fn accept_streams(
             other => tracing::debug!(?other, "unhandled stream kind"),
         }
     }
+    acceptors.abort_all();
     readers.abort_all();
 }
 
