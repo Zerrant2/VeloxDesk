@@ -63,6 +63,7 @@ object BridgeConstants {
     const val HOST_INPUT_MOUSE_WHEEL = 2
     const val HOST_INPUT_KEY = 3
     const val HOST_INPUT_TEXT = 4
+    const val HOST_INPUT_MOUSE_RELATIVE = 6
 
     // Mouse button codes in onHostInputEvent(kind = HOST_INPUT_MOUSE_BUTTON)
     const val HOST_MOUSE_BTN_LEFT = 1
@@ -354,6 +355,12 @@ data class HostUiState(
     val captureHeight: Int = 0,
     val captureFps: Int = 30,
     val accessibilityEnabled: Boolean = false,
+    val accessibilityConfiguredUnbound: Boolean = false,
     val chat: ChatState = ChatState(),
     val error: String? = null,
-)
+) {
+    fun withAccessibility(bound: Boolean, configuredInSettings: Boolean): HostUiState = copy(
+        accessibilityEnabled = bound,
+        accessibilityConfiguredUnbound = configuredInSettings && !bound,
+    )
+}

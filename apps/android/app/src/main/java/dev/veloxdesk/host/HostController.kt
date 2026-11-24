@@ -262,7 +262,8 @@ object HostController {
         val appCtx = context.applicationContext
         appContextRef = appCtx
         val ips = NetworkIpDetector.detectLocalAndTailscaleIps()
-        val a11y = VeloxAccessibilityService.isEnabled(appCtx)
+        val bound = VeloxAccessibilityService.isBound()
+        val configured = VeloxAccessibilityService.isConfiguredInSettings(appCtx)
         val deviceId = if (VeloxNative.isLoaded) {
             try {
                 VeloxNative.nativeInitIdentity(appCtx.filesDir.absolutePath)
@@ -277,13 +278,13 @@ object HostController {
                 deviceId = deviceId,
                 lanIps = ips.lanIps,
                 tailscaleIp = ips.tailscaleIp,
-                accessibilityEnabled = a11y,
-            )
+            ).withAccessibility(bound = bound, configuredInSettings = configured)
         }
     }
 
     internal fun onAccessibilityStateChanged(enabled: Boolean) {
-        _uiState.update { it.copy(accessibilityEnabled = enabled) }
+        val configured = appContextRef?.let { VeloxAccessibilityService.isConfiguredInSettings(it) } ?: false
+        _uiState.update { it.withAccessibility(bound = enabled, configuredInSettings = configured) }
     }
 
     /**
@@ -573,6 +574,8 @@ object HostController {
                 clipboard = clip
 
                 val ips = NetworkIpDetector.detectLocalAndTailscaleIps()
+                val bound = VeloxAccessibilityService.isBound()
+                val configured = VeloxAccessibilityService.isConfiguredInSettings(service)
                 _uiState.update {
                     it.copy(
                         isRunning = true,
@@ -582,9 +585,8 @@ object HostController {
                         captureFps = fps,
                         lanIps = ips.lanIps,
                         tailscaleIp = ips.tailscaleIp,
-                        accessibilityEnabled = VeloxAccessibilityService.isEnabled(service),
                         error = null,
-                    )
+                    ).withAccessibility(bound = bound, configuredInSettings = configured)
                 }
                 return true
             } catch (t: Throwable) {

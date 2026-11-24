@@ -857,3 +857,159 @@ async fn same_peer_reconnect_supersedes_stale_session_while_other_peer_gets_busy
     let _ = stop_tx.send(());
     tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_clipboard_bi_and_input_uni_stress_20_iterations_over_quic() {
+    use veloxdesk_clipboard::{ClipboardBackend, ClipboardItem, MemoryClipboard};
+    use veloxdesk_protocol::control::MouseRelative;
+
+    let host_id = DeviceIdentity::generate();
+    let viewer_id = DeviceIdentity::generate();
+    let listener = listen("127.0.0.1:0".parse().unwrap(), &host_id).await.expect("listen");
+    let addr = listener.local_addr();
+
+    let inj_log = Arc::new(Mutex::new(InjLog::default()));
+    let mem_clip = MemoryClipboard::new();
+    let mem_clip_host = mem_clip.clone();
+
+    let backends = HostBackends {
+        capture: Arc::new(|_| Ok(Box::new(StaticCapture { sent: false }) as Box<dyn FrameCapture>)),
+        encoder: Arc::new(|cfg, _| Ok(Box::new(FakeEncoder { cfg: cfg.clone(), next_id: 0 }) as Box<dyn VideoEncoder>)),
+        injector: Arc::new({
+            let log = inj_log.clone();
+            move || Ok(Box::new(RecInjector(log.clone())) as Box<dyn InputInjector>)
+        }),
+        video_sink: Arc::new(|ch, sid| Box::new(TransportVideoSink(VideoSender::new(ch, sid)))),
+        rate: Arc::new(|s, mn, mx| Box::new(TransportAbr(AbrController::new(s, mn, mx)))),
+        audio_capture: None,
+        audio_encoder: None,
+        audio_playback: None,
+        clipboard: Some(Arc::new(move || Ok(Box::new(mem_clip_host.clone()) as Box<dyn ClipboardBackend>))),
+        privacy: None,
+        file_transfer: None,
+        tunnel_policy: None,
+    };
+
+    let cfg = HostConfig {
+        bind: addr,
+        max_fps: 30,
+        idle_fps: 5,
+        max_sessions: 32,
+        ipc_port: None,
+        ..Default::default()
+    };
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let host_task = tokio::spawn(serve_until(listener, cfg, backends, async {
+        let _ = stop_rx.await;
+    }));
+
+    const ITERATIONS: usize = 20;
+    const EVENTS_PER_ITER: usize = 3;
+
+    for iter in 0..ITERATIONS {
+        let expected_after = (iter + 1) * EVENTS_PER_ITER;
+        let quic = connect(addr, &viewer_id, Some(host_id.public_key())).await.expect("connect");
+        let ch: Arc<dyn TransportChannel> = Arc::new(quic.clone());
+
+        let (send, recv) = ch.open_bi(StreamKind::Control).await.expect("open control");
+        let (mut w, mut r) = framed(send, recv);
+        w.send(
+            &Msg::Hello(Hello {
+                device_id: viewer_id.device_id(),
+                public_key: viewer_id.public_key().to_vec(),
+                protocol_version: 1,
+                ..Default::default()
+            })
+            .into(),
+        )
+        .await
+        .unwrap();
+        let Msg::AuthResult(a) = recv_until(&mut r, |m| matches!(m, Msg::AuthResult(_))).await else { unreachable!() };
+        assert!(a.ok);
+        let Msg::SessionConfig(_) = recv_until(&mut r, |m| matches!(m, Msg::SessionConfig(_))).await else {
+            unreachable!()
+        };
+
+        // Also send a broken stream (invalid preamble byte or 0-byte early FIN) to ensure
+        // per-stream preamble errors never kill `accept_streams`.
+        if iter % 2 == 0 {
+            let mut bad_uni = quic.connection().open_uni().await.unwrap();
+            bad_uni.write_all(&[0xFD]).await.unwrap();
+            let _ = bad_uni.finish();
+        } else {
+            let mut empty_uni = quic.connection().open_uni().await.unwrap();
+            let _ = empty_uni.finish();
+        }
+
+        // Open Clipboard (bi) and Input (uni) concurrently!
+        let ch_clip = ch.clone();
+        let ch_inp = ch.clone();
+        let clip_fut = tokio::spawn(async move { ch_clip.open_bi(StreamKind::Clipboard).await });
+        let inp_fut = tokio::spawn(async move { ch_inp.open_uni(StreamKind::Input).await });
+        let (clip_res, inp_res) = tokio::join!(clip_fut, inp_fut);
+        let (clip_s, _clip_r) = clip_res.unwrap().expect("open Clipboard bi");
+        let inp_s = inp_res.unwrap().expect("open Input uni");
+
+        let clip_text = format!("svc-clip-{iter}");
+        let wire_clip = ClipboardItem::Text(clip_text.clone()).to_wire(false).unwrap();
+        let mut clip_w = veloxdesk_transport::ControlSender::new(clip_s);
+        clip_w.send(&Msg::Clipboard(wire_clip).into()).await.expect("send clipboard");
+
+        let mut iw = veloxdesk_transport::ControlSender::new(inp_s);
+        for k in 0..EVENTS_PER_ITER {
+            let ev = if k == 0 {
+                InputEvent {
+                    ts_us: (k + 1) as u64,
+                    event: Some(InputEventKind::MouseRelative(MouseRelative { dx: 10, dy: -5 })),
+                }
+            } else {
+                InputEvent {
+                    ts_us: (k + 1) as u64,
+                    event: Some(InputEventKind::Key(KeyEvent {
+                        hid_usage: 0x04 + k as u32,
+                        down: k % 2 == 1,
+                        modifiers: 0,
+                    })),
+                }
+            };
+            iw.send(&Msg::Input(ev).into()).await.expect("send input");
+        }
+        let _ = iw.finish().await;
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while inj_log.lock().unwrap().events < expected_after
+                || mem_clip.get() != Some(ClipboardItem::Text(clip_text.clone()))
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "iter {iter}: stream accept race dropped Input or Clipboard! injected={}/{} clip={:?}",
+                inj_log.lock().unwrap().events,
+                expected_after,
+                mem_clip.get()
+            )
+        });
+
+        let _ = w.send(&Msg::Close(Default::default()).into()).await;
+        let _ = w.finish().await;
+        ch.close(0, "iter done");
+        // Both Input stream EOF and session teardown invoke `release_all()` (2 per iteration).
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while inj_log.lock().unwrap().releases < (iter + 1) * 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for session teardown");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(inj_log.lock().unwrap().events, ITERATIONS * EVENTS_PER_ITER);
+    assert_eq!(inj_log.lock().unwrap().releases, ITERATIONS * 2);
+
+    let _ = stop_tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), host_task).await.unwrap().unwrap().unwrap();
+}

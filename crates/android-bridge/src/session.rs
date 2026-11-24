@@ -1294,6 +1294,46 @@ fn handle_viewer_chat_ack(ack: &ChatAck, callbacks: &Arc<dyn SessionCallbacks>) 
     callbacks.on_chat_ack(ack.id);
 }
 
+async fn run_input_writer(
+    input_ch: Arc<dyn TransportChannel>,
+    mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
+    session_open: Arc<AtomicBool>,
+) {
+    let mut sender = match input_ch.open_uni(StreamKind::Input).await {
+        Ok(stream) => Some(ControlSender::new(stream)),
+        Err(e) => {
+            tracing::warn!("could not open initial Input stream: {e}");
+            None
+        }
+    };
+    while let Some(ev) = input_rx.recv().await {
+        let env: Envelope = Msg::Input(ev).into();
+        if let Some(s) = sender.as_mut() {
+            if s.send(&env).await.is_ok() {
+                continue;
+            }
+            sender = None;
+        }
+        if !session_open.load(Ordering::Acquire) {
+            break;
+        }
+        tracing::debug!("Input stream send failed while session open; reopening StreamKind::Input once");
+        match input_ch.open_uni(StreamKind::Input).await {
+            Ok(stream) => {
+                let mut reopened = ControlSender::new(stream);
+                if reopened.send(&env).await.is_err() {
+                    break;
+                }
+                sender = Some(reopened);
+            }
+            Err(_) => break,
+        }
+    }
+    if let Some(mut s) = sender {
+        let _ = s.finish().await;
+    }
+}
+
 // ───────────────────────── Main async session loop ─────────────────────────
 
 async fn run_session_async(
@@ -1425,21 +1465,9 @@ async fn run_session_async(
         let _ = ctrl_tx.finish().await;
     });
 
-    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<InputEvent>();
-    let input_ch = ch.clone();
-    let input_writer = tokio::spawn(async move {
-        let Ok(stream) = input_ch.open_uni(StreamKind::Input).await else {
-            tracing::warn!("could not open Input stream");
-            return;
-        };
-        let mut sender = ControlSender::new(stream);
-        while let Some(ev) = input_rx.recv().await {
-            if sender.send(&Msg::Input(ev).into()).await.is_err() {
-                break;
-            }
-        }
-        let _ = sender.finish().await;
-    });
+    let (input_tx, input_rx) = mpsc::unbounded_channel::<InputEvent>();
+    let session_open = Arc::new(AtomicBool::new(true));
+    let input_writer = tokio::spawn(run_input_writer(ch.clone(), input_rx, session_open.clone()));
 
     // 5. Audio decode thread, mic uplink DSP (`Denoise -> AEC -> Opus`), & optional clipboard stream.
     let audio_out = AndroidAudioThread::spawn(
@@ -1741,6 +1769,7 @@ async fn run_session_async(
     };
 
     // 8. Clean teardown: disconnect virtual gamepads, stop clipboard & audio, flush Close & QUIC CONNECTION_CLOSE.
+    session_open.store(false, Ordering::Release);
     let disconnect_pads = shared.gamepads.lock().disconnect_all();
     for state in disconnect_pads {
         if let Ok(dgram) = encode_gamepad_datagram(&state) {
@@ -2124,5 +2153,168 @@ mod tests {
         let mut raw = [0.25f32, -0.25f32];
         proc.process_f32_in_place(&mut raw, None);
         assert_eq!(raw, [0.25f32, -0.25f32]);
+    }
+
+    #[tokio::test]
+    async fn input_writer_reopens_uni_stream_once_when_first_stream_breaks() {
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context as TaskContext, Poll};
+        use tokio::io::AsyncWrite;
+        use veloxdesk_core_traits::transport::{RecvStream, SendStream, TransportStats};
+
+        struct BrokenSendStream;
+        impl AsyncWrite for BrokenSendStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream stopped")))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        struct FlakyUniChannel {
+            uni_opens: AtomicUsize,
+            reopened_rx: Mutex<Option<RecvStream>>,
+        }
+
+        impl TransportChannel for FlakyUniChannel {
+            fn max_datagram_size(&self) -> Option<usize> {
+                Some(1200)
+            }
+            fn send_datagram(&self, _data: bytes::Bytes) -> veloxdesk_core_traits::Result<()> {
+                Ok(())
+            }
+            fn recv_datagram<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> Pin<Box<dyn std::future::Future<Output = veloxdesk_core_traits::Result<bytes::Bytes>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(std::future::pending())
+            }
+            fn open_bi<'life0, 'async_trait>(
+                &'life0 self,
+                _kind: StreamKind,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<Output = veloxdesk_core_traits::Result<(SendStream, RecvStream)>>
+                        + Send
+                        + 'async_trait,
+                >,
+            >
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(async { Err(CoreError::unsupported("bi")) })
+            }
+            fn open_uni<'life0, 'async_trait>(
+                &'life0 self,
+                kind: StreamKind,
+            ) -> Pin<Box<dyn std::future::Future<Output = veloxdesk_core_traits::Result<SendStream>> + Send + 'async_trait>>
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(async move {
+                    assert_eq!(kind, StreamKind::Input);
+                    let n = self.uni_opens.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        Ok(Box::pin(BrokenSendStream) as SendStream)
+                    } else {
+                        let (client, server) = tokio::io::duplex(64 * 1024);
+                        *self.reopened_rx.lock() = Some(Box::pin(server));
+                        Ok(Box::pin(client) as SendStream)
+                    }
+                })
+            }
+            fn accept_bi<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<Output = veloxdesk_core_traits::Result<(StreamKind, SendStream, RecvStream)>>
+                        + Send
+                        + 'async_trait,
+                >,
+            >
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(std::future::pending())
+            }
+            fn accept_uni<'life0, 'async_trait>(
+                &'life0 self,
+            ) -> Pin<
+                Box<
+                    dyn std::future::Future<Output = veloxdesk_core_traits::Result<(StreamKind, RecvStream)>>
+                        + Send
+                        + 'async_trait,
+                >,
+            >
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait,
+            {
+                Box::pin(std::future::pending())
+            }
+            fn stats(&self) -> TransportStats {
+                TransportStats::default()
+            }
+            fn peer_public_key(&self) -> Option<[u8; 32]> {
+                None
+            }
+            fn close(&self, _code: u32, _reason: &str) {}
+        }
+
+        let ch = Arc::new(FlakyUniChannel {
+            uni_opens: AtomicUsize::new(0),
+            reopened_rx: Mutex::new(None),
+        });
+        let (tx, rx) = mpsc::unbounded_channel();
+        let session_open = Arc::new(AtomicBool::new(true));
+        let writer = tokio::spawn(run_input_writer(ch.clone(), rx, session_open.clone()));
+
+        tx.send(InputEvent {
+            ts_us: 101,
+            event: Some(input_event::Event::MouseRelative(MouseRelative { dx: 12, dy: -8 })),
+        })
+        .unwrap();
+        tx.send(InputEvent {
+            ts_us: 202,
+            event: Some(input_event::Event::Key(KeyEvent { hid_usage: 0x04, down: true, modifiers: 0 })),
+        })
+        .unwrap();
+        drop(tx);
+        writer.await.unwrap();
+
+        assert_eq!(ch.uni_opens.load(Ordering::SeqCst), 2, "must reopen Input uni stream once");
+        let recv = ch.reopened_rx.lock().take().expect("reopened stream receiver");
+        let mut reader = ControlReceiver::new(recv);
+        let env1 = reader.recv().await.expect("first retried event");
+        let env2 = reader.recv().await.expect("second event on reopened stream");
+        assert!(matches!(
+            env1.msg,
+            Some(Msg::Input(InputEvent {
+                ts_us: 101,
+                event: Some(input_event::Event::MouseRelative(MouseRelative { dx: 12, dy: -8 }))
+            }))
+        ));
+        assert!(matches!(
+            env2.msg,
+            Some(Msg::Input(InputEvent {
+                ts_us: 202,
+                event: Some(input_event::Event::Key(KeyEvent { hid_usage: 0x04, down: true, .. }))
+            }))
+        ));
     }
 }
