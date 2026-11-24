@@ -777,6 +777,7 @@ fn v060_backends(
             }) as Arc<veloxdesk_service::AudioEncoderFactory>
         }),
         audio_playback: None,
+        mic_playback: None,
         clipboard: None,
         privacy,
         file_transfer: None,

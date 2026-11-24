@@ -134,6 +134,7 @@ fn synth_backends(privacy: Option<Arc<dyn PrivacyController>>) -> HostBackends {
         audio_capture: None,
         audio_encoder: None,
         audio_playback: None,
+        mic_playback: None,
         clipboard: None,
         privacy,
         file_transfer: None,

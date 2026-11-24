@@ -42,6 +42,7 @@ pub type RateFactory = dyn Fn(u32, u32, u32) -> Box<dyn RateController> + Send +
 pub type AudioCaptureFactory = dyn Fn() -> Result<Box<dyn AudioCapture>> + Send + Sync;
 pub type AudioEncoderFactory = dyn Fn(&AudioEncoderConfig) -> Result<Box<dyn AudioEncoder>> + Send + Sync;
 pub type AudioPlaybackFactory = dyn Fn() -> Result<Box<dyn AudioPlayback>> + Send + Sync;
+pub type MicPlaybackFactory = dyn Fn(Option<&str>) -> Result<Box<dyn AudioPlayback>> + Send + Sync;
 pub type ClipboardFactory = dyn Fn() -> Result<Box<dyn ClipboardBackend>> + Send + Sync;
 
 /// Factories for every platform-dependent stage. Cheap to clone (Arc'd closures).
@@ -55,6 +56,7 @@ pub struct HostBackends {
     pub audio_capture: Option<Arc<AudioCaptureFactory>>,
     pub audio_encoder: Option<Arc<AudioEncoderFactory>>,
     pub audio_playback: Option<Arc<AudioPlaybackFactory>>,
+    pub mic_playback: Option<Arc<MicPlaybackFactory>>,
     pub clipboard: Option<Arc<ClipboardFactory>>,
     pub privacy: Option<Arc<dyn PrivacyController>>,
     pub file_transfer: Option<FileTransferConfig>,
@@ -67,6 +69,12 @@ impl HostBackends {
         self.audio_capture = None;
         self.audio_encoder = None;
         self.audio_playback = None;
+        self.mic_playback = None;
+        self
+    }
+
+    pub fn with_mic_playback(mut self, factory: Arc<MicPlaybackFactory>) -> Self {
+        self.mic_playback = Some(factory);
         self
     }
 

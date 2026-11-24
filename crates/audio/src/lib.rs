@@ -77,18 +77,82 @@ pub fn create_mic_capture() -> Result<Box<dyn AudioCapture>> {
     }
 }
 
-/// Create the OS low-latency audio playback backend.
-pub fn create_playback() -> Result<Box<dyn AudioPlayback>> {
+/// Metadata for an enumerated audio playback (render) endpoint on the host OS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub is_virtual_cable: bool,
+}
+
+/// Returns `true` when an audio endpoint friendly name matches a known virtual audio cable
+/// (VB-Audio Virtual Cable, VoiceMeeter, Steam Streaming Microphone, Virtual Audio Cable, etc.).
+pub fn is_virtual_cable_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    const KEYWORDS: [&str; 6] = [
+        "cable input",
+        "vb-audio",
+        "virtual cable",
+        "steam streaming microphone",
+        "virtual audio",
+        "voicemeeter",
+    ];
+    KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+pub(crate) fn select_virtual_mic_device(devices: &[AudioDeviceInfo]) -> Option<AudioDeviceInfo> {
+    if let Some(d) = devices.iter().find(|d| {
+        let lower = d.name.to_lowercase();
+        lower.contains("cable input") || lower.contains("vb-audio")
+    }) {
+        return Some(d.clone());
+    }
+    if let Some(d) = devices.iter().find(|d| d.name.to_lowercase().contains("steam streaming microphone")) {
+        return Some(d.clone());
+    }
+    devices.iter().find(|d| d.is_virtual_cable).cloned()
+}
+
+/// Enumerate active audio playback (`eRender`) endpoints on the host OS.
+pub fn list_playback_devices() -> Vec<AudioDeviceInfo> {
     #[cfg(windows)]
     {
-        Ok(Box::new(wasapi::WasapiPlayback::new()))
+        wasapi::list_playback_devices()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// Pick the preferred virtual audio cable playback endpoint (if any is active),
+/// preferring VB-CABLE (`"cable input"` / `"vb-audio"`), then `"steam streaming microphone"`,
+/// then any other `is_virtual_cable` device.
+pub fn find_virtual_mic_playback_device() -> Option<AudioDeviceInfo> {
+    let devices = list_playback_devices();
+    select_virtual_mic_device(&devices)
+}
+
+/// Create the OS low-latency audio playback backend on the default output endpoint.
+pub fn create_playback() -> Result<Box<dyn AudioPlayback>> {
+    create_playback_for_device(None)
+}
+
+/// Create the OS low-latency audio playback backend targeting an optional `device_id`
+/// (`None` selects the OS default speakers/headphones).
+pub fn create_playback_for_device(device_id: Option<&str>) -> Result<Box<dyn AudioPlayback>> {
+    #[cfg(windows)]
+    {
+        Ok(Box::new(wasapi::WasapiPlayback::with_device(device_id.map(str::to_owned))))
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = device_id;
         Ok(Box::new(linux::LinuxAudioPlayback::new()))
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
+        let _ = device_id;
         Err(CoreError::unsupported("audio playback is not implemented on this OS"))
     }
 }
@@ -282,6 +346,69 @@ mod tests {
             }
             Err(e) => {
                 eprintln!("skipping live process-loopback smoke (no audio endpoint in env): {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_cable_name_matching_and_priority() {
+        assert!(is_virtual_cable_name("CABLE Input (VB-Audio Virtual Cable)"));
+        assert!(is_virtual_cable_name("Динамики (VB-Audio Point)"));
+        assert!(is_virtual_cable_name("Line 1 (Virtual Audio Cable)"));
+        assert!(is_virtual_cable_name("Steam Streaming Microphone"));
+        assert!(is_virtual_cable_name("VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)"));
+        assert!(is_virtual_cable_name("voicemeeter aux input"));
+        assert!(!is_virtual_cable_name("Speakers (Realtek(R) Audio)"));
+        assert!(!is_virtual_cable_name("Headphones (Sony WH-1000XM5)"));
+
+        let devs = vec![
+            AudioDeviceInfo {
+                id: "realtek".into(),
+                name: "Speakers (Realtek(R) Audio)".into(),
+                is_virtual_cable: false,
+            },
+            AudioDeviceInfo {
+                id: "vac".into(),
+                name: "Line 1 (Virtual Audio Cable)".into(),
+                is_virtual_cable: true,
+            },
+            AudioDeviceInfo {
+                id: "steam".into(),
+                name: "Speakers (Steam Streaming Microphone)".into(),
+                is_virtual_cable: true,
+            },
+            AudioDeviceInfo {
+                id: "vbcable".into(),
+                name: "CABLE Input (VB-Audio Virtual Cable)".into(),
+                is_virtual_cable: true,
+            },
+        ];
+        // VB-CABLE beats Steam Streaming Microphone and generic Virtual Audio Cable.
+        assert_eq!(select_virtual_mic_device(&devs).as_ref().map(|d| d.id.as_str()), Some("vbcable"));
+        // Steam Streaming Microphone beats generic Virtual Audio Cable when VB-CABLE is absent.
+        assert_eq!(select_virtual_mic_device(&devs[..3]).as_ref().map(|d| d.id.as_str()), Some("steam"));
+        // Generic virtual cable is picked when neither VB-CABLE nor Steam is present.
+        assert_eq!(select_virtual_mic_device(&devs[..2]).as_ref().map(|d| d.id.as_str()), Some("vac"));
+        // None when only physical speakers exist.
+        assert_eq!(select_virtual_mic_device(&devs[..1]), None);
+    }
+
+    #[test]
+    fn list_playback_devices_and_device_playback_smoke() {
+        let devices = list_playback_devices();
+        eprintln!("enumerated {} playback device(s):", devices.len());
+        for d in &devices {
+            assert!(!d.id.is_empty(), "device id must not be empty");
+            assert!(!d.name.is_empty(), "device name must not be empty");
+            assert_eq!(d.is_virtual_cable, is_virtual_cable_name(&d.name));
+            eprintln!("  - id={} name={:?} virtual_cable={}", d.id, d.name, d.is_virtual_cable);
+        }
+        let _ = find_virtual_mic_playback_device();
+
+        if let Some(first) = devices.first() {
+            let mut pb = create_playback_for_device(Some(&first.id)).expect("create_playback_for_device");
+            if pb.start(AudioFormat::STEREO_48K, Duration::from_millis(20)).is_ok() {
+                pb.stop();
             }
         }
     }

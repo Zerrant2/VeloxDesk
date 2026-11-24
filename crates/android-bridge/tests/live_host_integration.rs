@@ -135,6 +135,7 @@ fn test_backends(
         audio_capture: None,
         audio_encoder: None,
         audio_playback: None,
+        mic_playback: None,
         clipboard: host_clipboard.map(|mem| {
             Arc::new(move || -> Result<Box<dyn veloxdesk_clipboard::ClipboardBackend>> {
                 Ok(Box::new(mem.clone()))

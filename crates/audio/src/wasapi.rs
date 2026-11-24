@@ -7,19 +7,21 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 use veloxdesk_core_traits::audio::{AudioCapture, AudioCaptureConfig, AudioFormat, AudioFrame, AudioPlayback};
 use veloxdesk_core_traits::{CoreError, Result, Timestamp};
-use windows::Win32::Foundation::{CloseHandle, E_NOINTERFACE, E_POINTER, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, E_NOINTERFACE, E_POINTER, HANDLE, PROPERTYKEY, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
 use windows::Win32::System::Com::{
     BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, IAgileObject,
-    IAgileObject_Impl,
+    IAgileObject_Impl, STGM_READ,
 };
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitForSingleObject};
-use windows::Win32::System::Variant::VT_BLOB;
-use windows::core::{HRESULT, HSTRING, IUnknown, Interface, Ref, implement};
+use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::core::{GUID, HRESULT, HSTRING, IUnknown, Interface, PWSTR, Ref, implement};
 
+use crate::AudioDeviceInfo;
 use crate::pcm::{LinearResampler, SampleEncoding, remix_channels};
 
 const WAVE_FORMAT_PCM_TAG: u16 = 1;
@@ -47,6 +49,96 @@ fn wasapi_err(ctx: &'static str) -> impl Fn(windows::core::Error) -> CoreError {
         } else {
             CoreError::platform(format!("{ctx}: {e}"))
         }
+    }
+}
+
+const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
+    fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+    pid: 14,
+};
+
+/// Convert a COM-allocated `PWSTR` (e.g. from `IMMDevice::GetId`) into a Rust `String`
+/// and unconditionally free the buffer with `CoTaskMemFree`.
+///
+/// # Safety
+/// `pwstr` must be either null or a valid null-terminated UTF-16 buffer allocated with `CoTaskMemAlloc`.
+unsafe fn take_pwstr_and_free(pwstr: PWSTR) -> Option<String> {
+    if pwstr.is_null() {
+        return None;
+    }
+    // SAFETY: `pwstr.0` is non-null, NUL-terminated UTF-16 allocated by COM; freed immediately after copy.
+    unsafe {
+        let mut len = 0usize;
+        while *pwstr.0.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(pwstr.0, len);
+        let text = String::from_utf16_lossy(slice);
+        CoTaskMemFree(Some(pwstr.0.cast()));
+        Some(text)
+    }
+}
+
+fn read_device_friendly_name(dev: &IMMDevice) -> Option<String> {
+    // SAFETY: standard COM `OpenPropertyStore(STGM_READ)` + `GetValue` + `PropVariantClear`.
+    unsafe {
+        let store: IPropertyStore = dev.OpenPropertyStore(STGM_READ).ok()?;
+        let mut prop = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME).ok()?;
+        let name = {
+            let inner = &*prop.Anonymous.Anonymous;
+            if inner.vt == VT_LPWSTR && !inner.Anonymous.pwszVal.is_null() {
+                let ptr = inner.Anonymous.pwszVal.0;
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(ptr, len);
+                let s = String::from_utf16_lossy(slice).trim().to_string();
+                (!s.is_empty()).then_some(s)
+            } else {
+                None
+            }
+        };
+        // Explicitly clear `prop` (frees `pwszVal` and resets `vt = VT_EMPTY` so any `Drop` is a no-op).
+        let _ = PropVariantClear(&mut prop);
+        name
+    }
+}
+
+/// Enumerate active WASAPI playback (`eRender`) endpoints with their endpoint IDs and friendly names.
+pub fn list_playback_devices() -> Vec<AudioDeviceInfo> {
+    ensure_com();
+    // SAFETY: standard WASAPI `IMMDeviceEnumerator::EnumAudioEndpoints` COM enumeration.
+    unsafe {
+        let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
+            return Vec::new();
+        };
+        let Ok(collection) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
+            return Vec::new();
+        };
+        let Ok(count) = collection.GetCount() else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::with_capacity(count as usize);
+        for idx in 0..count {
+            let Ok(dev) = collection.Item(idx) else {
+                continue;
+            };
+            let Ok(raw_id) = dev.GetId() else {
+                continue;
+            };
+            let Some(id) = take_pwstr_and_free(raw_id) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+            let name = read_device_friendly_name(&dev).unwrap_or_else(|| id.clone());
+            let is_virtual_cable = crate::is_virtual_cable_name(&name);
+            out.push(AudioDeviceInfo { id, name, is_virtual_cable });
+        }
+        out
     }
 }
 
@@ -578,12 +670,17 @@ impl Drop for PlaybackState {
 
 /// Windows WASAPI low-latency shared-mode playback sink.
 pub struct WasapiPlayback {
+    device_id: Option<String>,
     state: Option<PlaybackState>,
 }
 
 impl WasapiPlayback {
     pub fn new() -> Self {
-        Self { state: None }
+        Self::with_device(None)
+    }
+
+    pub fn with_device(device_id: Option<String>) -> Self {
+        Self { device_id, state: None }
     }
 }
 
@@ -603,7 +700,7 @@ impl AudioPlayback for WasapiPlayback {
         if format.sample_rate == 0 || format.channels == 0 {
             return Err(CoreError::invalid("invalid playback AudioFormat"));
         }
-        let device = pick_device(eRender, None)?;
+        let device = pick_device(eRender, self.device_id.as_deref())?;
         let wf = make_float_waveformat(format);
         // Use AUTOCONVERTPCM so Windows accepts 48 kHz stereo f32 regardless of endpoint format.
         let flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;

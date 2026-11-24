@@ -72,6 +72,9 @@ pub struct HostConfig {
     pub echo_cancellation: bool,
     /// Enable pure-Rust microphone noise suppression on host audio path (v0.6.0).
     pub mic_noise_suppression: bool,
+    /// Preferred host playback endpoint for incoming viewer microphone audio (`None` / `"auto"` =
+    /// prefer virtual cable if installed, `"speakers"` = default OS speakers, or a WASAPI device ID) (v0.6.2).
+    pub mic_output_device: Option<String>,
     /// Default permissions applied to unattended/interactive sessions (v0.6.0).
     pub default_permissions: Permissions,
     /// Windows privacy mode strategy (`CurtainOverlay` vs `VddMonitorOff`) (v0.6.0).
@@ -133,6 +136,7 @@ impl Default for HostConfig {
             allow_mic: false,
             echo_cancellation: true,
             mic_noise_suppression: true,
+            mic_output_device: None,
             default_permissions: Permissions::interactive_default(),
             privacy_mode_kind: PrivacyModeKind::CurtainOverlay,
             portable: false,
@@ -189,7 +193,29 @@ pub struct HostConfigFile {
     pub audio_frame_ms: Option<f32>,
     pub allow_mic: Option<bool>,
     pub echo_cancellation: Option<bool>,
+    pub mic_output_device: Option<String>,
     pub ipc_port: Option<u16>,
+}
+
+/// Resolve a host microphone playback output preference into `(wasapi_device_id, is_non_default_speaker)`.
+///
+/// * `None | Some("") | Some("auto")` → picks [`veloxdesk_audio::find_virtual_mic_playback_device`]
+///   when a virtual audio cable is active (`(Some(id), true)`), else default speakers (`(None, false)`).
+/// * `Some("speakers") | Some("default")` → `(None, false)`.
+/// * `Some(id)` → `(Some(id.to_string()), true)`.
+pub fn resolve_mic_output_device(pref: Option<&str>) -> (Option<String>, bool) {
+    match pref.map(str::trim) {
+        None | Some("") => match veloxdesk_audio::find_virtual_mic_playback_device() {
+            Some(d) => (Some(d.id), true),
+            None => (None, false),
+        },
+        Some(s) if s.eq_ignore_ascii_case("auto") => match veloxdesk_audio::find_virtual_mic_playback_device() {
+            Some(d) => (Some(d.id), true),
+            None => (None, false),
+        },
+        Some(s) if s.eq_ignore_ascii_case("speakers") || s.eq_ignore_ascii_case("default") => (None, false),
+        Some(id) => (Some(id.to_string()), true),
+    }
 }
 
 /// Parse a chroma format name: `yuv420`/`420` or `yuv444`/`444`.
@@ -256,6 +282,9 @@ impl HostConfig {
         }
         if let Some(p) = file.ipc_port {
             self.ipc_port = Some(p);
+        }
+        if let Some(dev) = &file.mic_output_device {
+            self.mic_output_device = Some(dev.clone());
         }
         if let Some(phc) = &file.permanent_password_hash {
             self.auth.permanent_password_hash = Some(
@@ -342,6 +371,7 @@ impl HostConfig {
             audio_frame_ms: Some(self.audio_frame_ms),
             allow_mic: Some(self.allow_mic),
             echo_cancellation: Some(self.echo_cancellation),
+            mic_output_device: self.mic_output_device.clone(),
             ipc_port: self.ipc_port,
         };
         toml::to_string(&f).unwrap_or_default()
@@ -752,5 +782,32 @@ mod tests {
         .unwrap();
         assert!(cli_on.h.resolve().unwrap().echo_cancellation);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mic_output_device_toml_and_resolution() {
+        let def = HostConfig::default();
+        assert_eq!(def.mic_output_device, None);
+
+        let c = HostConfig::from_toml_str("allow_mic = true\nmic_output_device = \"speakers\"\n").unwrap();
+        assert!(c.allow_mic);
+        assert_eq!(c.mic_output_device.as_deref(), Some("speakers"));
+        let round = HostConfig::from_toml_str(&c.to_toml()).unwrap();
+        assert_eq!(round, c);
+
+        assert_eq!(resolve_mic_output_device(Some("speakers")), (None, false));
+        assert_eq!(resolve_mic_output_device(Some("default")), (None, false));
+        assert_eq!(
+            resolve_mic_output_device(Some("{0.0.0.00000000}.{custom-endpoint}")),
+            (Some("{0.0.0.00000000}.{custom-endpoint}".to_string()), true)
+        );
+
+        let expected_auto = match veloxdesk_audio::find_virtual_mic_playback_device() {
+            Some(d) => (Some(d.id), true),
+            None => (None, false),
+        };
+        assert_eq!(resolve_mic_output_device(None), expected_auto);
+        assert_eq!(resolve_mic_output_device(Some("")), expected_auto);
+        assert_eq!(resolve_mic_output_device(Some("auto")), expected_auto);
     }
 }

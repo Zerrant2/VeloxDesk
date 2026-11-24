@@ -250,6 +250,7 @@ async fn full_session_over_memory_transport() {
             audio_capture: None,
             audio_encoder: None,
             audio_playback: None,
+            mic_playback: None,
             clipboard: None,
             privacy: None,
             file_transfer: None,
@@ -441,6 +442,7 @@ async fn live_session_mode_update_switches_desktop_gaming_desktop_without_discon
                 Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?) as Box<dyn AudioEncoder>)
             })),
             audio_playback: None,
+            mic_playback: None,
             clipboard: None,
             privacy: None,
             file_transfer: None,

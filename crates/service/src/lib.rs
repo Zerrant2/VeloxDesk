@@ -24,10 +24,10 @@ pub mod video;
 
 pub use auth::{ApprovalDecision, ApprovalHandler, ApprovalRequest, HostAuthConfig, HostAuthState, TrustedPeer};
 pub use backends::{
-    AudioCaptureFactory, AudioEncoderFactory, AudioPlaybackFactory, ClipboardFactory, HostBackends, RateController,
-    RateDecision, SimpleRate, VideoSink,
+    AudioCaptureFactory, AudioEncoderFactory, AudioPlaybackFactory, ClipboardFactory, HostBackends, MicPlaybackFactory,
+    RateController, RateDecision, SimpleRate, VideoSink,
 };
-pub use config::{HostArgs, HostConfig, PortablePaths, resolve_portable_paths};
+pub use config::{HostArgs, HostConfig, PortablePaths, resolve_mic_output_device, resolve_portable_paths};
 pub use daemon::{
     DesktopKind, ServiceStatus, detect_desktop, install_service, run_service_or_console, service_status,
     uninstall_service, wait_for_shutdown,

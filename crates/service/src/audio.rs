@@ -6,16 +6,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use veloxdesk_audio::pcm::{LinearResampler, remix_channels};
 use veloxdesk_audio::{
     AcousticEchoCanceller, AecConfig, AecReferenceFeed, AudioJitterBuffer, DenoiseConfig, JitterConfig, JitterPop,
     NoiseSuppressor, OpusDecoder,
 };
 use veloxdesk_core_traits::audio::{
-    AudioCaptureConfig, AudioCodecId, AudioDecoder, AudioEncoderConfig, AudioFormat, AudioFrame, EncodedAudio,
+    AudioCaptureConfig, AudioCodecId, AudioDecoder, AudioEncoderConfig, AudioFormat, AudioFrame, AudioPlayback,
+    EncodedAudio,
 };
 use veloxdesk_core_traits::{CoreError, Result, TransportChannel};
 use veloxdesk_protocol::control::{AudioConfig, SessionMode};
@@ -244,9 +245,21 @@ impl MicHandle {
     }
 }
 
+fn make_mic_jitter_buffer(frame_dur: Duration) -> AudioJitterBuffer {
+    AudioJitterBuffer::new(JitterConfig {
+        frame_duration: frame_dur,
+        target_delay: (frame_dur * 4).max(Duration::from_millis(20)),
+        max_delay: (frame_dur * 16).max(Duration::from_millis(100)),
+    })
+}
+
+fn is_valid_opus_duration_us(us: u32) -> bool {
+    matches!(us, 2_500 | 5_000 | 10_000 | 20_000)
+}
+
 impl MicPlayback {
     pub fn start(frame_duration_us: u32, backends: &HostBackends) -> Result<Self> {
-        Self::start_with_aec_feed(frame_duration_us, backends, None)
+        Self::start_with_device(frame_duration_us, backends, None, false, None)
     }
 
     /// Start viewer-microphone playback and optionally feed decoded speaker samples into
@@ -256,7 +269,7 @@ impl MicPlayback {
         backends: &HostBackends,
         aec_ref: Option<AecReferenceFeed>,
     ) -> Result<Self> {
-        Self::start_with_options(frame_duration_us, backends, aec_ref, false)
+        Self::start_with_device(frame_duration_us, backends, aec_ref, false, None)
     }
 
     /// Start viewer-microphone playback with optional [`AecReferenceFeed`] and pure-Rust
@@ -267,27 +280,81 @@ impl MicPlayback {
         aec_ref: Option<AecReferenceFeed>,
         mic_noise_suppression: bool,
     ) -> Result<Self> {
-        let pb_factory = backends
-            .audio_playback
-            .as_ref()
-            .ok_or_else(|| CoreError::unsupported("audio playback backend not configured"))?;
-        let frame_duration = Duration::from_micros(frame_duration_us.max(2500) as u64);
+        Self::start_with_device(frame_duration_us, backends, aec_ref, mic_noise_suppression, None)
+    }
+
+    /// Start viewer-microphone playback routed to an optional `mic_output_device`
+    /// (`None` = default speakers, `"auto"` = virtual cable if installed, `"speakers"` = default
+    /// speakers, or a specific WASAPI endpoint ID).
+    pub fn start_with_device(
+        frame_duration_us: u32,
+        backends: &HostBackends,
+        aec_ref: Option<AecReferenceFeed>,
+        mic_noise_suppression: bool,
+        mic_output_device: Option<&str>,
+    ) -> Result<Self> {
+        if backends.mic_playback.is_none() && backends.audio_playback.is_none() {
+            return Err(CoreError::unsupported("audio playback backend not configured"));
+        }
+
+        let initial_us = if is_valid_opus_duration_us(frame_duration_us) {
+            frame_duration_us
+        } else {
+            5_000
+        };
+        let initial_frame_dur = Duration::from_micros(initial_us as u64);
         let fmt = AudioFormat::STEREO_48K;
-        let mut playback = pb_factory()?;
-        playback.start(fmt, Duration::from_millis(15))?;
-        let mut decoder = OpusDecoder::new(fmt, frame_duration)?;
-        let (tx, rx): (Sender<EncodedAudio>, Receiver<EncodedAudio>) = crossbeam_channel::bounded(32);
+        let target_latency = Duration::from_millis(25);
+
+        let (target_dev, mut routed_away) = match mic_output_device {
+            Some(pref) if backends.mic_playback.is_some() => crate::config::resolve_mic_output_device(Some(pref)),
+            _ => (None, false),
+        };
+
+        let open_and_start = |dev: Option<&str>| -> Result<Box<dyn AudioPlayback>> {
+            let mut pb = if let Some(mic_factory) = backends.mic_playback.as_ref() {
+                mic_factory(dev)?
+            } else if let Some(pb_factory) = backends.audio_playback.as_ref() {
+                pb_factory()?
+            } else {
+                return Err(CoreError::unsupported("audio playback backend not configured"));
+            };
+            pb.start(fmt, target_latency)?;
+            Ok(pb)
+        };
+
+        let mut playback = if let Some(dev_id) = target_dev.as_deref() {
+            match open_and_start(Some(dev_id)) {
+                Ok(pb) => {
+                    tracing::info!(device_id = %dev_id, "host mic playback routed to dedicated output device");
+                    pb
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        device_id = %dev_id,
+                        error = %err,
+                        "failed to open configured mic output device; falling back to default speakers"
+                    );
+                    routed_away = false;
+                    open_and_start(None)?
+                }
+            }
+        } else {
+            routed_away = false;
+            open_and_start(None)?
+        };
+
+        let effective_aec_ref = if routed_away { None } else { aec_ref };
+        let mut decoder = OpusDecoder::new(fmt, initial_frame_dur)?;
+        let (tx, rx): (Sender<EncodedAudio>, Receiver<EncodedAudio>) = crossbeam_channel::bounded(64);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_bg = stop.clone();
 
         let thread = std::thread::Builder::new()
             .name("vdk-audio-mic".into())
             .spawn(move || {
-                let mut jitter = AudioJitterBuffer::new(JitterConfig {
-                    frame_duration,
-                    target_delay: frame_duration * 2,
-                    max_delay: frame_duration * 8,
-                });
+                let mut frame_dur = initial_frame_dur;
+                let mut jitter = make_mic_jitter_buffer(frame_dur);
                 let mut denoiser = mic_noise_suppression.then(|| {
                     NoiseSuppressor::new(DenoiseConfig {
                         sample_rate: fmt.sample_rate,
@@ -295,11 +362,44 @@ impl MicPlayback {
                         ..DenoiseConfig::default()
                     })
                 });
-                let tick = frame_duration.max(Duration::from_millis(2));
+                let mut next_tick = Instant::now() + frame_dur;
+
+                let push_pkt = |pkt: EncodedAudio,
+                                frame_dur: &mut Duration,
+                                jitter: &mut AudioJitterBuffer,
+                                next_tick: &mut Instant| {
+                    if is_valid_opus_duration_us(pkt.duration_us) {
+                        let pkt_dur = Duration::from_micros(pkt.duration_us as u64);
+                        if pkt_dur != *frame_dur {
+                            tracing::info!(
+                                old_us = frame_dur.as_micros() as u32,
+                                new_us = pkt.duration_us,
+                                "adapting host mic playback cadence to incoming Opus packet duration"
+                            );
+                            *frame_dur = pkt_dur;
+                            *jitter = make_mic_jitter_buffer(pkt_dur);
+                            let now = Instant::now();
+                            if *next_tick > now + pkt_dur {
+                                *next_tick = now + pkt_dur;
+                            }
+                        }
+                    }
+                    jitter.push(pkt);
+                };
+
                 while !stop_bg.load(Ordering::Relaxed) {
+                    let now = Instant::now();
+                    if now < next_tick {
+                        match rx.recv_timeout(next_tick - now) {
+                            Ok(pkt) => push_pkt(pkt, &mut frame_dur, &mut jitter, &mut next_tick),
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+
                     loop {
                         match rx.try_recv() {
-                            Ok(pkt) => jitter.push(pkt),
+                            Ok(pkt) => push_pkt(pkt, &mut frame_dur, &mut jitter, &mut next_tick),
                             Err(TryRecvError::Empty) => break,
                             Err(TryRecvError::Disconnected) => {
                                 stop_bg.store(true, Ordering::Relaxed);
@@ -310,27 +410,38 @@ impl MicPlayback {
                     if stop_bg.load(Ordering::Relaxed) {
                         break;
                     }
-                    let frame: Option<AudioFrame> = match jitter.pop() {
-                        JitterPop::Packet(pkt) => {
-                            if pkt.codec == AudioCodecId::Opus {
-                                decoder.decode(Some(&pkt)).ok()
-                            } else {
-                                None
+
+                    let mut caught_up = 0u32;
+                    while Instant::now() >= next_tick && caught_up < 6 {
+                        next_tick += frame_dur;
+                        caught_up += 1;
+
+                        let frame: Option<AudioFrame> = match jitter.pop() {
+                            JitterPop::Packet(pkt) => {
+                                if pkt.codec == AudioCodecId::Opus {
+                                    decoder.decode(Some(&pkt)).ok()
+                                } else {
+                                    None
+                                }
                             }
+                            JitterPop::Missing { .. } => decoder.decode(None).ok(),
+                            JitterPop::Buffering => None,
+                        };
+                        if let Some(mut pcm) = frame {
+                            if let Some(ns) = denoiser.as_mut() {
+                                ns.process(&mut pcm.samples);
+                            }
+                            if let Some(feed) = &effective_aec_ref {
+                                feed.push(&pcm.samples);
+                            }
+                            let _ = playback.push(&pcm);
                         }
-                        JitterPop::Missing { .. } => decoder.decode(None).ok(),
-                        JitterPop::Buffering => None,
-                    };
-                    if let Some(mut pcm) = frame {
-                        if let Some(ns) = denoiser.as_mut() {
-                            ns.process(&mut pcm.samples);
-                        }
-                        if let Some(feed) = &aec_ref {
-                            feed.push(&pcm.samples);
-                        }
-                        let _ = playback.push(&pcm);
                     }
-                    std::thread::sleep(tick);
+
+                    let after = Instant::now();
+                    if next_tick + frame_dur * 6 < after {
+                        next_tick = after + frame_dur;
+                    }
                 }
                 playback.stop();
                 tracing::debug!("audio mic playback thread exit");
@@ -601,5 +712,112 @@ mod tests {
         // Reference samples pushed before capture should have been drained by the AEC loop.
         let mut rem = Vec::new();
         assert_eq!(feed.drain_into(&mut rem, 480), 0);
+    }
+
+    #[test]
+    fn mic_playback_handles_5ms_opus_stream_and_device_routing() {
+        use std::sync::Mutex;
+        use veloxdesk_core_traits::Timestamp;
+        use veloxdesk_core_traits::audio::AudioEncoder;
+
+        struct MockPlayback {
+            frames: Arc<Mutex<Vec<usize>>>,
+            fail_start: bool,
+        }
+        impl AudioPlayback for MockPlayback {
+            fn backend(&self) -> &'static str {
+                "mock-pb"
+            }
+            fn start(&mut self, _fmt: AudioFormat, _lat: Duration) -> Result<()> {
+                if self.fail_start { Err(CoreError::platform("unplugged")) } else { Ok(()) }
+            }
+            fn push(&mut self, frame: &AudioFrame) -> Result<()> {
+                assert!(frame.samples.iter().all(|s| s.is_finite()));
+                self.frames.lock().unwrap().push(frame.frames_per_channel());
+                Ok(())
+            }
+            fn buffered_us(&self) -> u32 {
+                0
+            }
+            fn stop(&mut self) {}
+        }
+
+        let mut enc = veloxdesk_audio::OpusEncoder::new(&AudioEncoderConfig {
+            format: AudioFormat::STEREO_48K,
+            bitrate_kbps: 96,
+            frame_duration: Duration::from_micros(5_000),
+            low_delay: true,
+        })
+        .unwrap();
+        let mut pkts = Vec::with_capacity(40);
+        for i in 0..40usize {
+            let samples: Vec<f32> = (0..240 * 2).map(|k| ((i * 240 + k / 2) as f32 * 0.05).sin() * 0.3).collect();
+            let pcm = AudioFrame { format: AudioFormat::STEREO_48K, samples, capture_ts: Timestamp(i as u64 * 5_000) };
+            pkts.extend(enc.encode(&pcm).unwrap());
+        }
+        assert_eq!(pkts.len(), 40);
+
+        for &init_us in &[10_000u32, 5_000] {
+            let pushed = Arc::new(Mutex::new(Vec::new()));
+            let pushed_c = pushed.clone();
+            let mut backends = crate::HostBackends::system().without_audio();
+            backends.audio_playback =
+                Some(Arc::new(move || Ok(Box::new(MockPlayback { frames: pushed_c.clone(), fail_start: false }))));
+
+            let mic = MicPlayback::start(init_us, &backends).unwrap();
+            let handle = mic.handle().unwrap();
+            let t0 = Instant::now();
+            for (i, pkt) in pkts.iter().cloned().enumerate() {
+                let target = t0 + Duration::from_millis(5 * i as u64);
+                let now = Instant::now();
+                if now < target {
+                    std::thread::sleep(target - now);
+                }
+                handle.push(pkt);
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            mic.stop();
+
+            let got = pushed.lock().unwrap();
+            assert!(got.len() >= 30, "init_us={init_us}: expected >= 30 decoded frames, got {}", got.len());
+            assert!(got.iter().all(|&spc| spc == 240));
+        }
+
+        // Verify virtual cable routing suppresses aec_ref while unplugged device falls back to default & feeds aec_ref.
+        let opened_devs = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let opened_c = opened_devs.clone();
+        let pushed = Arc::new(Mutex::new(Vec::new()));
+        let pushed_c = pushed.clone();
+        let mut backends = crate::HostBackends::system().without_audio().with_mic_playback(Arc::new(move |dev| {
+            opened_c.lock().unwrap().push(dev.map(str::to_owned));
+            let fail = dev == Some("unplugged-id");
+            Ok(Box::new(MockPlayback { frames: pushed_c.clone(), fail_start: fail }))
+        }));
+        let _ = &mut backends;
+
+        let aec_routed = AecReferenceFeed::new(4_800);
+        let mic1 = MicPlayback::start_with_device(5_000, &backends, Some(aec_routed.clone()), false, Some("cable-id")).unwrap();
+        let h1 = mic1.handle().unwrap();
+        for pkt in pkts.iter().take(10).cloned() {
+            h1.push(pkt);
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        mic1.stop();
+        assert!(aec_routed.is_empty(), "aec_ref must not be fed when routed away from speakers");
+
+        let aec_fallback = AecReferenceFeed::new(4_800);
+        let mic2 =
+            MicPlayback::start_with_device(5_000, &backends, Some(aec_fallback.clone()), false, Some("unplugged-id")).unwrap();
+        let h2 = mic2.handle().unwrap();
+        for pkt in pkts.iter().take(10).cloned() {
+            h2.push(pkt);
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        mic2.stop();
+        assert!(!aec_fallback.is_empty(), "aec_ref must be fed after fallback to default speakers");
+        assert_eq!(
+            *opened_devs.lock().unwrap(),
+            vec![Some("cable-id".into()), Some("unplugged-id".into()), None]
+        );
     }
 }

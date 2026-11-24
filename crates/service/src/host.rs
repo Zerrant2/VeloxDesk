@@ -106,6 +106,7 @@ impl HostBackends {
             audio_capture: Some(system_audio_capture_factory()),
             audio_encoder: Some(Arc::new(|cfg| Ok(Box::new(veloxdesk_audio::OpusEncoder::new(cfg)?)))),
             audio_playback: Some(Arc::new(veloxdesk_audio::create_playback)),
+            mic_playback: Some(Arc::new(veloxdesk_audio::create_playback_for_device)),
             clipboard: Some(Arc::new(veloxdesk_clipboard::create_system_clipboard)),
             privacy: Some(veloxdesk_virtual_display::create_privacy_controller()),
             file_transfer: Some(veloxdesk_file_transfer::FileTransferConfig::default()),
@@ -157,6 +158,7 @@ pub struct RunningHost {
     auth_state: Arc<HostAuthState>,
     active_sessions: Arc<AtomicUsize>,
     echo_cancellation: Arc<AtomicBool>,
+    mic_output_device: Arc<Mutex<Option<String>>>,
     privacy: Option<Arc<dyn PrivacyController>>,
     privacy_mode_kind: Mutex<PrivacyModeKind>,
     chat_tx: broadcast::Sender<ChatMessage>,
@@ -292,6 +294,7 @@ impl RunningHost {
         }
 
         let echo_cancellation = Arc::new(AtomicBool::new(cfg.echo_cancellation));
+        let mic_output_device = Arc::new(Mutex::new(cfg.mic_output_device.clone()));
         let privacy = backends.privacy.clone();
         let initial_privacy_mode = cfg.privacy_mode_kind;
         if let Some(ctrl) = &privacy {
@@ -305,6 +308,7 @@ impl RunningHost {
             chat_tx: Some(chat_tx.clone()),
             power_executor: None,
             echo_cancellation: Some(echo_cancellation.clone()),
+            mic_output_device: Some(mic_output_device.clone()),
         };
         let stop_tx_done = stop_tx.clone();
         let mut accept_stop = stop_rx;
@@ -337,6 +341,7 @@ impl RunningHost {
             auth_state,
             active_sessions,
             echo_cancellation,
+            mic_output_device,
             privacy,
             privacy_mode_kind: Mutex::new(initial_privacy_mode),
             chat_tx,
@@ -399,6 +404,16 @@ impl RunningHost {
     /// Current live echo-cancellation toggle state (v0.6.0).
     pub fn echo_cancellation(&self) -> bool {
         self.echo_cancellation.load(Ordering::Relaxed)
+    }
+
+    /// Update the host microphone playback output device preference for future sessions (v0.6.2).
+    pub fn set_mic_output_device(&self, device: Option<String>) {
+        *self.mic_output_device.lock().unwrap_or_else(|e| e.into_inner()) = device;
+    }
+
+    /// Current live host microphone playback output device preference (v0.6.2).
+    pub fn mic_output_device(&self) -> Option<String> {
+        self.mic_output_device.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Update Windows privacy curtain strategy on the fly (v0.6.0).
@@ -922,6 +937,7 @@ mod tests {
             audio_capture: None,
             audio_encoder: None,
             audio_playback: None,
+            mic_playback: None,
             clipboard: None,
             privacy: None,
             file_transfer: None,

@@ -187,6 +187,8 @@ pub struct SessionHooks {
     pub power_executor: Option<Arc<dyn PowerExecutor>>,
     /// Shared live echo-cancellation toggle updated by [`crate::RunningHost::set_echo_cancellation`] (v0.6.0).
     pub echo_cancellation: Option<Arc<AtomicBool>>,
+    /// Shared live host microphone output device preference updated by [`crate::RunningHost::set_mic_output_device`] (v0.6.2).
+    pub mic_output_device: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 struct ActiveSessionGuard {
@@ -298,6 +300,10 @@ pub async fn run_session_with_hooks(
         .echo_cancellation
         .clone()
         .unwrap_or_else(|| Arc::new(AtomicBool::new(cfg.echo_cancellation)));
+    let mic_output_pref: Option<String> = match &hooks.mic_output_device {
+        Some(slot) => slot.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        None => cfg.mic_output_device.clone(),
+    };
     let mut chat_rx = if auth.permissions.allow_chat {
         hooks.chat_tx.as_ref().map(broadcast::Sender::subscribe)
     } else {
@@ -322,11 +328,17 @@ pub async fn run_session_with_hooks(
         if allow_input { Some(InputThread::start_with_feedback(backends.injector.clone(), Some(fb_tx))?) } else { None };
     let mut active_audio_frame_us =
         negotiate_audio_frame_us(cfg.audio_frame_ms, cfg.audio_frame_ms_explicit, initial_mode);
+    let has_playback = backends.mic_playback.is_some() || backends.audio_playback.is_some();
+    let (resolved_mic_device, _) = if allow_mic && backends.mic_playback.is_some() {
+        crate::config::resolve_mic_output_device(mic_output_pref.as_deref())
+    } else {
+        (None, false)
+    };
     let aec_feed = (allow_audio
         && allow_mic
         && backends.audio_capture.is_some()
         && backends.audio_encoder.is_some()
-        && backends.audio_playback.is_some())
+        && has_playback)
     .then(|| AecReferenceFeed::new(48_000));
     let (mut audio, audio_cfg) = if allow_audio && backends.audio_capture.is_some() && backends.audio_encoder.is_some() {
         match AudioPipeline::start_with_live_aec(
@@ -350,12 +362,13 @@ pub async fn run_session_with_hooks(
     } else {
         (None, None)
     };
-    let mic = if allow_mic && backends.audio_playback.is_some() {
-        match MicPlayback::start_with_options(
-            active_audio_frame_us,
+    let mic = if allow_mic && has_playback {
+        match MicPlayback::start_with_device(
+            5_000,
             &backends,
             aec_feed.clone(),
             cfg.mic_noise_suppression,
+            resolved_mic_device.as_deref(),
         ) {
             Ok(m) => Some(m),
             Err(e) => {
