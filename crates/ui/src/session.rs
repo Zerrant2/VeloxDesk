@@ -165,6 +165,7 @@ impl SessionToolbar {
             .show(ui.ctx(), |ui| {
                 let pal = crate::theme::palette_for(ui);
                 crate::theme::toolbar_frame(ui).show(ui, |ui| {
+                    let is_android = info.host_os.eq_ignore_ascii_case("android");
                     if !self.expanded {
                         ui.horizontal(|ui| {
                             if ui
@@ -174,8 +175,22 @@ impl SessionToolbar {
                             {
                                 self.expanded = true;
                             }
-                            if info.pointer_locked {
-                                ui.colored_label(pal.success, t.pointer_locked_pill);
+                            if !is_android {
+                                if info.pointer_locked {
+                                    ui.colored_label(pal.success, t.pointer_locked_pill);
+                                } else if settings.mode == Mode::Gaming {
+                                    let lock_pill = egui::Button::new(
+                                        egui::RichText::new(t.toolbar_lock_cursor_btn)
+                                            .strong()
+                                            .small()
+                                            .color(pal.badge_active_text),
+                                    )
+                                    .fill(pal.badge_active_bg)
+                                    .small();
+                                    if ui.add(lock_pill).on_hover_text(t.toolbar_lock_tooltip).clicked() {
+                                        out.push(ToolbarAction::TogglePointerLock);
+                                    }
+                                }
                             }
                             if info.recording_active {
                                 let elapsed = format_recording_elapsed(info.recording_elapsed_ms);
@@ -228,6 +243,7 @@ impl SessionToolbar {
                                     out.push(ToolbarAction::SetMode(m));
                                 }
                             }
+                            let is_gaming = settings.mode == Mode::Gaming;
                             let prof = settings.active_mut();
                             ui.separator();
                             if info.displays.len() > 1 {
@@ -303,15 +319,43 @@ impl SessionToolbar {
                                 prof.mic_enabled = !prof.mic_enabled;
                                 out.push(ToolbarAction::SetMic(prof.mic_enabled));
                             }
-                            if ui
-                                .selectable_label(
-                                    info.pointer_locked,
-                                    if info.pointer_locked { t.toolbar_locked } else { t.toolbar_lock },
-                                )
-                                .on_hover_text(t.toolbar_lock_tooltip)
-                                .clicked()
-                            {
-                                out.push(ToolbarAction::TogglePointerLock);
+                            if !is_android {
+                                let lock_clicked = if is_gaming {
+                                    if info.pointer_locked {
+                                        ui.add(
+                                            egui::Button::new(
+                                                egui::RichText::new(t.toolbar_unlock_cursor_btn)
+                                                    .strong()
+                                                    .color(pal.success),
+                                            )
+                                            .small(),
+                                        )
+                                        .on_hover_text(t.toolbar_lock_tooltip)
+                                        .clicked()
+                                    } else {
+                                        ui.add(
+                                            egui::Button::new(
+                                                egui::RichText::new(t.toolbar_lock_cursor_btn)
+                                                    .strong()
+                                                    .color(pal.badge_active_text),
+                                            )
+                                            .fill(pal.badge_active_bg)
+                                            .small(),
+                                        )
+                                        .on_hover_text(t.toolbar_lock_tooltip)
+                                        .clicked()
+                                    }
+                                } else {
+                                    ui.selectable_label(
+                                        info.pointer_locked,
+                                        if info.pointer_locked { t.toolbar_locked } else { t.toolbar_lock },
+                                    )
+                                    .on_hover_text(t.toolbar_lock_tooltip)
+                                    .clicked()
+                                };
+                                if lock_clicked {
+                                    out.push(ToolbarAction::TogglePointerLock);
+                                }
                             }
                             if info.active_gamepads > 0 {
                                 ui.label(t.toolbar_pads(info.active_gamepads));
@@ -1893,5 +1937,164 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gaming_lock_cursor_button_renders_in_en_and_ru_without_missing_glyphs() {
+        fn verify_shapes_have_glyphs(ctx: &egui::Context, shape: &egui::epaint::Shape) {
+            match shape {
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        verify_shapes_have_glyphs(ctx, s);
+                    }
+                }
+                egui::epaint::Shape::Text(ts) => {
+                    for section in &ts.galley.job.sections {
+                        let range = section.byte_range.start.0..section.byte_range.end.0;
+                        let slice = &ts.galley.job.text[range];
+                        let printable: String = slice.chars().filter(|c| !c.is_control()).collect();
+                        let ok = ctx.fonts_mut(|f| f.has_glyphs(&section.format.font_id, &printable));
+                        assert!(ok, "missing glyph in rendered text section: {slice:?}");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let make_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+            events,
+            ..Default::default()
+        };
+
+        for lang in Language::ALL {
+            let t = tr(lang);
+
+            // 1. Collapsed toolbar in Gaming mode (unlocked, Windows host): shows 1-click Lock Cursor pill.
+            {
+                let ctx = egui::Context::default();
+                let mut settings = Settings { language: lang, mode: Mode::Gaming, ..Default::default() };
+                let mut tb = SessionToolbar { expanded: false, ..Default::default() };
+                let info = SessionInfo {
+                    host_name: "GamingPC".into(),
+                    host_os: "windows".into(),
+                    pointer_locked: false,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                    let _ = tb.show(ui, &info, &mut settings);
+                });
+                out.textures_delta.clear();
+                out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                    let _ = tb.show(ui, &info, &mut settings);
+                });
+                out.textures_delta.clear();
+                for clipped in &out.shapes {
+                    verify_shapes_have_glyphs(&ctx, &clipped.shape);
+                }
+                let lock_pos = out
+                    .shapes
+                    .iter()
+                    .find_map(|c| find_text_rect(&c.shape, t.toolbar_lock_cursor_btn))
+                    .unwrap_or_else(|| panic!("collapsed Gaming Lock Cursor pill missing for {lang:?}"))
+                    .center();
+                let mut emitted = Vec::new();
+                for pressed in [true, false] {
+                    let mut c = ctx.run_ui(
+                        make_input(vec![
+                            egui::Event::PointerMoved(lock_pos),
+                            egui::Event::PointerButton {
+                                pos: lock_pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]),
+                        |ui| {
+                            let a = tb.show(ui, &info, &mut settings);
+                            if !a.is_empty() {
+                                emitted = a;
+                            }
+                        },
+                    );
+                    c.textures_delta.clear();
+                }
+                assert_eq!(emitted, vec![ToolbarAction::TogglePointerLock]);
+            }
+
+            // 2. Expanded toolbar in Gaming mode (unlocked & locked, Windows host): renders EN/RU labels cleanly.
+            for (locked, expected_label) in [
+                (false, t.toolbar_lock_cursor_btn),
+                (true, t.toolbar_unlock_cursor_btn),
+            ] {
+                let ctx = egui::Context::default();
+                let mut settings = Settings { language: lang, mode: Mode::Gaming, ..Default::default() };
+                let mut tb = SessionToolbar { expanded: true, ..Default::default() };
+                let info = SessionInfo {
+                    host_name: "GamingPC".into(),
+                    host_os: "windows".into(),
+                    pointer_locked: locked,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                    let _ = tb.show(ui, &info, &mut settings);
+                });
+                out.textures_delta.clear();
+                out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                    let _ = tb.show(ui, &info, &mut settings);
+                });
+                out.textures_delta.clear();
+                for clipped in &out.shapes {
+                    verify_shapes_have_glyphs(&ctx, &clipped.shape);
+                }
+                let btn_pos = out
+                    .shapes
+                    .iter()
+                    .find_map(|c| find_text_rect(&c.shape, expected_label))
+                    .unwrap_or_else(|| panic!("expanded Gaming cursor button {expected_label:?} missing ({lang:?})"))
+                    .center();
+                let mut emitted = Vec::new();
+                for pressed in [true, false] {
+                    let mut c = ctx.run_ui(
+                        make_input(vec![
+                            egui::Event::PointerMoved(btn_pos),
+                            egui::Event::PointerButton {
+                                pos: btn_pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]),
+                        |ui| {
+                            let a = tb.show(ui, &info, &mut settings);
+                            if !a.is_empty() {
+                                emitted = a;
+                            }
+                        },
+                    );
+                    c.textures_delta.clear();
+                }
+                assert_eq!(emitted, vec![ToolbarAction::TogglePointerLock]);
+            }
+
+            // 3. Android host never shows pointer lock controls even in Gaming mode.
+            for expanded in [false, true] {
+                let ctx = egui::Context::default();
+                let mut settings = Settings { language: lang, mode: Mode::Gaming, ..Default::default() };
+                let mut tb = SessionToolbar { expanded, ..Default::default() };
+                let android_info = SessionInfo {
+                    host_name: "Pixel-9".into(),
+                    host_os: "Android".into(),
+                    pointer_locked: false,
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(make_input(Vec::new()), |ui| {
+                    let _ = tb.show(ui, &android_info, &mut settings);
+                });
+                out.textures_delta.clear();
+                assert!(!shapes_contain_text(&out.shapes, t.toolbar_lock_cursor_btn));
+                assert!(!shapes_contain_text(&out.shapes, t.toolbar_unlock_cursor_btn));
+            }
+        }
     }
 }
