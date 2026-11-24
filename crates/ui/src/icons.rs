@@ -256,13 +256,69 @@ pub fn status_dot_widget(ui: &mut egui::Ui, diameter: f32, color: egui::Color32)
     resp
 }
 
-/// Standalone colored checkmark widget (e.g. chat delivery receipt).
+/// Standalone colored checkmark widget (e.g. chat delivery receipt or active badge).
 pub fn check_widget(ui: &mut egui::Ui, size: f32, color: egui::Color32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
     if ui.is_rect_visible(rect) {
         check(ui.painter(), rect, color);
     }
     resp
+}
+
+/// Draw a warning triangle with `!` inside `rect`.
+pub fn warning_triangle(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let r = rect.shrink(rect.width().min(rect.height()) * 0.08);
+    let stroke = egui::Stroke::new((r.width().min(r.height()) * 0.13).max(1.3), color);
+    let top = egui::pos2(r.center().x, r.top());
+    let bl = egui::pos2(r.left(), r.bottom());
+    let br = egui::pos2(r.right(), r.bottom());
+    painter.line_segment([top, bl], stroke);
+    painter.line_segment([bl, br], stroke);
+    painter.line_segment([br, top], stroke);
+    let cx = r.center().x;
+    painter.line_segment(
+        [egui::pos2(cx, r.top() + r.height() * 0.36), egui::pos2(cx, r.top() + r.height() * 0.66)],
+        stroke,
+    );
+    painter.circle_filled(egui::pos2(cx, r.top() + r.height() * 0.82), stroke.width * 0.65, color);
+}
+
+/// Standalone colored warning triangle widget.
+pub fn warning_widget(ui: &mut egui::Ui, size: f32, color: egui::Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        warning_triangle(ui.painter(), rect, color);
+    }
+    resp
+}
+
+/// Draw a circular refresh arrow inside `rect`.
+pub fn refresh_arrow(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let rad = rect.width().min(rect.height()) * 0.36;
+    let stroke = egui::Stroke::new((rad * 0.36).max(1.4), color);
+    let segments = 10;
+    let start = -std::f32::consts::FRAC_PI_4;
+    let sweep = std::f32::consts::TAU * 0.78;
+    for i in 0..segments {
+        let a0 = start + sweep * (i as f32 / segments as f32);
+        let a1 = start + sweep * ((i + 1) as f32 / segments as f32);
+        painter.line_segment(
+            [c + egui::vec2(a0.cos(), a0.sin()) * rad, c + egui::vec2(a1.cos(), a1.sin()) * rad],
+            stroke,
+        );
+    }
+    let tip = c + egui::vec2(start.cos(), start.sin()) * rad;
+    let wing = rad * 0.52;
+    painter.line_segment([tip, tip + egui::vec2(-wing, -wing * 0.15)], stroke);
+    painter.line_segment([tip, tip + egui::vec2(-wing * 0.15, wing)], stroke);
+}
+
+/// Paint-based [`egui::Atom`] for [`refresh_arrow`].
+pub fn refresh_atom(size: f32) -> egui::Atom<'static> {
+    egui::Atom::paint(egui::vec2(size, size), |ui, args| {
+        refresh_arrow(ui.painter(), args.rect, args.fallback_text_color);
+    })
 }
 
 /// Standalone right-arrow widget tinted with the active theme text color.

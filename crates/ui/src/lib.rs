@@ -37,11 +37,12 @@ pub use power::{
 };
 pub use session::{
     SessionAction, SessionInfo, SessionToolbar, SettingsAction, ToolbarAction, format_recording_elapsed,
-    format_recording_size, settings_window, settings_window_at, settings_window_full, settings_window_with_security,
+    format_recording_size, settings_window, settings_window_at, settings_window_full, settings_window_with_host_audio,
+    settings_window_with_security,
 };
 pub use settings::{
-    AudioFrameLatency, FpsCap, HostPrivacyMode, Language, Mode, PasswordMode, Present, Quality, SavedTrustedPeer,
-    Scale, Settings, StreamSettings, ThemePreference,
+    AudioFrameLatency, AudioOutputDeviceItem, FpsCap, HostPrivacyMode, Language, Mode, PasswordMode, Present, Quality,
+    SavedTrustedPeer, Scale, Settings, StreamSettings, ThemePreference, VirtualMicInstallUiState,
 };
 pub use terminal::{TerminalAction, TerminalWindow, strip_ansi};
 pub use tunnels::{ActiveTunnel, TunnelAction, TunnelSpec, TunnelsWindow, parse_tunnel_spec, parse_tunnel_spec_i18n};

@@ -21,6 +21,7 @@ pub struct EmbeddedHostAuthOpts {
     pub echo_cancellation: bool,
     pub mic_noise_suppression: bool,
     pub privacy_mode: HostPrivacyMode,
+    pub mic_output_device: Option<String>,
 }
 
 /// Events posted from the embedded background host thread to the winit event loop.
@@ -150,6 +151,8 @@ impl EmbeddedHostHandle {
 
     pub fn set_privacy_mode_kind(&self, _mode: HostPrivacyMode) {}
 
+    pub fn set_mic_output_device(&self, _device: Option<String>) {}
+
     pub fn send_chat(&self, _text: String, _sender_name: String) {}
 
     pub fn stop(&self) {}
@@ -233,6 +236,7 @@ mod net {
         SetDefaultPermissions(Permissions),
         SetEchoCancellation(bool),
         SetPrivacyMode(HostPrivacyMode),
+        SetMicOutputDevice(Option<String>),
         SendChat { text: String, sender_name: String },
         Stop,
     }
@@ -329,6 +333,8 @@ mod net {
 
             let cfg = HostConfig {
                 rendezvous,
+                allow_mic: true,
+                mic_output_device: auth.mic_output_device,
                 echo_cancellation: auth.echo_cancellation,
                 mic_noise_suppression: auth.mic_noise_suppression,
                 default_permissions: auth.default_permissions,
@@ -398,6 +404,10 @@ mod net {
 
         pub fn set_privacy_mode_kind(&self, mode: HostPrivacyMode) {
             let _ = self.cmd_tx.send(HostCmd::SetPrivacyMode(mode));
+        }
+
+        pub fn set_mic_output_device(&self, device: Option<String>) {
+            let _ = self.cmd_tx.send(HostCmd::SetMicOutputDevice(device));
         }
 
         pub fn send_chat(&self, text: String, sender_name: String) {
@@ -532,6 +542,9 @@ mod net {
                     }
                     HostCmd::SetPrivacyMode(mode) => {
                         running.set_privacy_mode_kind(map_privacy_mode(mode));
+                    }
+                    HostCmd::SetMicOutputDevice(device) => {
+                        running.set_mic_output_device(device);
                     }
                     HostCmd::SendChat { text, sender_name } => {
                         match running.send_chat(text.clone(), sender_name.clone()) {

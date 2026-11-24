@@ -11,6 +11,7 @@ mod tailscale;
 mod tray;
 mod updater;
 mod viewer;
+mod virtual_mic;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

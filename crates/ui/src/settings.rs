@@ -373,6 +373,28 @@ fn default_true() -> bool {
     true
 }
 
+fn default_host_mic_output() -> String {
+    "auto".to_string()
+}
+
+/// Runtime audio playback endpoint displayed in Settings (`crates/ui` stays decoupled from `veloxdesk-audio`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioOutputDeviceItem {
+    pub id: String,
+    pub name: String,
+    pub is_virtual_cable: bool,
+}
+
+/// UI state for the built-in Windows Virtual Microphone (`VB-CABLE`) 1-click installer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum VirtualMicInstallUiState {
+    #[default]
+    Idle,
+    Installing(String),
+    Installed(Option<String>),
+    Error(String),
+}
+
 /// Persisted trusted viewer identity remembered from an interactive Accept dialog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -548,6 +570,10 @@ pub struct Settings {
     /// Windows physical monitor blanking strategy for Host Privacy Mode.
     #[serde(default)]
     pub host_privacy_mode: HostPrivacyMode,
+    /// Host incoming microphone playback routing: `"auto"` (Virtual Cable if installed),
+    /// `"speakers"` (default speakers), or a specific WASAPI endpoint ID (v0.6.2).
+    #[serde(default = "default_host_mic_output")]
+    pub host_mic_output: String,
 }
 
 impl Default for Settings {
@@ -575,6 +601,7 @@ impl Default for Settings {
             host_allow_power: false,
             host_echo_exclusion: true,
             host_privacy_mode: HostPrivacyMode::CurtainOverlay,
+            host_mic_output: default_host_mic_output(),
         }
     }
 }
@@ -674,6 +701,7 @@ struct RawSettings {
     host_allow_power: Option<bool>,
     host_echo_exclusion: Option<bool>,
     host_privacy_mode: Option<HostPrivacyMode>,
+    host_mic_output: Option<String>,
     /// Captures pre-R4 flat stream fields and v0.5.0 top-level `echo_cancellation`.
     #[serde(flatten)]
     legacy: RawStreamSettings,
@@ -742,6 +770,11 @@ impl<'de> Deserialize<'de> for Settings {
             host_allow_power: raw.host_allow_power.unwrap_or(false),
             host_echo_exclusion,
             host_privacy_mode: raw.host_privacy_mode.unwrap_or_default(),
+            host_mic_output: raw
+                .host_mic_output
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_host_mic_output),
         })
     }
 }
@@ -1269,5 +1302,27 @@ mod tests {
         let json = serde_json::to_string_pretty(&def).unwrap();
         let reloaded: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(reloaded, def);
+    }
+
+    #[test]
+    fn v062_host_mic_output_default_compat_and_roundtrip() {
+        let def = Settings::default();
+        assert_eq!(def.host_mic_output, "auto");
+
+        // Legacy JSON without host_mic_output defaults to "auto", and empty string normalizes to "auto".
+        let legacy: Settings = serde_json::from_str(r#"{"mode":"Desktop"}"#).unwrap();
+        assert_eq!(legacy.host_mic_output, "auto");
+        let empty_str: Settings = serde_json::from_str(r#"{"host_mic_output":"   "}"#).unwrap();
+        assert_eq!(empty_str.host_mic_output, "auto");
+
+        let mut custom = Settings {
+            host_mic_output: "{0.0.0.00000000}.{11111111-2222-3333-4444-555555555555}".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string_pretty(&custom).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), custom);
+        custom.host_mic_output = "speakers".into();
+        let json2 = serde_json::to_string_pretty(&custom).unwrap();
+        assert_eq!(serde_json::from_str::<Settings>(&json2).unwrap(), custom);
     }
 }

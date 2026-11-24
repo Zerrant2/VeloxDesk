@@ -22,11 +22,12 @@ use veloxdesk_render::winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use veloxdesk_render::winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use veloxdesk_render::{RenderBreakdown, SurfaceOptions, VideoSurface, egui};
 use veloxdesk_ui::{
-    AcceptDecision, AcceptPrompt, ChatAction, ChatWindow, ConnectAction, ConnectScreen, ConnectTarget, FileAction,
-    FileManagerWindow, Language, Mode, PasswordAction, PasswordMode, PasswordPrompt, Present, ReconnectAction,
-    ReconnectBannerState, ReconnectOverlay, SessionInfo, SessionToolbar, Settings, TailscaleInfo, TerminalAction,
-    TerminalWindow, ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow, UpdateUiState, format_device_id,
-    parse_rendezvous_addr_i18n, parse_target_i18n, settings_window_with_security, tr,
+    AcceptDecision, AcceptPrompt, AudioOutputDeviceItem, ChatAction, ChatWindow, ConnectAction, ConnectScreen,
+    ConnectTarget, FileAction, FileManagerWindow, Language, Mode, PasswordAction, PasswordMode, PasswordPrompt,
+    Present, ReconnectAction, ReconnectBannerState, ReconnectOverlay, SessionInfo, SessionToolbar, Settings,
+    TailscaleInfo, TerminalAction, TerminalWindow, ToolbarAction, TunnelAction, TunnelSpec, TunnelsWindow,
+    UpdateUiState, VirtualMicInstallUiState, format_device_id, parse_rendezvous_addr_i18n, parse_target_i18n,
+    settings_window_with_host_audio, tr,
 };
 
 use crate::embedded_host::{self, EmbeddedHostAuthOpts, EmbeddedHostEvent, EmbeddedHostHandle};
@@ -37,6 +38,7 @@ use crate::stats::PresentedFrame;
 use crate::tailscale;
 use crate::tray::{TrayAction, TrayHandle};
 use crate::updater::{self, ReleaseInfo, UpdateCheckOutcome};
+use crate::virtual_mic::{self, VirtualMicEvent};
 
 fn hud_labels_for(lang: Language) -> HudLabels {
     let t = tr(lang);
@@ -86,6 +88,8 @@ pub enum UserEvent {
     Tailscale(TailscaleInfo),
     Update(UpdateEvent),
     PasswordHashed { seq: u64, result: Result<String, String> },
+    AudioDevices(Vec<AudioOutputDeviceItem>),
+    VirtualMic(VirtualMicEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -484,6 +488,8 @@ pub struct App {
     manual_update_check: bool,
     pw_status: Option<String>,
     pw_hash_seq: u64,
+    audio_devices: Vec<AudioOutputDeviceItem>,
+    virtual_mic_state: VirtualMicInstallUiState,
     tray: Option<TrayHandle>,
     files: FileManagerWindow,
     terminal: TerminalWindow,
@@ -553,6 +559,8 @@ impl App {
             manual_update_check: false,
             pw_status: None,
             pw_hash_seq: 0,
+            audio_devices: Vec::new(),
+            virtual_mic_state: VirtualMicInstallUiState::Idle,
             tray: None,
             files: FileManagerWindow::default(),
             terminal: TerminalWindow::default(),
@@ -757,6 +765,7 @@ impl App {
             echo_cancellation: self.settings.host_echo_exclusion,
             mic_noise_suppression: self.settings.active().noise_suppression,
             privacy_mode: self.settings.host_privacy_mode,
+            mic_output_device: Some(self.settings.host_mic_output.clone()),
         };
         match EmbeddedHostHandle::start(
             rendezvous,
@@ -795,6 +804,35 @@ impl App {
             let info = tailscale::query_status_for(lang);
             let _ = proxy.send_event(UserEvent::Tailscale(info));
         });
+    }
+
+    fn refresh_audio_devices_bg(&self) {
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new().name("veloxdesk-audio-scan".into()).spawn(move || {
+            #[cfg(feature = "net")]
+            let items: Vec<AudioOutputDeviceItem> = veloxdesk_audio::list_playback_devices()
+                .into_iter()
+                .map(|d| AudioOutputDeviceItem {
+                    id: d.id,
+                    name: d.name,
+                    is_virtual_cable: d.is_virtual_cable,
+                })
+                .collect();
+            #[cfg(not(feature = "net"))]
+            let items: Vec<AudioOutputDeviceItem> = Vec::new();
+            let _ = proxy.send_event(UserEvent::AudioDevices(items));
+        });
+    }
+
+    fn start_virtual_mic_install(&mut self) {
+        if matches!(self.virtual_mic_state, VirtualMicInstallUiState::Installing(_)) {
+            return;
+        }
+        let msg = tr(self.settings.language).vbcable_downloading.to_string();
+        if virtual_mic::spawn_install_virtual_mic(self.proxy.clone()) {
+            self.virtual_mic_state = VirtualMicInstallUiState::Installing(msg);
+            self.request_redraw();
+        }
     }
 
     fn start_tailscale_bg(&self) {
@@ -1308,7 +1346,10 @@ impl App {
                     self.send_input(ev);
                 }
             }
-            ToolbarAction::OpenSettings => self.settings_open = true,
+            ToolbarAction::OpenSettings => {
+                self.settings_open = true;
+                self.refresh_audio_devices_bg();
+            }
             ToolbarAction::CheckForUpdates => {
                 self.check_for_updates_bg(true);
                 if let Some(s) = &self.surface {
@@ -1381,8 +1422,15 @@ impl App {
                     h.set_default_permissions(self.settings.host_default_permissions());
                     h.set_echo_cancellation(self.settings.host_echo_exclusion);
                     h.set_privacy_mode_kind(self.settings.host_privacy_mode);
+                    h.set_mic_output_device(Some(self.settings.host_mic_output.clone()));
                 }
                 self.request_redraw();
+            }
+            ToolbarAction::RefreshAudioDevices => {
+                self.refresh_audio_devices_bg();
+            }
+            ToolbarAction::InstallVirtualMicDriver => {
+                self.start_virtual_mic_install();
             }
             ToolbarAction::Disconnect => {
                 self.auto_reconnect_armed = false;
@@ -1461,6 +1509,8 @@ impl App {
         let settings_open = &mut self.settings_open;
         let settings_path = self.viewer_opts.settings_path.as_deref();
         let pw_status = self.pw_status.as_deref();
+        let audio_devices = &self.audio_devices;
+        let virtual_mic_state = &self.virtual_mic_state;
         let reconnect_banner = self.reconnect.as_ref().map(|rc| rc.banner_state(Instant::now()));
         let info = &mut self.session_info;
         info.files_open = files.open;
@@ -1558,7 +1608,7 @@ impl App {
             {
                 actions.push(UiAction::Accept(dec));
             }
-            for a in settings_window_with_security(
+            for a in settings_window_with_host_audio(
                 ui.ctx(),
                 settings_open,
                 settings,
@@ -1566,6 +1616,8 @@ impl App {
                 Some(&connect.build_display),
                 Some(&connect.update_state),
                 pw_status,
+                audio_devices,
+                virtual_mic_state,
             ) {
                 actions.push(UiAction::Toolbar(a));
             }
@@ -1582,7 +1634,10 @@ impl App {
         for a in actions {
             match a {
                 UiAction::Connect(ConnectAction::Connect { address, target }) => self.start_connect(address, target),
-                UiAction::Connect(ConnectAction::OpenSettings) => self.settings_open = true,
+                UiAction::Connect(ConnectAction::OpenSettings) => {
+                    self.settings_open = true;
+                    self.refresh_audio_devices_bg();
+                }
                 UiAction::Connect(ConnectAction::ToggleHost(enable)) => {
                     if enable {
                         self.start_embedded_host();
@@ -2464,6 +2519,7 @@ impl ApplicationHandler<UserEvent> for App {
                 #[cfg(feature = "net")]
                 self.start_embedded_host();
                 self.refresh_tailscale();
+                self.refresh_audio_devices_bg();
                 self.check_for_updates_bg(false);
             }
             Launch::Connect(addr) => match parse_target_i18n(&addr, self.settings.language) {
@@ -2515,6 +2571,44 @@ impl ApplicationHandler<UserEvent> for App {
                     Err(e) => {
                         tracing::warn!("permanent password hashing failed: {e}");
                         self.pw_status = Some(e);
+                    }
+                }
+                self.request_redraw();
+            }
+            UserEvent::AudioDevices(items) => {
+                self.audio_devices = items;
+                self.request_redraw();
+            }
+            UserEvent::VirtualMic(ev) => {
+                let t = tr(self.settings.language);
+                match ev {
+                    VirtualMicEvent::Downloading => {
+                        self.virtual_mic_state = VirtualMicInstallUiState::Installing(t.vbcable_downloading.into());
+                    }
+                    VirtualMicEvent::Extracting => {
+                        self.virtual_mic_state = VirtualMicInstallUiState::Installing(t.vbcable_extracting.into());
+                    }
+                    VirtualMicEvent::WaitingForUac => {
+                        self.virtual_mic_state = VirtualMicInstallUiState::Installing(t.vbcable_waiting_uac.into());
+                    }
+                    VirtualMicEvent::Completed { device_name } => {
+                        self.virtual_mic_state = VirtualMicInstallUiState::Installed(device_name);
+                        if self.settings.host_mic_output == "speakers" {
+                            self.settings.host_mic_output = "auto".into();
+                            self.save_settings();
+                        }
+                        if let Some(h) = &self.embedded_host {
+                            h.set_mic_output_device(Some(self.settings.host_mic_output.clone()));
+                        }
+                        self.refresh_audio_devices_bg();
+                    }
+                    VirtualMicEvent::Cancelled => {
+                        self.virtual_mic_state = VirtualMicInstallUiState::Idle;
+                        tracing::info!("{}", t.vbcable_cancelled);
+                    }
+                    VirtualMicEvent::Failed(err) => {
+                        tracing::warn!("VB-CABLE installation failed: {err}");
+                        self.virtual_mic_state = VirtualMicInstallUiState::Error(err);
                     }
                 }
                 self.request_redraw();

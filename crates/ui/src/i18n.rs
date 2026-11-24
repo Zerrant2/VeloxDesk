@@ -428,6 +428,23 @@ define_strings!(
     tip_host_echo_exclusion,
     settings_host_privacy_mode,
     tip_host_privacy_mode,
+
+    // v0.6.2 Remote Microphone / Discord Routing & Built-in VB-CABLE Installer
+    settings_host_mic_routing_heading,
+    tip_host_mic_routing,
+    settings_host_mic_output_label,
+    host_mic_output_auto,
+    host_mic_output_speakers,
+    host_mic_refresh_tooltip,
+    host_mic_missing_warn,
+    vbcable_install_btn,
+    vbcable_reinstall_btn,
+    tip_vbcable_install,
+    vbcable_downloading,
+    vbcable_extracting,
+    vbcable_waiting_uac,
+    vbcable_cancelled,
+    vbcable_post_install_hint,
 );
 
 pub const EN: Strings = Strings {
@@ -834,6 +851,23 @@ pub const EN: Strings = Strings {
     tip_host_echo_exclusion: "Exclude VeloxDesk's own audio playback from Windows WASAPI loopback capture so remote voice does not echo back.",
     settings_host_privacy_mode: "Windows Privacy Mode",
     tip_host_privacy_mode: "Choose how Privacy Mode blanks physical monitors on Windows: Curtain Overlay works without VDD; VDD + Monitor Off also powers off displays when a virtual display is active.",
+
+    // v0.6.2 Remote Microphone / Discord Routing & Built-in VB-CABLE Installer
+    settings_host_mic_routing_heading: "Remote Microphone / Discord Routing",
+    tip_host_mic_routing: "Route incoming viewer microphone audio into a virtual audio cable (VB-CABLE) so Discord, Zoom, and games on this PC can use it as a microphone input.",
+    settings_host_mic_output_label: "Mic output device",
+    host_mic_output_auto: "Auto (Virtual Cable if installed)",
+    host_mic_output_speakers: "Default Speakers",
+    host_mic_refresh_tooltip: "Refresh playback audio devices",
+    host_mic_missing_warn: "Virtual microphone not installed — sound will play through PC speakers (Discord will not hear it)",
+    vbcable_install_btn: "Install Virtual Microphone (VB-CABLE)",
+    vbcable_reinstall_btn: "Reinstall Driver (VB-CABLE)",
+    tip_vbcable_install: "Download and silently install the official Microsoft WHQL-signed VB-Audio Virtual Cable driver (prompts for Windows UAC elevation).",
+    vbcable_downloading: "Downloading VB-CABLE driver…",
+    vbcable_extracting: "Extracting driver package…",
+    vbcable_waiting_uac: "Confirm Windows UAC prompt to install driver…",
+    vbcable_cancelled: "Driver installation cancelled.",
+    vbcable_post_install_hint: "Select \"CABLE Output\" as your microphone in Discord; if the device has not appeared yet, restart your PC.",
 };
 
 pub const RU: Strings = Strings {
@@ -1240,6 +1274,23 @@ pub const RU: Strings = Strings {
     tip_host_echo_exclusion: "Исключать собственное воспроизведение VeloxDesk из системного захвата WASAPI на Windows, чтобы голос не возвращался эхом.",
     settings_host_privacy_mode: "Режим приватности (Windows)",
     tip_host_privacy_mode: "Способ скрытия физических мониторов на Windows: «Чёрный экран» работает без VDD; «VDD + отключение монитора» также выключает дисплей при активном VDD.",
+
+    // v0.6.2 Remote Microphone / Discord Routing & Built-in VB-CABLE Installer
+    settings_host_mic_routing_heading: "Удалённый микрофон / Маршрутизация Discord",
+    tip_host_mic_routing: "Направляйте входящий микрофон клиента в виртуальный аудиокабель (VB-CABLE), чтобы Discord, Zoom и игры на этом ПК слышали его как микрофон.",
+    settings_host_mic_output_label: "Вывод микрофона",
+    host_mic_output_auto: "Авто (виртуальный кабель, если установлен)",
+    host_mic_output_speakers: "Динамики по умолчанию",
+    host_mic_refresh_tooltip: "Обновить список аудиоустройств вывода",
+    host_mic_missing_warn: "Виртуальный микрофон не установлен — звук пойдёт в динамики ПК (Discord его не услышит)",
+    vbcable_install_btn: "Установить виртуальный микрофон (VB-CABLE)",
+    vbcable_reinstall_btn: "Переустановить драйвер",
+    tip_vbcable_install: "Скачать и тихо установить официальный WHQL-драйвер VB-Audio Virtual Cable с подписью Microsoft (появится запрос Windows UAC).",
+    vbcable_downloading: "Загрузка драйвера VB-CABLE…",
+    vbcable_extracting: "Распаковка пакета драйвера…",
+    vbcable_waiting_uac: "Подтвердите запрос Windows UAC для установки драйвера…",
+    vbcable_cancelled: "Установка драйвера отменена.",
+    vbcable_post_install_hint: "Выберите «CABLE Output» как микрофон в Discord; если устройство ещё не появилось — перезагрузите ПК",
 };
 
 /// Return the static localization table for `lang`.
@@ -1805,6 +1856,35 @@ impl Strings {
             format!("Ошибка управления питанием: {err}")
         } else {
             format!("Remote power action failed: {err}")
+        }
+    }
+
+    pub fn fmt_host_mic_active(&self, name: &str) -> String {
+        if self.is_ru() {
+            format!("Виртуальный микрофон активен: {name} — выберите «CABLE Output» в Discord")
+        } else {
+            format!("Virtual microphone active: {name} — select \"CABLE Output\" in Discord")
+        }
+    }
+
+    pub fn fmt_vbcable_installed(&self, name: Option<&str>) -> String {
+        match name.filter(|s| !s.trim().is_empty()) {
+            Some(dev) => {
+                if self.is_ru() {
+                    format!("Драйвер установлен ({dev}). {}", self.vbcable_post_install_hint)
+                } else {
+                    format!("Driver installed ({dev}). {}", self.vbcable_post_install_hint)
+                }
+            }
+            None => self.vbcable_post_install_hint.to_string(),
+        }
+    }
+
+    pub fn fmt_vbcable_error(&self, err: &str) -> String {
+        if self.is_ru() {
+            format!("Ошибка установки VB-CABLE: {err}")
+        } else {
+            format!("VB-CABLE install error: {err}")
         }
     }
 }

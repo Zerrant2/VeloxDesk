@@ -9,8 +9,8 @@ use crate::connect::{UpdateUiState, format_device_id};
 use crate::i18n::tr;
 use crate::power::{PowerConfirmDialog, PowerConfirmOutcome, power_action_label};
 use crate::settings::{
-    AudioFrameLatency, FpsCap, HostPrivacyMode, Language, Mode, PasswordMode, Present, Quality, Scale, Settings,
-    ThemePreference,
+    AudioFrameLatency, AudioOutputDeviceItem, FpsCap, HostPrivacyMode, Language, Mode, PasswordMode, Present, Quality,
+    Scale, Settings, ThemePreference, VirtualMicInstallUiState,
 };
 
 /// What the toolbar / settings window asks the application to do.
@@ -55,6 +55,8 @@ pub enum ToolbarAction {
     SetRequireAccept(bool),
     RemoveTrustedPeer(String),
     UpdateHostPolicy,
+    RefreshAudioDevices,
+    InstallVirtualMicDriver,
     Disconnect,
 }
 
@@ -584,6 +586,32 @@ pub fn settings_window_with_security(
     update_state: Option<&UpdateUiState>,
     pw_status: Option<&str>,
 ) -> Vec<ToolbarAction> {
+    settings_window_with_host_audio(
+        ctx,
+        open,
+        settings,
+        settings_path,
+        build_display,
+        update_state,
+        pw_status,
+        &[],
+        &VirtualMicInstallUiState::Idle,
+    )
+}
+
+/// Full Settings window including runtime host audio output devices and built-in VB-CABLE installer state (v0.6.2).
+#[allow(clippy::too_many_arguments)]
+pub fn settings_window_with_host_audio(
+    ctx: &egui::Context,
+    open: &mut bool,
+    settings: &mut Settings,
+    settings_path: Option<&Path>,
+    build_display: Option<&str>,
+    update_state: Option<&UpdateUiState>,
+    pw_status: Option<&str>,
+    audio_devices: &[AudioOutputDeviceItem],
+    virtual_mic_state: &VirtualMicInstallUiState,
+) -> Vec<ToolbarAction> {
     let tab_id = egui::Id::unique("veloxdesk-settings-profile-tab");
     let pw_buf_id = egui::Id::unique("veloxdesk-settings-perm-pw-buf");
     let pw_err_id = egui::Id::unique("veloxdesk-settings-perm-pw-err");
@@ -836,61 +864,6 @@ pub fn settings_window_with_security(
                             )
                             .on_hover_text(t.tip_rendezvous_server);
                             ui.end_row();
-
-                            let version_text = build_display
-                                .filter(|s| !s.is_empty())
-                                .map(str::to_string)
-                                .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
-                            ui.label(t.settings_version_label).on_hover_text(t.tip_version);
-                            ui.label(egui::RichText::new(version_text).monospace())
-                                .on_hover_text(t.tip_version);
-                            ui.end_row();
-
-                            ui.label(t.settings_updates_label).on_hover_text(t.tip_updates);
-                            ui.horizontal(|ui| {
-                                let pal = crate::theme::palette_for(ui);
-                                let checking = matches!(
-                                    update_state,
-                                    Some(UpdateUiState::Checking | UpdateUiState::Downloading { .. })
-                                );
-                                if ui
-                                    .add_enabled(!checking, egui::Button::new(t.update_check_btn))
-                                    .on_hover_text(t.tip_updates)
-                                    .clicked()
-                                {
-                                    out.push(ToolbarAction::CheckForUpdates);
-                                }
-                                if let Some(st) = update_state {
-                                    match st {
-                                        UpdateUiState::Idle => {}
-                                        UpdateUiState::Checking => {
-                                            ui.spinner();
-                                            ui.weak(t.update_checking);
-                                        }
-                                        UpdateUiState::UpToDate => {
-                                            ui.colored_label(pal.success, t.update_up_to_date);
-                                        }
-                                        UpdateUiState::Available { latest, .. } => {
-                                            ui.colored_label(pal.info, t.fmt_update_available_short(latest));
-                                            if ui.button(t.update_now_btn).on_hover_text(t.tip_updates).clicked() {
-                                                out.push(ToolbarAction::StartUpdate);
-                                            }
-                                        }
-                                        UpdateUiState::Downloading { status, .. } => {
-                                            ui.spinner();
-                                            ui.weak(if status.is_empty() {
-                                                t.update_downloading
-                                            } else {
-                                                status.as_str()
-                                            });
-                                        }
-                                        UpdateUiState::Error(e) => {
-                                            ui.colored_label(pal.danger, t.fmt_update_error(e));
-                                        }
-                                    }
-                                }
-                            });
-                            ui.end_row();
                         });
 
                     // v0.3.0 Host Access & Security section
@@ -1072,6 +1045,71 @@ pub fn settings_window_with_security(
                             });
                             ui.end_row();
                         });
+
+                    ui.add_space(6.0);
+                    render_host_mic_routing_card(ui, settings, audio_devices, virtual_mic_state, &mut out);
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    egui::Grid::new("veloxdesk-settings-about")
+                        .num_columns(2)
+                        .spacing([16.0, 5.0])
+                        .show(ui, |ui| {
+                            let version_text = build_display
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
+                            ui.label(t.settings_version_label).on_hover_text(t.tip_version);
+                            ui.label(egui::RichText::new(version_text).monospace())
+                                .on_hover_text(t.tip_version);
+                            ui.end_row();
+
+                            ui.label(t.settings_updates_label).on_hover_text(t.tip_updates);
+                            ui.horizontal(|ui| {
+                                let pal = crate::theme::palette_for(ui);
+                                let checking = matches!(
+                                    update_state,
+                                    Some(UpdateUiState::Checking | UpdateUiState::Downloading { .. })
+                                );
+                                if ui
+                                    .add_enabled(!checking, egui::Button::new(t.update_check_btn))
+                                    .on_hover_text(t.tip_updates)
+                                    .clicked()
+                                {
+                                    out.push(ToolbarAction::CheckForUpdates);
+                                }
+                                if let Some(st) = update_state {
+                                    match st {
+                                        UpdateUiState::Idle => {}
+                                        UpdateUiState::Checking => {
+                                            ui.spinner();
+                                            ui.weak(t.update_checking);
+                                        }
+                                        UpdateUiState::UpToDate => {
+                                            ui.colored_label(pal.success, t.update_up_to_date);
+                                        }
+                                        UpdateUiState::Available { latest, .. } => {
+                                            ui.colored_label(pal.info, t.fmt_update_available_short(latest));
+                                            if ui.button(t.update_now_btn).on_hover_text(t.tip_updates).clicked() {
+                                                out.push(ToolbarAction::StartUpdate);
+                                            }
+                                        }
+                                        UpdateUiState::Downloading { status, .. } => {
+                                            ui.spinner();
+                                            ui.weak(if status.is_empty() {
+                                                t.update_downloading
+                                            } else {
+                                                status.as_str()
+                                            });
+                                        }
+                                        UpdateUiState::Error(e) => {
+                                            ui.colored_label(pal.danger, t.fmt_update_error(e));
+                                        }
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        });
                 });
         });
 
@@ -1110,7 +1148,8 @@ pub fn settings_window_with_security(
             || settings.host_allow_terminal_tunnel != before.host_allow_terminal_tunnel
             || settings.host_allow_power != before.host_allow_power
             || settings.host_echo_exclusion != before.host_echo_exclusion
-            || settings.host_privacy_mode != before.host_privacy_mode;
+            || settings.host_privacy_mode != before.host_privacy_mode
+            || settings.host_mic_output != before.host_mic_output;
         if host_policy_changed {
             out.push(SettingsAction::UpdateHostPolicy);
         }
@@ -1159,6 +1198,112 @@ pub fn settings_window_with_security(
         settings.save_to_or_default(settings_path);
     }
     out
+}
+
+fn render_host_mic_routing_card(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+    audio_devices: &[AudioOutputDeviceItem],
+    virtual_mic_state: &VirtualMicInstallUiState,
+    out: &mut Vec<ToolbarAction>,
+) {
+    let lang = settings.language;
+    let t = tr(lang);
+    let pal = crate::theme::palette_for(ui);
+    let detected_vcable = audio_devices.iter().find(|d| d.is_virtual_cable);
+
+    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.label(egui::RichText::new(t.settings_host_mic_routing_heading).strong())
+            .on_hover_text(t.tip_host_mic_routing);
+        ui.add_space(4.0);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if let Some(vc) = detected_vcable {
+                crate::icons::check_widget(ui, 12.0, pal.success);
+                ui.colored_label(pal.success, t.fmt_host_mic_active(&vc.name));
+            } else {
+                crate::icons::warning_widget(ui, 13.0, pal.warning);
+                ui.colored_label(pal.warning, t.host_mic_missing_warn);
+            }
+        });
+        ui.add_space(6.0);
+
+        let selected_label = match settings.host_mic_output.as_str() {
+            "" | "auto" => t.host_mic_output_auto.to_string(),
+            "speakers" | "default" => t.host_mic_output_speakers.to_string(),
+            id => audio_devices
+                .iter()
+                .find(|d| d.id == id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| id.to_string()),
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(t.settings_host_mic_output_label).on_hover_text(t.tip_host_mic_routing);
+            egui::ComboBox::from_id_salt("set-host-mic-output")
+                .selected_text(selected_label)
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    let is_auto = matches!(settings.host_mic_output.as_str(), "" | "auto");
+                    if ui.selectable_label(is_auto, t.host_mic_output_auto).clicked() {
+                        settings.host_mic_output = "auto".into();
+                    }
+                    let is_spk = matches!(settings.host_mic_output.as_str(), "speakers" | "default");
+                    if ui.selectable_label(is_spk, t.host_mic_output_speakers).clicked() {
+                        settings.host_mic_output = "speakers".into();
+                    }
+                    for dev in audio_devices {
+                        let sel = settings.host_mic_output == dev.id;
+                        if ui.selectable_label(sel, &dev.name).clicked() {
+                            settings.host_mic_output = dev.id.clone();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(t.tip_host_mic_routing);
+
+            if crate::icons::icon_small_button(ui, egui::vec2(24.0, 20.0), crate::icons::refresh_atom(12.0))
+                .on_hover_text(t.host_mic_refresh_tooltip)
+                .clicked()
+            {
+                out.push(ToolbarAction::RefreshAudioDevices);
+            }
+        });
+
+        if cfg!(windows) {
+            ui.add_space(6.0);
+            let installing = matches!(virtual_mic_state, VirtualMicInstallUiState::Installing(_));
+            let btn_label = if detected_vcable.is_some() {
+                t.vbcable_reinstall_btn
+            } else {
+                t.vbcable_install_btn
+            };
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(!installing, egui::Button::new(btn_label))
+                    .on_hover_text(t.tip_vbcable_install)
+                    .clicked()
+                {
+                    out.push(ToolbarAction::InstallVirtualMicDriver);
+                }
+                if let VirtualMicInstallUiState::Installing(msg) = virtual_mic_state {
+                    ui.spinner();
+                    ui.weak(msg.as_str());
+                }
+            });
+            match virtual_mic_state {
+                VirtualMicInstallUiState::Installed(dev_name) => {
+                    ui.colored_label(pal.success, t.fmt_vbcable_installed(dev_name.as_deref()));
+                }
+                VirtualMicInstallUiState::Error(err) => {
+                    ui.colored_label(pal.danger, t.fmt_vbcable_error(err));
+                }
+                _ => {}
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2094,6 +2239,65 @@ mod tests {
                 out.textures_delta.clear();
                 assert!(!shapes_contain_text(&out.shapes, t.toolbar_lock_cursor_btn));
                 assert!(!shapes_contain_text(&out.shapes, t.toolbar_unlock_cursor_btn));
+            }
+        }
+    }
+
+    #[test]
+    fn host_mic_routing_card_renders_amber_green_and_installer_states_en_and_ru() {
+        for lang in Language::ALL {
+            let t = tr(lang);
+            let ctx = egui::Context::default();
+            let mut settings = Settings { language: lang, ..Default::default() };
+
+            // 1. Missing virtual cable (Amber) + Idle installer
+            let mut actions = Vec::new();
+            let mut out_amber = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    render_host_mic_routing_card(
+                        ui,
+                        &mut settings,
+                        &[],
+                        &VirtualMicInstallUiState::Idle,
+                        &mut actions,
+                    );
+                },
+            );
+            out_amber.textures_delta.clear();
+            assert!(shapes_contain_text(&out_amber.shapes, t.settings_host_mic_routing_heading));
+            assert!(shapes_contain_text(&out_amber.shapes, t.host_mic_missing_warn));
+            if cfg!(windows) {
+                assert!(shapes_contain_text(&out_amber.shapes, t.vbcable_install_btn));
+            }
+
+            // 2. Virtual cable present (Green) + Installed hint
+            let devs = vec![AudioOutputDeviceItem {
+                id: "wasapi-vbcable".into(),
+                name: "CABLE Input (VB-Audio Virtual Cable)".into(),
+                is_virtual_cable: true,
+            }];
+            let installed = VirtualMicInstallUiState::Installed(Some(devs[0].name.clone()));
+            let mut out_green = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| {
+                    render_host_mic_routing_card(ui, &mut settings, &devs, &installed, &mut actions);
+                },
+            );
+            out_green.textures_delta.clear();
+            assert!(shapes_contain_text(
+                &out_green.shapes,
+                &t.fmt_host_mic_active("CABLE Input (VB-Audio Virtual Cable)")
+            ));
+            if cfg!(windows) {
+                assert!(shapes_contain_text(&out_green.shapes, t.vbcable_reinstall_btn));
+                assert!(shapes_contain_text(&out_green.shapes, t.vbcable_post_install_hint));
             }
         }
     }
