@@ -33,8 +33,8 @@ android {
         applicationId = "dev.veloxdesk.viewer"
         minSdk = 26
         targetSdk = 35
-        versionCode = 601
-        versionName = "0.6.1"
+        versionCode = 602
+        versionName = "0.6.2"
 
         buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
         vectorDrawables {
